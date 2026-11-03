@@ -75,8 +75,9 @@ void Error_Handler(void);
 #define BQ_BOOT_GPIO_Port GPIOB
 #define BQ_ALT_EXTI8_Pin GPIO_PIN_8
 #define BQ_ALT_EXTI8_GPIO_Port GPIOA
-#define BQ_IIC2_SCL_Pin GPIO_PIN_9
-#define BQ_IIC2_SCL_GPIO_Port GPIOA
+#define BQ_ALT_EXTI8_EXTI_IRQn EXTI9_5_IRQn
+#define BQ_IIC1_SCL_Pin GPIO_PIN_9
+#define BQ_IIC1_SCL_GPIO_Port GPIOA
 #define BQ_IIC1_SDA_Pin GPIO_PIN_10
 #define BQ_IIC1_SDA_GPIO_Port GPIOA
 #define IND_ROHT_Pin GPIO_PIN_3
@@ -85,6 +86,7 @@ void Error_Handler(void);
 #define IND_NORM_GPIO_Port GPIOB
 #define WAKE_EXTI5_Pin GPIO_PIN_5
 #define WAKE_EXTI5_GPIO_Port GPIOB
+#define WAKE_EXTI5_EXTI_IRQn EXTI9_5_IRQn
 
 /* USER CODE BEGIN Private defines */
 

@@ -1,0 +1,46 @@
+# =============================================================================
+# app.mk — App/ 分层应用源码接入
+#
+# 接入方式（每次 CubeMX 重新生成 Makefile 后必须重做）：
+#   在 Makefile 的 C_INCLUDES 之后、 "# compile gcc flags" 之前插入：
+#       -include app.mk
+#
+# 说明：
+#   - 生成的 C_SOURCES 是静态列表，这里以 filter-out 去重后追加，避免 HAL 源
+#     （应用同样需要但 IOC 可能未启用）被重复加入链接；
+#   - 源文件名必须全库唯一（Makefile 用 notdir 扁平化到 build/）；
+#   - HAL_RTC_MODULE_ENABLED 已由 Core/Inc/stm32l4xx_hal_conf.h 打开，勿重复 -D。
+# =============================================================================
+
+APP_SOURCES =  \
+App/app/main_app.c \
+App/app/power_mode.c \
+App/app/black_box.c \
+App/app/state_machine.c \
+App/app/led_status.c \
+App/app/faults.c \
+App/app/self_test.c \
+App/app/reset_cause.c \
+App/bsp/bq_ic.c \
+App/bsp/flash_store.c \
+App/bsp/ws2812_uart.c \
+App/bsp/buzzer.c \
+App/comm/app_log.c
+
+# RTC 已在 IOC 中，生成的 Makefile 通常已包含；这里保留兜底，已包含时由 filter-out 去重。
+APP_HAL_SOURCES =  \
+Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_rtc.c \
+Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_rtc_ex.c
+
+APP_INCLUDES =  \
+-IApp \
+-IApp/bsp \
+-IApp/comm \
+-IApp/app
+
+APP_ALL_SOURCES = $(APP_SOURCES) $(APP_HAL_SOURCES)
+
+# C_SOURCES 是递归变量，必须先立即展开再追加，否则 += 会造成自引用。
+APP_NEW_SOURCES := $(filter-out $(C_SOURCES), $(APP_ALL_SOURCES))
+C_SOURCES := $(C_SOURCES) $(APP_NEW_SOURCES)
+C_INCLUDES += $(APP_INCLUDES)
