@@ -15,6 +15,7 @@
 #define SM_CRITICAL_FAULT_MASK  (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY | \
                                  FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |       \
                                  FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |     \
+                                 FAULT_BIT_BQ_ADC_STUCK |                  \
                                  FAULT_BIT_POWER | FAULT_BIT_CLK)
 
 static struct

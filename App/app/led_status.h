@@ -24,6 +24,7 @@ typedef enum
     LED_FLOW_STANDBY = 0,
     LED_FLOW_CHARGING,
     LED_FLOW_DISCHARGING,
+    LED_FLOW_CAL,
     LED_FLOW_FAULT
 } led_flow_t;
 

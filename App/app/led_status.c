@@ -156,6 +156,11 @@ void LedStatus_Flush(void)
         case LED_FLOW_DISCHARGING:
             b = 48u;
             break;
+        case LED_FLOW_CAL:
+            r = 48u;
+            g = 24u;
+            b = 0u;
+            break;
         case LED_FLOW_STANDBY:
         case LED_FLOW_FAULT:
         default:

@@ -85,11 +85,26 @@ app.mk              # App/ 的源文件与 include 路径，独立于 CubeMX 生
    ```
 
    `detect/` 未使用时可不加对应 `-I`；应用额外需要、但 IOC 未启用的 HAL 源（如 `stm32l4xx_hal_rtc.c`）同样先用 `filter-out` 去重再加入。
-4. 在生成的 `Makefile` 中加 `-include app.mk`（位置见规则 4）；重生成后同时把 `STM32L432xx_FLASH.ld` 的 FLASH 改回 **128K**。
+4. 在生成的 `Makefile` 中加 `-include app.mk`（位置见规则 4）；重生成后同时把 `STM32L432xx_FLASH.ld` 的 FLASH 改回 **96K**（`_image_end <= 0x08018000`），不要改成 128K/256K。
 5. 在 `App_Init()` 按依赖顺序调用 `Xxx_Init()`；周期任务放 `App_OnTick250Hz()`（用 `s_app.uptime_s`/分频计数或 250 Hz tick 计数分频），耗时/阻塞工作放 `App_Loop()`。
 6. 若模块占用 HAL weak 回调，先查 `references/reference-map.md` 的"中断归属"表。**同一回调全库只能有一个 owner**，按 `Instance` 分发并在注释里登记。DMA 通道分配见 CLAUDE.md 的通道表（只用 DMA1：I2C1_RX 用生成的 `hdma_i2c1_rx`/DMA1_Ch7；USART2_TX 用 USART2 中断，不占 DMA）。
 7. 手工同步 `compile_commands.json`（按 `app.mk` 补条目）。
-8. 验证：`make -j2 all`，再核对 `arm-none-eabi-size build/BMC_CMZY_080.elf` 与 Flash 上限（镜像 `_etext` 必须 < 黑匣子基址 `0x0801A000`；链接脚本 128K）。本工程无测试工程，验证 = 编译 + 上板行为。
+8. 验证：`make -j2 all`，再核对 `arm-none-eabi-size build/BMC_CMZY_080.elf` 与 Flash 上限（`arm-none-eabi-nm -n build/BMC_CMZY_080.elf | grep _image_end` 必须 ≤ `0x08018000`；链接脚本 96K，页 48–51 归 NVM/StateStore，黑匣子从 `0x0801A000` 起）。本工程无测试工程，验证 = 编译 + 上板行为。
+
+## BQ 电压异常排查规则（强制）
+
+用户已确认本板 PCB 接线与引脚电压正常。**BQ 某节电压异常（尤其是 cell3/VC5 偶发 6 V、复位相关、reject 持续增加）时，不得以“怀疑硬件/接线”结束排查。** 必须先完成下列软件初始化取证，没有这些证据不得结案：
+
+1. **ADC 受控 0→1 重启**：每次 CONFIG（冷启动、LP 唤醒、总线恢复、运行期恢复）必须先写 `SYS_CTRL2=0`、`CELLBAL1=0`、`SYS_CTRL1=0`，回读确认 ADC/TEMP/CC/FET/均衡全部关闭，保持 ≥300 ms，再在 ADC off 状态写 CC_CFG/增益/保护，最后写 `SYS_CTRL2=CC_EN`、`SYS_CTRL1=0x18` 并逐项回读。MCU 复位不会复位 BQ；若 ADC_EN 本来已是 1，缺少 0→1 边沿就可能保留异常通道。
+2. **SYS_CTRL1/2 回读**：配置结束必须确认 `ADC_EN|TEMP_SEL=1`、`CC_EN=1`、FET 位符合预期；回读失败按配置失败重试，不能继续发布电压。
+3. **保护写入时序**：保护阈值必须在 ADC off 阶段写入并回读，不能先开 ADC 再写保护。
+4. **XREADY**：settle 后读 `SYS_STAT`，XREADY 置位时按“清一次 + 等待 10 ms + 再确认”的有界流程处理；持久 XREADY 报故障。
+5. **连续有效帧确认**：首帧（以及 reject 后的首帧）只作为候选，连续 2 帧 cells 差 ≤250 mV、pack 差 ≤300 mV 才发布；发布值不能掩盖 raw 异常。
+6. **reject 恢复**：连续 4 帧拒绝触发一次受控 ADC 重启；连续 12 帧或 3 次重启仍失败置 `FAULT_BIT_BQ_ADC_STUCK`，不能只让 `reject_count` 静默增长。
+7. **自检动态复查**：BQ 首帧短暂异常只进入 12 s 恢复宽限，不立即锁死三声报错；完成后 MONITOR 持续复查，恢复后自动清除 BQ 失败位并解除 LP 阻止。
+8. **pre/post 快照**：保留 `pre_ctrl1/pre_ctrl2/pre_sys_stat/pre_cellbal1`、`adc_off_ctrl1/2`、`post_ctrl1/2`、`settle_sys_stat`、`xready_*`、`adc_restart_*`、`last_reject_*`，台架复位循环时用它们证明软件初始化是否产生真实 ADC 重启。
+
+硬件结论只能在这些软件路径全部验证、且 pre/post 快照与 raw VC3/VC4 仍异常后才能提出，并需给出可复现的引脚/波形证据。
 
 ## 参考工程与本工程的对应关系
 
@@ -109,5 +124,6 @@ app.mk              # App/ 的源文件与 include 路径，独立于 CubeMX 生
 - [ ] ISR 只置标志/计数/启动 DMA；协议、CAN 发送、Flash 写都在主循环
 - [ ] 250 Hz TIM2 tick 在全部模块初始化完成后才启动；LP 进入前停止、唤醒后重建
 - [ ] 调试可见量用字段完整命名的 `static struct`（ISR 写字段加 `volatile`）
-- [ ] `make -j2 all` 通过，镜像大小核对（`_etext` < `0x0801A000`）
+- [ ] 涉及 BQ 电压/ADC 的改动已按“BQ 电压异常排查规则”检查 ADC 0→1 重启、回读、XREADY、双帧确认、reject 恢复与自检复查，不以硬件怀疑结案
+- [ ] `make -j2 all` 通过，镜像大小核对（`_image_end` ≤ `0x08018000`；链接脚本 96K）
 - [ ] 相关协议文档、参数默认值、上位机/主机工具已同步（如适用）

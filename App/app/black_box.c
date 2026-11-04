@@ -25,14 +25,11 @@
 #include "bsp/bq_ic.h"
 #include "bsp/flash_store.h"
 #include "app/faults.h"
+#include "app/power_mode.h"
 
 #define BB_SLOT_BYTES       24u
-#define BB_RECORD_WORDS     (BB_RECORD_BYTES / 8u)   /* 3 个双字 */
 #define BB_SLOT_COUNT       BB_RECORD_COUNT          /* 1020 */
 #define BB_BLANK_U32        0xFFFFFFFFUL
-
-/* 链接符号：.text 结束地址，用于断言固件不侵入黑匣子区。 */
-extern uint32_t _etext;
 
 typedef struct
 {
@@ -49,6 +46,7 @@ typedef struct
 static struct
 {
     uint8_t valid_head;
+    uint16_t head_slot;
     uint32_t head_seq;
     uint32_t uptime_base;
     uint16_t next_slot;         /* 0..1019 */
@@ -59,6 +57,12 @@ static struct
     uint32_t skipped_bad_records;
     uint8_t err;
 } s_bb;
+
+/* RAM 影子：上电后从 Flash 头记录向前取最近 5 条，写记录时同步前插。
+ * LP 中调试器连不上时，复位/重新上电后在 NORM 直接展开 s_bb_shadow 即可
+ * 看到最近 5 次事件（LP_ENTER/WAKE/MONITOR/周期记录）；diag_* 字段只写
+ * RAM，不消耗 Flash，用于观察 LP 唤醒路径。 */
+bb_shadow_t s_bb_shadow;
 
 /* ---------------- 工具 ---------------- */
 static uint16_t Bb_Crc16(const uint8_t *data, uint32_t len)
@@ -150,6 +154,138 @@ static uint8_t Bb_SlotValid(const uint8_t *p)
     return (crc == Bb_ReadU16(p + 22)) ? 1u : 0u;
 }
 
+static uint8_t Bb_DecodeWakeMask(uint8_t kind, uint16_t flags)
+{
+    uint8_t raw = (uint8_t)((flags >> 3) & 0x07u);
+
+    if (kind == BB_KIND_WAKE_MASK)
+    {
+        return (uint8_t)(raw & (POWER_WAKE_RTC | POWER_WAKE_BUTTON |
+                                POWER_WAKE_BQ_ALERT));
+    }
+    if (kind == BB_KIND_WAKE)
+    {
+        switch (raw)
+        {
+        case BB_WAKE_RTC:
+            return POWER_WAKE_RTC;
+        case BB_WAKE_BUTTON:
+            return POWER_WAKE_BUTTON;
+        case BB_WAKE_BQ_ALERT:
+            return POWER_WAKE_BQ_ALERT;
+        default:
+            return 0u;
+        }
+    }
+    return 0u;
+}
+
+static int Bb_DecodeSlot(uint16_t slot, black_box_record_t *out)
+{
+    const uint8_t *p;
+
+    if ((out == NULL) || (slot >= BB_SLOT_COUNT))
+    {
+        return -1;
+    }
+
+    p = (const uint8_t *)Bb_SlotAddr(slot);
+    if (Bb_SlotValid(p) == 0u)
+    {
+        return -1;
+    }
+
+    out->seq = Bb_ReadU32(p);
+    out->uptime_s = Bb_ReadU32(p + 4u);
+    out->cell_mv[0] = Bb_ReadU16(p + 8u);
+    out->cell_mv[1] = Bb_ReadU16(p + 10u);
+    out->cell_mv[2] = Bb_ReadU16(p + 12u);
+    out->pack_mv = Bb_ReadU16(p + 14u);
+    out->cc_raw = (int16_t)Bb_ReadU16(p + 16u);
+    out->ts1_raw = Bb_ReadU16(p + 18u);
+    out->flags = Bb_ReadU16(p + 20u);
+    out->kind = (uint8_t)(out->flags & 0x07u);
+    out->wake_mask = Bb_DecodeWakeMask(out->kind, out->flags);
+    out->event_code = (out->kind == BB_KIND_EVENT) ?
+                      (uint16_t)((out->flags >> 6) & 0x03FFu) : 0u;
+    out->valid = 1u;
+    return 0;
+}
+
+static void Bb_PublicFromRecord(const bb_record_t *src, black_box_record_t *dst)
+{
+    dst->seq = src->seq;
+    dst->uptime_s = src->uptime_s;
+    dst->cell_mv[0] = src->cell_mv[0];
+    dst->cell_mv[1] = src->cell_mv[1];
+    dst->cell_mv[2] = src->cell_mv[2];
+    dst->pack_mv = src->pack_mv;
+    dst->cc_raw = src->cc_raw;
+    dst->ts1_raw = src->ts1_raw;
+    dst->flags = src->flags;
+    dst->kind = (uint8_t)(src->flags & 0x07u);
+    dst->wake_mask = Bb_DecodeWakeMask(dst->kind, dst->flags);
+    dst->event_code = (dst->kind == BB_KIND_EVENT) ?
+                      (uint16_t)((dst->flags >> 6) & 0x03FFu) : 0u;
+    dst->valid = 1u;
+}
+
+static void Bb_ShadowLoad(void)
+{
+    uint16_t slot;
+    uint8_t i;
+
+    s_bb_shadow.count = 0u;
+    for (i = 0u; i < BB_SHADOW_COUNT; i++)
+    {
+        s_bb_shadow.rec[i].valid = 0u;
+    }
+    s_bb_shadow.diag_lp_enter_count = 0u;
+    s_bb_shadow.diag_wut_count = 0u;
+    s_bb_shadow.diag_lp_loop_count = 0u;
+    s_bb_shadow.diag_button_irq_count = 0u;
+    s_bb_shadow.diag_wake_count = 0u;
+    s_bb_shadow.diag_last_stage = 0u;
+    s_bb_shadow.diag_flag_button = 0u;
+    s_bb_shadow.diag_pb5_level = 0u;
+    s_bb_shadow.diag_exti_imr = 0u;
+    s_bb_shadow.diag_exti_pending = 0u;
+    s_bb_shadow.diag_last_wake_cause = 0u;
+    if (s_bb.valid_head == 0u)
+    {
+        return;
+    }
+
+    slot = s_bb.head_slot;
+    for (i = 0u; i < BB_SHADOW_COUNT; i++)
+    {
+        black_box_record_t rec;
+
+        if (Bb_DecodeSlot(slot, &rec) != 0)
+        {
+            break;
+        }
+        s_bb_shadow.rec[i] = rec;
+        s_bb_shadow.count = (uint8_t)(i + 1u);
+        slot = (uint16_t)((slot + BB_SLOT_COUNT - 1u) % BB_SLOT_COUNT);
+    }
+}
+
+static void Bb_ShadowPush(const bb_record_t *rec)
+{
+    uint8_t i;
+
+    for (i = BB_SHADOW_COUNT - 1u; i > 0u; i--)
+    {
+        s_bb_shadow.rec[i] = s_bb_shadow.rec[i - 1u];
+    }
+    Bb_PublicFromRecord(rec, &s_bb_shadow.rec[0]);
+    if (s_bb_shadow.count < BB_SHADOW_COUNT)
+    {
+        s_bb_shadow.count++;
+    }
+}
+
 /* ---------------- 上电头查找 ---------------- */
 void BlackBox_Init(void)
 {
@@ -159,6 +295,7 @@ void BlackBox_Init(void)
     uint8_t found = 0u;
 
     s_bb.valid_head = 0u;
+    s_bb.head_slot = 0u;
     s_bb.head_seq = 0u;
     s_bb.uptime_base = 0u;
     s_bb.next_slot = 0u;
@@ -168,9 +305,10 @@ void BlackBox_Init(void)
     s_bb.erase_fail_count = 0u;
     s_bb.skipped_bad_records = 0u;
     s_bb.err = 0u;
+    s_bb_shadow.count = 0u;
 
-    /* 固件不得侵入黑匣子区，否则擦写会破坏代码。 */
-    if ((uint32_t)&_etext >= BB_FLASH_BASE)
+    /* 固件不得侵入页 48–63，否则擦写会破坏代码。 */
+    if ((uint32_t)&_image_end > APP_FLASH_END)
     {
         s_bb.err = 2u;
         Fault_SetSticky(FAULT_BIT_FLASH_LOG);
@@ -207,6 +345,7 @@ void BlackBox_Init(void)
         const uint8_t *p = (const uint8_t *)Bb_SlotAddr(best_slot);
 
         s_bb.valid_head = 1u;
+        s_bb.head_slot = best_slot;
         s_bb.head_seq = best_seq;
         s_bb.uptime_base = Bb_ReadU32(p + 4u);
         s_bb.next_slot = (uint16_t)((best_slot + 1u) % BB_SLOT_COUNT);
@@ -215,6 +354,8 @@ void BlackBox_Init(void)
     {
         s_bb.next_slot = 0u;
     }
+
+    Bb_ShadowLoad();
 }
 
 uint32_t BlackBox_GetUptimeBase(void)
@@ -227,21 +368,59 @@ uint8_t BlackBox_HasError(void)
     return s_bb.err;
 }
 
-/* ---------------- 写记录 ---------------- */
-static int Bb_WriteRecord(uint32_t uptime_s, uint16_t flags)
+uint16_t BlackBox_GetHeadSlot(void)
 {
-    bq_snapshot_t snap;
+    return s_bb.head_slot;
+}
+
+uint32_t BlackBox_GetHeadSeq(void)
+{
+    return s_bb.head_seq;
+}
+
+int BlackBox_ReadNewest(black_box_record_t *out)
+{
+    if (s_bb.valid_head == 0u)
+    {
+        return -1;
+    }
+    return Bb_DecodeSlot(s_bb.head_slot, out);
+}
+
+int BlackBox_ReadSlot(uint16_t slot, black_box_record_t *out)
+{
+    return Bb_DecodeSlot(slot, out);
+}
+
+uint8_t BlackBox_GetShadowCount(void)
+{
+    return s_bb_shadow.count;
+}
+
+int BlackBox_ReadShadow(uint8_t index, black_box_record_t *out)
+{
+    if ((out == NULL) || (index >= s_bb_shadow.count) ||
+        (index >= BB_SHADOW_COUNT) || (s_bb_shadow.rec[index].valid == 0u))
+    {
+        return -1;
+    }
+    *out = s_bb_shadow.rec[index];
+    return 0;
+}
+
+/* ---------------- 写记录 ---------------- */
+static int Bb_WriteRecordSnapshot(uint32_t uptime_s, uint16_t flags,
+                                  const bq_snapshot_t *snap)
+{
     bb_record_t rec;
     uint8_t raw[BB_SLOT_BYTES];
     uint32_t addr;
     uint32_t seq;
 
-    if (s_bb.err == 2u)
+    if ((snap == NULL) || (s_bb.err == 2u))
     {
         return -1;
     }
-
-    BQ_GetSnapshot(&snap);
 
     /* 新记录紧接头序号；跳过 0xFFFFFFFF 空白哨兵。 */
     seq = s_bb.valid_head ? (s_bb.head_seq + 1u) : 1u;
@@ -267,12 +446,12 @@ static int Bb_WriteRecord(uint32_t uptime_s, uint16_t flags)
 
     rec.seq = seq;
     rec.uptime_s = uptime_s;
-    rec.cell_mv[0] = snap.cell_mv[0];
-    rec.cell_mv[1] = snap.cell_mv[1];
-    rec.cell_mv[2] = snap.cell_mv[2];
-    rec.pack_mv = snap.pack_mv;
-    rec.cc_raw = snap.cc_raw;
-    rec.ts1_raw = snap.ts1_raw;
+    rec.cell_mv[0] = snap->cell_mv[0];
+    rec.cell_mv[1] = snap->cell_mv[1];
+    rec.cell_mv[2] = snap->cell_mv[2];
+    rec.pack_mv = snap->pack_mv;
+    rec.cc_raw = snap->cc_raw;
+    rec.ts1_raw = snap->ts1_raw;
     rec.flags = flags;
     rec.crc16 = 0u;
 
@@ -287,19 +466,46 @@ static int Bb_WriteRecord(uint32_t uptime_s, uint16_t flags)
     }
 
     s_bb.valid_head = 1u;
+    s_bb.head_slot = s_bb.next_slot;
     s_bb.head_seq = seq;
     s_bb.uptime_base = uptime_s;
     s_bb.next_slot = (uint16_t)((s_bb.next_slot + 1u) % BB_SLOT_COUNT);
     s_bb.writes++;
     s_bb.err = 0u;
+    Bb_ShadowPush(&rec);
     return 0;
+}
+
+static int Bb_WriteRecord(uint32_t uptime_s, uint16_t flags)
+{
+    bq_snapshot_t snap;
+
+    BQ_GetSnapshot(&snap);
+    return Bb_WriteRecordSnapshot(uptime_s, flags, &snap);
 }
 
 int BlackBox_WritePeriodic(uint32_t uptime_s)
 {
+    bq_snapshot_t snap;
     uint16_t flags = (uint16_t)(BB_KIND_PERIODIC & 0x07u);
 
-    return Bb_WriteRecord(uptime_s, flags);
+    BQ_GetSnapshot(&snap);
+    if ((snap.fresh == 0u) || (snap.valid == 0u))
+    {
+        return -1;
+    }
+    return Bb_WriteRecordSnapshot(uptime_s, flags, &snap);
+}
+
+int BlackBox_WritePeriodicSnapshot(const bq_snapshot_t *snap, uint32_t uptime_s)
+{
+    uint16_t flags = (uint16_t)(BB_KIND_PERIODIC & 0x07u);
+
+    if ((snap == NULL) || (snap->fresh == 0u) || (snap->valid == 0u))
+    {
+        return -1;
+    }
+    return Bb_WriteRecordSnapshot(uptime_s, flags, snap);
 }
 
 int BlackBox_WriteTransition(uint8_t transition_kind, uint8_t wake_cause,
@@ -310,4 +516,44 @@ int BlackBox_WriteTransition(uint8_t transition_kind, uint8_t wake_cause,
     flags = (uint16_t)((transition_kind & 0x07u) |
                        ((uint16_t)(wake_cause & 0x07u) << 3));
     return Bb_WriteRecord(uptime_s, flags);
+}
+
+int BlackBox_WriteWake(uint8_t power_wake_mask, uint32_t uptime_s)
+{
+    uint16_t flags = (uint16_t)(BB_KIND_WAKE_MASK |
+                                ((uint16_t)(power_wake_mask & 0x07u) << 3));
+
+    return Bb_WriteRecord(uptime_s, flags);
+}
+
+int BlackBox_WriteEvent(uint16_t event_code, uint32_t uptime_s)
+{
+    uint16_t flags = (uint16_t)(BB_KIND_EVENT |
+                                ((uint16_t)(event_code & 0x03FFu) << 6));
+
+    return Bb_WriteRecord(uptime_s, flags);
+}
+
+int BlackBox_WriteLpDiag(uint32_t uptime_s, uint32_t wut_count,
+                         uint32_t button_irq_count, uint32_t loop_count,
+                         uint8_t stage, uint8_t flags)
+{
+    bq_snapshot_t snap;
+    uint16_t rec_flags = (uint16_t)(BB_KIND_EVENT |
+                                    ((uint16_t)(BB_EVENT_LP_DIAG & 0x03FFu) << 6));
+
+    /* 复用 24 B 记录的字段承载诊断：
+     *   cell1=WUT count [15:0], cell2=button IRQ count [15:0],
+     *   cell3=LP loop count [15:0], pack=stage | (flags<<8),
+     *   cc=WUT count[31:16], ts1=button IRQ count[31:16].
+     * 这些值只在 LP 按键尝试时写一条，不逐秒写 Flash。 */
+    snap.cell_mv[0] = (uint16_t)(wut_count & 0xFFFFu);
+    snap.cell_mv[1] = (uint16_t)(button_irq_count & 0xFFFFu);
+    snap.cell_mv[2] = (uint16_t)(loop_count & 0xFFFFu);
+    snap.pack_mv = (uint16_t)(((uint16_t)stage & 0xFFu) |
+                              ((uint16_t)flags << 8));
+    snap.cc_raw = (int16_t)((wut_count >> 16) & 0xFFFFu);
+    snap.ts1_raw = (uint16_t)((button_irq_count >> 16) & 0xFFFFu);
+
+    return Bb_WriteRecordSnapshot(uptime_s, rec_flags, &snap);
 }

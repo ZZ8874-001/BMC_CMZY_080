@@ -62,7 +62,7 @@ MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 48K
 RAM2 (xrw)      : ORIGIN = 0x10000000, LENGTH = 16K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 128K
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 96K
 }
 
 /* Define output sections */
@@ -165,7 +165,11 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
   } >RAM AT> FLASH
 
-  
+  /* 真实镜像末尾 = .data 的 FLASH 加载地址 + .data 长度；仅看 _etext 会漏掉 rodata/ARM。 */
+  _image_end = _sidata + SIZEOF(.data);
+  ASSERT(_image_end <= 0x08018000, "Firmware image overlaps BMS NVM pages")
+
+
   /* Uninitialized data section */
   . = ALIGN(4);
   .bss :

@@ -28,20 +28,7 @@
 #include <stddef.h>
 
 
-/* ---------------- 寄存器地址 ---------------- */
-#define BQ_REG_SYS_STAT     0x00u
-#define BQ_REG_SYS_CTRL1    0x04u
-#define BQ_REG_SYS_CTRL2    0x05u
-#define BQ_REG_CC_CFG       0x0Bu
-#define BQ_REG_VC1          0x0Cu   /* 2 字节块读自动递增：VC1_HI/LO */
-#define BQ_REG_VC2          0x0Eu
-#define BQ_REG_VC3          0x10u
-#define BQ_REG_BAT          0x2Au
-#define BQ_REG_TS1          0x2Cu
-#define BQ_REG_CC           0x32u
-#define BQ_REG_ADCGAIN1     0x50u
-#define BQ_REG_ADCOFFSET    0x51u
-#define BQ_REG_ADCGAIN2     0x59u
+/* ---------------- 寄存器地址/位定义见 bq_ic.h ---------------- */
 
 #define BQ_CC_CFG_VALUE     0x19u   /* 数据手册要求启动时写入 CC_CFG<5:0> = 0x19 */
 /* 实测 CC_CFG 读回可能是 0x59 或 0x79（bit5 不稳定/固定位），低 5 位始终是 0x19；
@@ -50,12 +37,23 @@
 #define BQ_SYS_CTRL1_VALUE  0x18u   /* ADC_EN | TEMP_SEL（NORMAL 下 ADC 必须保持使能） */
 #define BQ_SYS_CTRL1_LP     0x00u   /* LP：清 ADC_EN|TEMP_SEL → 电压/电流/温度检测停，
                                        OV/UV 保护随之停；SCD/OCD 比较器不可关、仍然有效 */
-#define BQ_SYS_CTRL2_CC_EN  0x40u   /* CC_EN；FET 位叠加在低两位 */
-#define BQ_SYS_CTRL2_RUN    0x43u   /* CC_EN | DSG_ON | CHG_ON */
-#define BQ_SYS_CTRL2_LP     0x03u   /* DSG_ON | CHG_ON，CC 关闭 */
 #define BQ_SYS_STAT_IRQ_CLR 0xA0u   /* 只清 CC_READY 与 DEVICE_XREADY，保护锁存保留 */
+/* VCx/TS1 是 14 位 ADC：高字节 bit7:6 为保留位，必须屏蔽后再换算。 */
+#define BQ_CELL_ADC_MASK    0x3FFFu
 
-#define BQ_SYS_STAT_XREADY      (1u << 5)
+/* 保护阈值（3S 三元锂 NMC 1500 mAh / 1.5 mΩ 分流，数据手册 Table 8-9..8-13）：
+ *   PROTECT1: RSNS=1, SCD 67 mV(44.7 A)/100 µs
+ *   PROTECT2: OCD 56 mV(37.3 A)/320 ms
+ *   PROTECT3: OV delay 1 s, UV delay 4 s
+ *   OV/UV trip 按 ADC gain/offset 在配置完成时计算。
+ * NMC 典型保护值取 OV 4.25 V/cell、UV 2.80 V/cell（充电上限 4.20 V，
+ * 留 50 mV 防 CV 末端误触发；UV 为硬件最后保护，软件 5%/0% 更早）。 */
+#define BQ_PROTECT1_VALUE   0x89u
+#define BQ_PROTECT2_VALUE   0x57u
+#define BQ_PROTECT3_VALUE   0x40u
+#define BQ_OV_TRIP_MV       4250
+#define BQ_UV_TRIP_MV       2800
+
 #define BQ_SYS_STAT_OV          (1u << 2)
 #define BQ_SYS_STAT_UV          (1u << 3)
 #define BQ_SYS_STAT_SCD         (1u << 1)
@@ -67,6 +65,27 @@
 #define BQ_RETRY_BACKOFF_MS     20u
 #define BQ_FAIL_BACKOFF_MS      2000u
 #define BQ_CFG_RETRY_LIMIT      3u
+
+/* 首帧/每帧电压合理性门限。MAX 允许真实 4.25 V OV 被报告；
+ * 6 V 的未建立通道和 18.4 V 的包压会被拒绝。 */
+#define BQ_CELL_VALID_MIN_MV    1000
+#define BQ_CELL_VALID_MAX_MV    5000
+#define BQ_PACK_VALID_MIN_MV    3000
+#define BQ_PACK_VALID_MAX_MV    15000
+#define BQ_PACK_SUM_TOL_MV      300
+#define BQ_OV_CLEAR_GUARD_MV    50
+#define BQ_UV_CLEAR_GUARD_MV    100
+
+/* 受控 ADC 重启/恢复。 */
+#define BQ_ADC_RESTART_OFF_HOLD_MS       300u
+#define BQ_ADC_RESTART_MAX_ATTEMPTS      3u
+#define BQ_ADC_RESTART_EPISODE_COOLDOWN_MS 60000u
+#define BQ_FRAME_CONFIRM_COUNT           2u
+#define BQ_FRAME_CONFIRM_CELL_DELTA_MV   250u
+#define BQ_FRAME_CONFIRM_PACK_DELTA_MV   300u
+#define BQ_REJECT_STREAK_RESTART         4u
+#define BQ_REJECT_STREAK_FAULT           12u
+#define BQ_VC34_MAX_RAW                  128u
 
 /* ---------------- 事务描述 ---------------- */
 typedef enum
@@ -83,7 +102,8 @@ typedef struct
     uint8_t data;
 } bq_job_t;
 
-/* 配置序列：读回增益/偏移供电压换算，最后打开 CC 与两只 MOS。 */
+/* 配置序列：读回增益/偏移供电压换算；最后只开 CC，FET 默认全关，
+ * 由状态机/调试变量显式请求。 */
 static const bq_job_t s_bq_cfg_script[] =
 {
     {BQ_OP_WRITE, BQ_REG_CC_CFG,    BQ_CC_CFG_VALUE},
@@ -91,9 +111,7 @@ static const bq_job_t s_bq_cfg_script[] =
     {BQ_OP_READ1, BQ_REG_ADCGAIN1,  0u},
     {BQ_OP_READ1, BQ_REG_ADCGAIN2,  0u},
     {BQ_OP_READ1, BQ_REG_ADCOFFSET, 0u},
-    {BQ_OP_WRITE, BQ_REG_SYS_CTRL1,  BQ_SYS_CTRL1_VALUE},
-    {BQ_OP_WRITE, BQ_REG_SYS_STAT,   0xFFu},
-    {BQ_OP_WRITE, BQ_REG_SYS_CTRL2,  BQ_SYS_CTRL2_RUN}
+    {BQ_OP_WRITE, BQ_REG_SYS_STAT,   BQ_SYS_STAT_IRQ_CLR}
 };
 
 /* 运行轮询：先读状态（清 CC_READY/XREADY），再读 3 节电压、总压、TS1、CC。 */
@@ -103,7 +121,9 @@ static const bq_job_t s_bq_run_script[] =
     {BQ_OP_WRITE, BQ_REG_SYS_STAT,  BQ_SYS_STAT_IRQ_CLR},
     {BQ_OP_READ2, BQ_REG_VC1,       0u},
     {BQ_OP_READ2, BQ_REG_VC2,       0u},
-    {BQ_OP_READ2, BQ_REG_VC3,       0u},
+    {BQ_OP_READ2, BQ_REG_CELL3,     0u},
+    {BQ_OP_READ2, BQ_REG_VC3,       0u},  /* 诊断：3S 时应接近 0 */
+    {BQ_OP_READ2, BQ_REG_VC4,       0u},  /* 诊断：3S 时应接近 0 */
     {BQ_OP_READ2, BQ_REG_BAT,       0u},
     {BQ_OP_READ2, BQ_REG_TS1,       0u},
     {BQ_OP_READ2, BQ_REG_CC,        0u}
@@ -132,7 +152,7 @@ static struct
     uint8_t tx_buf[4];
     uint8_t rx_buf[4];
 
-    /* 运行时 MOS 开关请求。bit0=DSG，bit1=CHG；默认 0x03（全开）。
+    /* 运行时 MOS 开关请求。bit0=CHG，bit1=DSG；默认全关（0x00）。
      * run script 完成后若 request != applied，用一次性 DMA 写 SYS_CTRL2。 */
     volatile uint8_t request_fet_mask;
     uint8_t fet_mask_applied;
@@ -157,14 +177,80 @@ static struct
     uint8_t adc_gain2_raw;
     uint8_t adc_gain;
     int8_t adc_offset;
+    uint8_t protect1;
+    uint8_t protect2;
+    uint8_t protect3;
+    uint8_t ov_trip;
+    uint8_t uv_trip;
+    uint8_t protection_ok;
 
     uint16_t raw_cell[3];
     uint16_t raw_pack;
     uint16_t raw_ts1;
+    uint16_t raw_vc3;
+    uint16_t raw_vc4;
     int16_t cc_raw;
 
     uint16_t cell_mv[3];
     uint16_t pack_mv;
+    uint8_t voltage_settled;    /* BQ_ST_SETTLE 到期后置 1 */
+    uint8_t frame_valid;        /* 最近一次完整帧通过校验 */
+    uint8_t reject_reason;      /* bq_frame_reject_t */
+    int16_t pack_residual_mv;   /* pack_mv - (cell0+cell1+cell2) */
+    uint16_t max_cell_mv;
+    uint16_t min_cell_mv;
+    uint16_t ov_trip_mv;        /* 由实际写回的 OV_TRIP 反算 */
+    uint16_t uv_trip_mv;
+    uint32_t frame_ok_count;
+    uint32_t frame_reject_count;
+    uint32_t reject_unsettled_count;
+    uint32_t reject_cell_count;
+    uint32_t reject_pack_count;
+    uint32_t reject_sum_count;
+    uint32_t reject_vc34_count;
+    uint16_t reject_streak;
+    uint16_t reject_since_publish;
+    uint16_t last_reject_cell_mv[3];
+    uint16_t last_reject_pack_mv;
+    uint16_t last_reject_vc3_raw;
+    uint16_t last_reject_vc4_raw;
+    uint32_t last_reject_ms;
+    uint8_t last_reject_reason;
+    uint8_t last_reject_sys_stat;
+
+    /* 首帧必须连续两帧一致才发布。 */
+    uint8_t frame_confirm_count;
+    uint16_t pending_cell_mv[3];
+    uint16_t pending_pack_mv;
+    int16_t pending_pack_residual_mv;
+    uint32_t frame_confirm_reset_count;
+
+    /* 受控 ADC 重启/恢复。 */
+    uint8_t pre_ctrl1;
+    uint8_t pre_ctrl2;
+    uint8_t pre_sys_stat;
+    uint8_t pre_cellbal1;
+    uint8_t pre_snapshot_valid;
+    uint8_t post_ctrl1;
+    uint8_t post_ctrl2;
+    uint8_t post_sys_stat;
+    uint8_t settle_sys_stat;
+    uint8_t adc_off_ctrl1;
+    uint8_t adc_off_ctrl2;
+    uint8_t xready_at_settle;
+    uint16_t xready_count;
+    uint8_t xready_streak;
+    uint8_t adc_restart_pending;
+    uint8_t adc_restart_reason;
+    uint8_t adc_restart_attempts;
+    uint8_t adc_recovery_failed;
+    uint32_t adc_restart_count;
+    uint32_t adc_restart_last_ms;
+    uint32_t adc_restart_block_until_ms;
+
+    volatile uint8_t pending_sysstat_clear; /* 只清 OV/UV 的延迟位 */
+    uint8_t sysstat_sync_active;
+    bq_job_t sysstat_job;
 } s_bq;
 
 /* ---------------- CRC-8（poly 0x07，初值 0，MSB 先行） ---------------- */
@@ -213,6 +299,12 @@ static uint8_t Bq_Crc8_ReadNext(uint8_t data)
 
 /* ---------------- 硬件层 ---------------- */
 static void Bq_RecoverBus(void);
+static void Bq_RequestAdcRestart(uint8_t reason);
+static void Bq_ConfigFailed(void);
+static int Bq_PreConfigSnapshot(void);
+static int Bq_ForceAdcOff(void);
+static int Bq_EnableAdcVerified(void);
+static int Bq_VerifySettleStatus(void);
 
 static void Bq_HwInit(void)
 {
@@ -320,6 +412,49 @@ static int Bq_BlockingRead1(uint8_t reg, uint8_t *out)
     return 0;
 }
 
+/* 连续读 1..8 个寄存器，返回数据字节（丢弃每字节 CRC）。 */
+static int Bq_BlockingReadBlock(uint8_t reg, uint8_t *out, uint8_t count)
+{
+    uint8_t ptr[1];
+    uint8_t rx[16];
+    uint8_t i;
+
+    if ((out == NULL) || (count == 0u) || (count > 8u))
+    {
+        return -1;
+    }
+
+    ptr[0] = reg;
+    if (HAL_I2C_Master_Transmit(&hi2c1, BQ_I2C_ADDR_WRITE, ptr, 1u,
+                                BQ_BLOCKING_TIMEOUT_MS) != HAL_OK)
+    {
+        return -1;
+    }
+    if (HAL_I2C_Master_Receive(&hi2c1, BQ_I2C_ADDR_WRITE, rx,
+                               (uint16_t)(2u * count),
+                               BQ_BLOCKING_TIMEOUT_MS) != HAL_OK)
+    {
+        return -1;
+    }
+
+    if (rx[1] != Bq_Crc8_ReadFirst(rx[0]))
+    {
+        return -1;
+    }
+    for (i = 1u; i < count; i++)
+    {
+        if (rx[(2u * i) + 1u] != Bq_Crc8_ReadNext(rx[2u * i]))
+        {
+            return -1;
+        }
+    }
+    for (i = 0u; i < count; i++)
+    {
+        out[i] = rx[2u * i];
+    }
+    return 0;
+}
+
 /* ---------------- 数据换算 ---------------- */
 static uint16_t Bq_RawToMv(uint16_t raw)
 {
@@ -357,22 +492,11 @@ static uint16_t Bq_RawPackToMv(uint16_t raw)
     return (uint16_t)millivolts;
 }
 
-static void Bq_UpdateFaults(uint8_t stat)
+/* SCD/OCD 是硬件比较器，和 ADC 建立无关，任何 SYS_STAT 读取都要立即更新。 */
+static void Bq_UpdateFastFaults(uint8_t stat)
 {
     uint16_t live = 0u;
 
-    if ((stat & BQ_SYS_STAT_XREADY) != 0u)
-    {
-        live |= FAULT_BIT_BQ_XREADY;
-    }
-    if ((stat & BQ_SYS_STAT_OV) != 0u)
-    {
-        live |= FAULT_BIT_BQ_OV;
-    }
-    if ((stat & BQ_SYS_STAT_UV) != 0u)
-    {
-        live |= FAULT_BIT_BQ_UV;
-    }
     if ((stat & BQ_SYS_STAT_SCD) != 0u)
     {
         live |= FAULT_BIT_BQ_SCD;
@@ -382,8 +506,31 @@ static void Bq_UpdateFaults(uint8_t stat)
         live |= FAULT_BIT_BQ_OCD;
     }
 
-    Fault_ClearLive(FAULT_BIT_BQ_XREADY | FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |
-                    FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD);
+    Fault_ClearLive(FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD);
+    Fault_SetLive(live);
+}
+
+/* OV/UV/XREADY 只由已经通过电压校验的稳定帧更新。
+ * false_ov/false_uv 表示该锁存来自 ADC 建立期的假值，本帧不置 live。 */
+static void Bq_UpdateVoltageFaults(uint8_t stat, uint8_t false_ov,
+                                   uint8_t false_uv)
+{
+    uint16_t live = 0u;
+
+    if ((stat & BQ_SYS_STAT_XREADY) != 0u)
+    {
+        live |= FAULT_BIT_BQ_XREADY;
+    }
+    if (((stat & BQ_SYS_STAT_OV) != 0u) && (false_ov == 0u))
+    {
+        live |= FAULT_BIT_BQ_OV;
+    }
+    if (((stat & BQ_SYS_STAT_UV) != 0u) && (false_uv == 0u))
+    {
+        live |= FAULT_BIT_BQ_UV;
+    }
+
+    Fault_ClearLive(FAULT_BIT_BQ_XREADY | FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV);
     Fault_SetLive(live);
 }
 
@@ -397,7 +544,23 @@ static void Bq_HandleReadData(uint8_t reg, const uint8_t *data, uint8_t count)
     {
     case BQ_REG_SYS_STAT:
         s_bq.sys_stat = data[0];
-        Bq_UpdateFaults(data[0]);
+        Bq_UpdateFastFaults(data[0]);
+        if ((data[0] & BQ_SYS_STAT_XREADY) != 0u)
+        {
+            s_bq.xready_count++;
+            if (s_bq.xready_streak < 0xFFu)
+            {
+                s_bq.xready_streak++;
+            }
+            if (s_bq.xready_streak >= 2u)
+            {
+                Bq_RequestAdcRestart((uint8_t)BQ_RESTART_REASON_XREADY);
+            }
+        }
+        else
+        {
+            s_bq.xready_streak = 0u;
+        }
         break;
 
     case BQ_REG_CC_CFG:
@@ -423,21 +586,40 @@ static void Bq_HandleReadData(uint8_t reg, const uint8_t *data, uint8_t count)
     case BQ_REG_VC1:
         if (count == 2u)
         {
-            s_bq.raw_cell[0] = (uint16_t)(((uint16_t)data[0] << 8) | data[2]);
+            s_bq.raw_cell[0] = (uint16_t)((((uint16_t)data[0] << 8) |
+                                           data[2]) & BQ_CELL_ADC_MASK);
         }
         break;
 
     case BQ_REG_VC2:
         if (count == 2u)
         {
-            s_bq.raw_cell[1] = (uint16_t)(((uint16_t)data[0] << 8) | data[2]);
+            s_bq.raw_cell[1] = (uint16_t)((((uint16_t)data[0] << 8) |
+                                           data[2]) & BQ_CELL_ADC_MASK);
+        }
+        break;
+
+    case BQ_REG_CELL3:
+        if (count == 2u)
+        {
+            s_bq.raw_cell[2] = (uint16_t)((((uint16_t)data[0] << 8) |
+                                           data[2]) & BQ_CELL_ADC_MASK);
         }
         break;
 
     case BQ_REG_VC3:
         if (count == 2u)
         {
-            s_bq.raw_cell[2] = (uint16_t)(((uint16_t)data[0] << 8) | data[2]);
+            s_bq.raw_vc3 = (uint16_t)((((uint16_t)data[0] << 8) |
+                                       data[2]) & BQ_CELL_ADC_MASK);
+        }
+        break;
+
+    case BQ_REG_VC4:
+        if (count == 2u)
+        {
+            s_bq.raw_vc4 = (uint16_t)((((uint16_t)data[0] << 8) |
+                                       data[2]) & BQ_CELL_ADC_MASK);
         }
         break;
 
@@ -451,7 +633,8 @@ static void Bq_HandleReadData(uint8_t reg, const uint8_t *data, uint8_t count)
     case BQ_REG_TS1:
         if (count == 2u)
         {
-            s_bq.raw_ts1 = (uint16_t)(((uint16_t)data[0] << 8) | data[2]);
+            s_bq.raw_ts1 = (uint16_t)((((uint16_t)data[0] << 8) |
+                                       data[2]) & BQ_CELL_ADC_MASK);
         }
         break;
 
@@ -468,16 +651,520 @@ static void Bq_HandleReadData(uint8_t reg, const uint8_t *data, uint8_t count)
     }
 }
 
-static void Bq_SnapshotUpdate(void)
+/* 由实际写入的 8 位 OV/UV middle-code 反算 mV，供假锁存安全判断使用。 */
+static uint16_t Bq_TripFullToMv(uint16_t full)
 {
-    s_bq.cell_mv[0] = Bq_RawToMv(s_bq.raw_cell[0]);
-    s_bq.cell_mv[1] = Bq_RawToMv(s_bq.raw_cell[1]);
-    s_bq.cell_mv[2] = Bq_RawToMv(s_bq.raw_cell[2]);
-    s_bq.pack_mv = Bq_RawPackToMv(s_bq.raw_pack);
+    int32_t millivolts = ((int32_t)(365 + (int32_t)s_bq.adc_gain) *
+                          (int32_t)full) / 1000 + (int32_t)s_bq.adc_offset;
+
+    if (millivolts < 0)
+    {
+        millivolts = 0;
+    }
+    if (millivolts > 65535)
+    {
+        millivolts = 65535;
+    }
+    return (uint16_t)millivolts;
+}
+
+static void Bq_UpdateTripThresholds(void)
+{
+    uint16_t ov_full = (uint16_t)(0x2000u |
+                                  (((uint16_t)s_bq.ov_trip & 0xFFu) << 4) |
+                                  0x8u);
+    uint16_t uv_full = (uint16_t)(0x1000u |
+                                  (((uint16_t)s_bq.uv_trip & 0xFFu) << 4));
+
+    s_bq.ov_trip_mv = Bq_TripFullToMv(ov_full);
+    s_bq.uv_trip_mv = Bq_TripFullToMv(uv_full);
+}
+
+static uint8_t Bq_ValidateFrameValues(const uint16_t cells[3], uint16_t pack,
+                                      uint16_t *residual_mv, uint8_t *reason)
+{
+    int32_t sum;
+
+    if ((cells[0] < BQ_CELL_VALID_MIN_MV) || (cells[0] > BQ_CELL_VALID_MAX_MV) ||
+        (cells[1] < BQ_CELL_VALID_MIN_MV) || (cells[1] > BQ_CELL_VALID_MAX_MV) ||
+        (cells[2] < BQ_CELL_VALID_MIN_MV) || (cells[2] > BQ_CELL_VALID_MAX_MV))
+    {
+        *reason = (uint8_t)BQ_FRAME_REJECT_CELL_RANGE;
+        return 0u;
+    }
+    if ((pack < BQ_PACK_VALID_MIN_MV) || (pack > BQ_PACK_VALID_MAX_MV))
+    {
+        *reason = (uint8_t)BQ_FRAME_REJECT_PACK_RANGE;
+        return 0u;
+    }
+
+    sum = (int32_t)cells[0] + (int32_t)cells[1] + (int32_t)cells[2];
+    *residual_mv = (uint16_t)(int16_t)((int32_t)pack - sum);
+    if (((int32_t)pack - sum > BQ_PACK_SUM_TOL_MV) ||
+        ((int32_t)pack - sum < -BQ_PACK_SUM_TOL_MV))
+    {
+        *reason = (uint8_t)BQ_FRAME_REJECT_PACK_SUM;
+        return 0u;
+    }
+
+    *reason = (uint8_t)BQ_FRAME_OK;
+    return 1u;
+}
+
+static uint8_t Bq_ValidateFrame(const uint16_t cells[3], uint16_t pack,
+                                uint16_t *residual_mv, uint8_t *reason)
+{
+    if (s_bq.voltage_settled == 0u)
+    {
+        *reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+        return 0u;
+    }
+    if (s_bq.protection_ok == 0u)
+    {
+        *reason = (uint8_t)BQ_FRAME_REJECT_NOT_CONFIGURED;
+        return 0u;
+    }
+    return Bq_ValidateFrameValues(cells, pack, residual_mv, reason);
+}
+
+static void Bq_RequestAdcRestart(uint8_t reason)
+{
+    if (s_bq.adc_restart_pending != 0u)
+    {
+        return;
+    }
+    if (s_bq.adc_restart_block_until_ms != 0u)
+    {
+        if ((int32_t)(s_bq.now_ms - s_bq.adc_restart_block_until_ms) < 0)
+        {
+            return;
+        }
+        /* 冷却结束：开启新的有界恢复回合。 */
+        s_bq.adc_restart_block_until_ms = 0u;
+        s_bq.adc_restart_attempts = 0u;
+        s_bq.adc_recovery_failed = 0u;
+    }
+
+    if (s_bq.adc_restart_attempts >= BQ_ADC_RESTART_MAX_ATTEMPTS)
+    {
+        s_bq.adc_recovery_failed = 1u;
+        s_bq.adc_restart_block_until_ms =
+            s_bq.now_ms + BQ_ADC_RESTART_EPISODE_COOLDOWN_MS;
+        Fault_SetLive(FAULT_BIT_BQ_ADC_STUCK);
+        return;
+    }
+
+    s_bq.adc_restart_pending = 1u;
+    s_bq.adc_restart_reason = reason;
+}
+
+static void Bq_RecordReject(const uint16_t cells[3], uint16_t pack,
+                            uint8_t reason)
+{
+    s_bq.frame_valid = 0u;
+    s_bq.reject_reason = reason;
+    s_bq.frame_reject_count++;
+    s_bq.last_reject_cell_mv[0] = cells[0];
+    s_bq.last_reject_cell_mv[1] = cells[1];
+    s_bq.last_reject_cell_mv[2] = cells[2];
+    s_bq.last_reject_pack_mv = pack;
+    s_bq.last_reject_vc3_raw = s_bq.raw_vc3;
+    s_bq.last_reject_vc4_raw = s_bq.raw_vc4;
+    s_bq.last_reject_sys_stat = s_bq.sys_stat;
+    s_bq.last_reject_reason = reason;
+    s_bq.last_reject_ms = s_bq.now_ms;
+    s_bq.frame_confirm_count = 0u;
+    s_bq.fresh = 0u;
+
+    if (s_bq.reject_streak < 0xFFFFu)
+    {
+        s_bq.reject_streak++;
+    }
+    if (s_bq.reject_since_publish < 0xFFFFu)
+    {
+        s_bq.reject_since_publish++;
+    }
+
+    if (reason == (uint8_t)BQ_FRAME_REJECT_UNSETTLED)
+    {
+        s_bq.reject_unsettled_count++;
+    }
+    else if (reason == (uint8_t)BQ_FRAME_REJECT_CELL_RANGE)
+    {
+        s_bq.reject_cell_count++;
+    }
+    else if (reason == (uint8_t)BQ_FRAME_REJECT_PACK_RANGE)
+    {
+        s_bq.reject_pack_count++;
+    }
+    else if (reason == (uint8_t)BQ_FRAME_REJECT_PACK_SUM)
+    {
+        s_bq.reject_sum_count++;
+    }
+    else if (reason == (uint8_t)BQ_FRAME_REJECT_VC34_SANITY)
+    {
+        s_bq.reject_vc34_count++;
+    }
+
+    if (reason != (uint8_t)BQ_FRAME_REJECT_UNSETTLED)
+    {
+        if (s_bq.reject_streak >= BQ_REJECT_STREAK_FAULT)
+        {
+            Fault_SetLive(FAULT_BIT_BQ_ADC_STUCK);
+        }
+        else if (s_bq.reject_streak >= BQ_REJECT_STREAK_RESTART)
+        {
+            Bq_RequestAdcRestart((uint8_t)BQ_RESTART_REASON_REJECT_STREAK);
+        }
+    }
+}
+
+static void Bq_PublishFrame(const uint16_t cells[3], uint16_t pack,
+                            int16_t residual)
+{
+    uint8_t false_ov = 0u;
+    uint8_t false_uv = 0u;
+    uint8_t pending = 0u;
+
+    s_bq.cell_mv[0] = cells[0];
+    s_bq.cell_mv[1] = cells[1];
+    s_bq.cell_mv[2] = cells[2];
+    s_bq.pack_mv = pack;
+    s_bq.pack_residual_mv = residual;
+    s_bq.max_cell_mv = (cells[0] >= cells[1]) ? cells[0] : cells[1];
+    if (cells[2] > s_bq.max_cell_mv)
+    {
+        s_bq.max_cell_mv = cells[2];
+    }
+    s_bq.min_cell_mv = (cells[0] <= cells[1]) ? cells[0] : cells[1];
+    if (cells[2] < s_bq.min_cell_mv)
+    {
+        s_bq.min_cell_mv = cells[2];
+    }
+
     /* CC：1 LSB=8.44 µV，分流 1.5 mΩ → I(mA)=cc_raw×844/150（带符号）。 */
     s_bq.current_ma = ((int32_t)s_bq.cc_raw * BQ_CURRENT_MA_NUM) / BQ_CURRENT_MA_DEN;
     s_bq.last_update_ms = s_bq.now_ms;
+    s_bq.frame_valid = 1u;
+    s_bq.reject_reason = (uint8_t)BQ_FRAME_OK;
+    s_bq.frame_confirm_count = 2u;
+    s_bq.reject_streak = 0u;
+    s_bq.reject_since_publish = 0u;
+    s_bq.adc_restart_pending = 0u;
+    s_bq.adc_restart_attempts = 0u;
+    s_bq.adc_recovery_failed = 0u;
+    s_bq.adc_restart_block_until_ms = 0u;
+    Fault_ClearLive(FAULT_BIT_BQ_ADC_STUCK);
     s_bq.fresh = 1u;
+
+    /* ADC 建立期可能已经锁存假 OV/UV。只有稳定帧中三相电压
+     * 明显落在实际 OV/UV 阈值内时才清对应锁存；真实故障保留。 */
+    if (((s_bq.sys_stat & BQ_SYS_STAT_OV) != 0u) &&
+        (s_bq.max_cell_mv <= (s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV ?
+                              (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u)))
+    {
+        false_ov = 1u;
+        pending |= BQ_SYS_STAT_OV;
+    }
+    if (((s_bq.sys_stat & BQ_SYS_STAT_UV) != 0u) &&
+        ((uint32_t)s_bq.min_cell_mv >=
+         ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV)))
+    {
+        false_uv = 1u;
+        pending |= BQ_SYS_STAT_UV;
+    }
+    if (pending != 0u)
+    {
+        s_bq.pending_sysstat_clear |= pending;
+    }
+    Bq_UpdateVoltageFaults(s_bq.sys_stat, false_ov, false_uv);
+}
+
+/* 只有完整、已稳定且通过电压/包压合理性检查的帧才发布。
+ * 首个有效帧只作为候选，第二帧一致后才发布。 */
+static void Bq_FrameCommit(void)
+{
+    uint16_t cells[3];
+    uint16_t pack;
+    uint16_t residual = 0u;
+    uint8_t reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+    uint8_t delta_ok = 1u;
+    uint8_t i;
+
+    cells[0] = Bq_RawToMv(s_bq.raw_cell[0]);
+    cells[1] = Bq_RawToMv(s_bq.raw_cell[1]);
+    cells[2] = Bq_RawToMv(s_bq.raw_cell[2]);
+    pack = Bq_RawPackToMv(s_bq.raw_pack);
+
+    if (Bq_ValidateFrame(cells, pack, &residual, &reason) == 0u)
+    {
+        Bq_RecordReject(cells, pack, reason);
+        return;
+    }
+
+    if ((s_bq.raw_vc3 > BQ_VC34_MAX_RAW) ||
+        (s_bq.raw_vc4 > BQ_VC34_MAX_RAW))
+    {
+        Bq_RecordReject(cells, pack,
+                        (uint8_t)BQ_FRAME_REJECT_VC34_SANITY);
+        return;
+    }
+
+    s_bq.frame_ok_count++;
+    s_bq.reject_streak = 0u;
+    if (s_bq.frame_confirm_count == 0u)
+    {
+        for (i = 0u; i < 3u; i++)
+        {
+            s_bq.pending_cell_mv[i] = cells[i];
+        }
+        s_bq.pending_pack_mv = pack;
+        s_bq.pending_pack_residual_mv = (int16_t)residual;
+        s_bq.frame_confirm_count = 1u;
+        s_bq.frame_valid = 0u;
+        s_bq.fresh = 0u;
+        return;
+    }
+
+    if (s_bq.frame_confirm_count == 1u)
+    {
+        for (i = 0u; i < 3u; i++)
+        {
+            uint16_t diff = (cells[i] >= s_bq.pending_cell_mv[i]) ?
+                            (uint16_t)(cells[i] - s_bq.pending_cell_mv[i]) :
+                            (uint16_t)(s_bq.pending_cell_mv[i] - cells[i]);
+            if (diff > BQ_FRAME_CONFIRM_CELL_DELTA_MV)
+            {
+                delta_ok = 0u;
+            }
+        }
+        {
+            uint16_t diff = (pack >= s_bq.pending_pack_mv) ?
+                            (uint16_t)(pack - s_bq.pending_pack_mv) :
+                            (uint16_t)(s_bq.pending_pack_mv - pack);
+            if (diff > BQ_FRAME_CONFIRM_PACK_DELTA_MV)
+            {
+                delta_ok = 0u;
+            }
+        }
+
+        if (delta_ok == 0u)
+        {
+            for (i = 0u; i < 3u; i++)
+            {
+                s_bq.pending_cell_mv[i] = cells[i];
+            }
+            s_bq.pending_pack_mv = pack;
+            s_bq.pending_pack_residual_mv = (int16_t)residual;
+            s_bq.frame_confirm_count = 1u;
+            s_bq.frame_confirm_reset_count++;
+            s_bq.frame_valid = 0u;
+            s_bq.fresh = 0u;
+            return;
+        }
+        s_bq.frame_confirm_count = 2u;
+    }
+
+    Bq_PublishFrame(cells, pack, (int16_t)residual);
+}
+
+/* 按实际 ADCGAIN/ADCOFFSET 计算 OV/UV 的 8 位 middle-code。
+ * V(mV) = (365 + gain) × ADC / 1000 + offset；OV 全 14 位以 10 开头、
+ * 低 4 位 1000，UV 以 01 开头、低 4 位 0000，寄存器只存 middle 8 位。 */
+static int Bq_ApplyProtectionConfig(void)
+{
+    int32_t gain_uv;
+    int32_t full;
+    uint8_t ov_trip;
+    uint8_t uv_trip;
+    uint8_t rb;
+
+    gain_uv = 365 + (int32_t)s_bq.adc_gain;
+    if (gain_uv <= 0)
+    {
+        return -1;
+    }
+
+    full = (((int32_t)BQ_OV_TRIP_MV - (int32_t)s_bq.adc_offset) * 1000) / gain_uv;
+    if (full < 0x2000)
+    {
+        full = 0x2000;
+    }
+    if (full > 0x2FFF)
+    {
+        full = 0x2FFF;
+    }
+    ov_trip = (uint8_t)((full >> 4) & 0xFF);
+
+    full = (((int32_t)BQ_UV_TRIP_MV - (int32_t)s_bq.adc_offset) * 1000) / gain_uv;
+    if (full < 0x1000)
+    {
+        full = 0x1000;
+    }
+    if (full > 0x1FFF)
+    {
+        full = 0x1FFF;
+    }
+    uv_trip = (uint8_t)((full >> 4) & 0xFF);
+
+    if (Bq_BlockingWrite(BQ_REG_PROTECT1, BQ_PROTECT1_VALUE) != 0 ||
+        Bq_BlockingWrite(BQ_REG_PROTECT2, BQ_PROTECT2_VALUE) != 0 ||
+        Bq_BlockingWrite(BQ_REG_PROTECT3, BQ_PROTECT3_VALUE) != 0 ||
+        Bq_BlockingWrite(BQ_REG_OV_TRIP, ov_trip) != 0 ||
+        Bq_BlockingWrite(BQ_REG_UV_TRIP, uv_trip) != 0)
+    {
+        return -1;
+    }
+
+    if ((Bq_BlockingRead1(BQ_REG_PROTECT1, &rb) != 0) || (rb != BQ_PROTECT1_VALUE) ||
+        (Bq_BlockingRead1(BQ_REG_PROTECT2, &rb) != 0) || (rb != BQ_PROTECT2_VALUE) ||
+        (Bq_BlockingRead1(BQ_REG_PROTECT3, &rb) != 0) || (rb != BQ_PROTECT3_VALUE) ||
+        (Bq_BlockingRead1(BQ_REG_OV_TRIP, &rb) != 0) || (rb != ov_trip) ||
+        (Bq_BlockingRead1(BQ_REG_UV_TRIP, &rb) != 0) || (rb != uv_trip))
+    {
+        return -1;
+    }
+
+    s_bq.protect1 = BQ_PROTECT1_VALUE;
+    s_bq.protect2 = BQ_PROTECT2_VALUE;
+    s_bq.protect3 = BQ_PROTECT3_VALUE;
+    s_bq.ov_trip = ov_trip;
+    s_bq.uv_trip = uv_trip;
+    s_bq.protection_ok = 1u;
+    Bq_UpdateTripThresholds();
+    return 0;
+}
+
+/* 受控 ADC 重启：配置前快照、ADC/CC/FET 关闭、最后再使能。 */
+static int Bq_PreConfigSnapshot(void)
+{
+    uint8_t rb1 = 0u;
+    uint8_t rb2 = 0u;
+    uint8_t stat = 0u;
+    uint8_t bal = 0u;
+
+    s_bq.pre_snapshot_valid = 0u;
+    if ((Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &rb1) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &rb2) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_CELLBAL1, &bal) != 0))
+    {
+        return -1;
+    }
+
+    s_bq.pre_ctrl1 = rb1;
+    s_bq.pre_ctrl2 = rb2;
+    s_bq.pre_sys_stat = stat;
+    s_bq.pre_cellbal1 = bal;
+    s_bq.pre_snapshot_valid = 1u;
+    return 0;
+}
+
+static int Bq_ForceAdcOff(void)
+{
+    uint8_t rb1 = 0u;
+    uint8_t rb2 = 0u;
+    uint8_t bal = 0u;
+
+    if ((Bq_BlockingWrite(BQ_REG_SYS_CTRL2, 0x00u) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_CELLBAL1, 0x00u) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, BQ_SYS_CTRL1_LP) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &rb1) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &rb2) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_CELLBAL1, &bal) != 0))
+    {
+        return -1;
+    }
+
+    s_bq.adc_off_ctrl1 = rb1;
+    s_bq.adc_off_ctrl2 = rb2;
+    if (((rb1 & (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL)) != 0u) ||
+        ((rb2 & (BQ_SYS_CTRL2_CC_EN | BQ_FET_MASK_ALL)) != 0u) ||
+        (bal != 0u))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int Bq_EnableAdcVerified(void)
+{
+    uint8_t rb1 = 0u;
+    uint8_t rb2 = 0u;
+    uint8_t stat = 0u;
+
+    if ((Bq_BlockingWrite(BQ_REG_SYS_CTRL2, BQ_SYS_CTRL2_CC_EN) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &rb2) != 0))
+    {
+        return -1;
+    }
+    s_bq.post_ctrl2 = rb2;
+    if ((rb2 & (BQ_SYS_CTRL2_CC_EN | BQ_FET_MASK_ALL)) !=
+        BQ_SYS_CTRL2_CC_EN)
+    {
+        return -1;
+    }
+
+    if ((Bq_BlockingWrite(BQ_REG_SYS_CTRL1, BQ_SYS_CTRL1_VALUE) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &rb1) != 0))
+    {
+        return -1;
+    }
+    s_bq.post_ctrl1 = rb1;
+    if ((rb1 & (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL)) !=
+        (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL))
+    {
+        return -1;
+    }
+
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+    s_bq.post_sys_stat = stat;
+    s_bq.xready_at_settle =
+        ((stat & BQ_SYS_STAT_XREADY) != 0u) ? 1u : 0u;
+    return 0;
+}
+
+static int Bq_VerifySettleStatus(void)
+{
+    uint8_t stat = 0u;
+    uint8_t rb1 = 0u;
+
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+    s_bq.settle_sys_stat = stat;
+
+    if ((stat & BQ_SYS_STAT_XREADY) != 0u)
+    {
+        s_bq.xready_count++;
+        if (Bq_BlockingWrite(BQ_REG_SYS_STAT, BQ_SYS_STAT_XREADY) != 0)
+        {
+            return -1;
+        }
+        HAL_Delay(10u);
+        if ((Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0) ||
+            ((stat & BQ_SYS_STAT_XREADY) != 0u))
+        {
+            Fault_SetLive(FAULT_BIT_BQ_XREADY);
+            return -1;
+        }
+        s_bq.settle_sys_stat = stat;
+    }
+
+    if (Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &rb1) != 0)
+    {
+        return -1;
+    }
+    if ((rb1 & (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL)) !=
+        (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL))
+    {
+        return -1;
+    }
+    return 0;
 }
 
 /* ---------------- 事务状态机 ---------------- */
@@ -516,6 +1203,25 @@ static void Bq_TransferFailed(void)
     }
 }
 
+static void Bq_ConfigFailed(void)
+{
+    s_bq.protection_ok = 0u;
+    s_bq.voltage_settled = 0u;
+    s_bq.frame_valid = 0u;
+    s_bq.fresh = 0u;
+    s_bq.req_read = 0u;
+    s_bq.frame_confirm_count = 0u;
+    s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_NOT_CONFIGURED;
+
+    s_bq.cfg_attempts++;
+    if (s_bq.cfg_attempts >= BQ_CFG_RETRY_LIMIT)
+    {
+        Fault_SetSticky(FAULT_BIT_BQ_COMM);
+        s_bq.cfg_attempts = 0u;
+    }
+    Bq_ScheduleRetry(0u);
+}
+
 static void Bq_JobComplete(void)
 {
     s_bq.retry = 0u;
@@ -528,6 +1234,15 @@ static void Bq_ScriptComplete(void)
 {
     s_bq.script = NULL;
 
+    /* 一次性 SYS_STAT 清锁存写完成：只从影子中消掉对应 OV/UV 位。 */
+    if (s_bq.sysstat_sync_active != 0u)
+    {
+        s_bq.sysstat_sync_active = 0u;
+        s_bq.sys_stat &= (uint8_t)~((uint8_t)s_bq.sysstat_job.data &
+                                    (BQ_SYS_STAT_OV | BQ_SYS_STAT_UV));
+        return;
+    }
+
     /* 一次性 FET 同步写完成：以写入时的 mask 为准（期间若又改请求，下轮再同步）。 */
     if (s_bq.fet_sync_active != 0u)
     {
@@ -538,35 +1253,50 @@ static void Bq_ScriptComplete(void)
 
     if (s_bq.state == BQ_ST_CONFIG)
     {
-        if ((s_bq.cc_cfg_readback & BQ_CC_CFG_MASK) == BQ_CC_CFG_VALUE)
+        if (((s_bq.cc_cfg_readback & BQ_CC_CFG_MASK) != BQ_CC_CFG_VALUE) ||
+            (Bq_ApplyProtectionConfig() != 0) ||
+            (Bq_EnableAdcVerified() != 0))
         {
-            s_bq.cfg_attempts = 0u;
-            s_bq.fet_mask_applied = 0x03u;  /* 配置脚本最后写 SYS_CTRL2=0x43 */
-            s_bq.fet_sync_active = 0u;
-            s_bq.state = BQ_ST_RUN;
-            s_bq.req_read = 1u;     /* 配置完成后立刻取一轮数据 */
+            Bq_ConfigFailed();
         }
         else
         {
-            s_bq.cfg_attempts++;
-            if (s_bq.cfg_attempts >= BQ_CFG_RETRY_LIMIT)
-            {
-                Fault_SetSticky(FAULT_BIT_BQ_COMM);
-                s_bq.cfg_attempts = 0u;
-                Bq_ScheduleRetry(0u);
-            }
-            else
-            {
-                Bq_ScheduleRetry(0u);
-            }
+            s_bq.cfg_attempts = 0u;
+            s_bq.fet_mask_applied = BQ_FET_MASK_NONE;  /* 配置脚本最后只开 CC（0x40） */
+            s_bq.fet_sync_active = 0u;
+            s_bq.voltage_settled = 0u;
+            s_bq.frame_valid = 0u;
+            s_bq.frame_confirm_count = 0u;
+            s_bq.reject_streak = 0u;
+            s_bq.reject_since_publish = 0u;
+            s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+            s_bq.fresh = 0u;
+            s_bq.req_read = 0u;
+            s_bq.state = BQ_ST_SETTLE;
+            s_bq.state_enter_ms = s_bq.now_ms;
         }
     }
     else if (s_bq.state == BQ_ST_RUN)
     {
-        Bq_SnapshotUpdate();
+        Bq_FrameCommit();
         s_bq.req_read = 0u;
 
-        /* 本刷新周期结束，按 MOS 开关请求同步（保留 CC_EN）。 */
+        /* 本刷新周期结束，按 MOS 开关请求同步（保留 CC_EN）。
+         * SYS_STAT 假锁存清理排在 FET 同步之前，由 BQ_Poll 发起。 */
+        if (s_bq.pending_sysstat_clear != 0u)
+        {
+            uint8_t clear_mask = s_bq.pending_sysstat_clear;
+
+            s_bq.pending_sysstat_clear = 0u;
+            s_bq.sysstat_job.op = (uint8_t)BQ_OP_WRITE;
+            s_bq.sysstat_job.reg = BQ_REG_SYS_STAT;
+            s_bq.sysstat_job.data =
+                (uint8_t)(clear_mask | BQ_SYS_STAT_IRQ_CLR);
+            s_bq.sysstat_sync_active = 1u;
+            Bq_StartScript(&s_bq.sysstat_job, 1u, BQ_ST_RUN);
+            return;
+        }
+
         if ((s_bq.request_fet_mask & 0x03u) != s_bq.fet_mask_applied)
         {
             s_bq.fet_job.op = (uint8_t)BQ_OP_WRITE;
@@ -660,7 +1390,33 @@ static void Bq_StartScript(const bq_job_t *script, uint8_t len, bq_state_t state
 
 static void Bq_StartConfig(void)
 {
+    s_bq.script = NULL;
     s_bq.cc_cfg_readback = 0u;
+    s_bq.protection_ok = 0u;
+    s_bq.voltage_settled = 0u;
+    s_bq.frame_valid = 0u;
+    s_bq.frame_confirm_count = 0u;
+    s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+    s_bq.fresh = 0u;
+    s_bq.req_read = 0u;
+    s_bq.pending_sysstat_clear = 0u;
+    s_bq.sysstat_sync_active = 0u;
+    s_bq.xready_at_settle = 0u;
+    s_bq.xready_streak = 0u;
+
+    if ((Bq_PreConfigSnapshot() != 0) || (Bq_ForceAdcOff() != 0))
+    {
+        Bq_ConfigFailed();
+        return;
+    }
+
+    /* ADC/CC/FET 已确认关闭；等一个 BQ ADC 帧后再写配置和重新使能。 */
+    s_bq.state = BQ_ST_ADC_RESTART_OFF;
+    s_bq.state_enter_ms = HAL_GetTick();
+}
+
+static void Bq_StartConfigScript(void)
+{
     Bq_StartScript(s_bq_cfg_script,
                    (uint8_t)(sizeof(s_bq_cfg_script) / sizeof(s_bq_cfg_script[0])),
                    BQ_ST_CONFIG);
@@ -762,7 +1518,7 @@ void BQ_Init(void)
     s_bq.irq_error = 0u;
     s_bq.xfer_phase = 0u;
     s_bq.xfer_start_ms = 0u;
-    s_bq.request_fet_mask = 0x03u;
+    s_bq.request_fet_mask = BQ_DEFAULT_FET_MASK;
     s_bq.fet_mask_applied = 0u;
     s_bq.fet_sync_active = 0u;
     s_bq.fet_job.op = 0u;
@@ -783,23 +1539,106 @@ void BQ_Init(void)
     s_bq.adc_gain2_raw = 0u;
     s_bq.adc_gain = 0u;
     s_bq.adc_offset = 0;
+    s_bq.protect1 = 0u;
+    s_bq.protect2 = 0u;
+    s_bq.protect3 = 0u;
+    s_bq.ov_trip = 0u;
+    s_bq.uv_trip = 0u;
+    s_bq.protection_ok = 0u;
     s_bq.raw_cell[0] = 0u;
     s_bq.raw_cell[1] = 0u;
     s_bq.raw_cell[2] = 0u;
     s_bq.raw_pack = 0u;
     s_bq.raw_ts1 = 0u;
+    s_bq.raw_vc3 = 0u;
+    s_bq.raw_vc4 = 0u;
     s_bq.cc_raw = 0;
     s_bq.cell_mv[0] = 0u;
     s_bq.cell_mv[1] = 0u;
     s_bq.cell_mv[2] = 0u;
     s_bq.pack_mv = 0u;
+    s_bq.voltage_settled = 0u;
+    s_bq.frame_valid = 0u;
+    s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+    s_bq.pack_residual_mv = 0;
+    s_bq.max_cell_mv = 0u;
+    s_bq.min_cell_mv = 0u;
+    s_bq.ov_trip_mv = 0u;
+    s_bq.uv_trip_mv = 0u;
+    s_bq.frame_ok_count = 0u;
+    s_bq.frame_reject_count = 0u;
+    s_bq.reject_unsettled_count = 0u;
+    s_bq.reject_cell_count = 0u;
+    s_bq.reject_pack_count = 0u;
+    s_bq.reject_sum_count = 0u;
+    s_bq.reject_vc34_count = 0u;
+    s_bq.reject_streak = 0u;
+    s_bq.reject_since_publish = 0u;
+    s_bq.last_reject_cell_mv[0] = 0u;
+    s_bq.last_reject_cell_mv[1] = 0u;
+    s_bq.last_reject_cell_mv[2] = 0u;
+    s_bq.last_reject_pack_mv = 0u;
+    s_bq.last_reject_vc3_raw = 0u;
+    s_bq.last_reject_vc4_raw = 0u;
+    s_bq.last_reject_ms = 0u;
+    s_bq.last_reject_reason = 0u;
+    s_bq.last_reject_sys_stat = 0u;
+    s_bq.frame_confirm_count = 0u;
+    s_bq.pending_cell_mv[0] = 0u;
+    s_bq.pending_cell_mv[1] = 0u;
+    s_bq.pending_cell_mv[2] = 0u;
+    s_bq.pending_pack_mv = 0u;
+    s_bq.pending_pack_residual_mv = 0;
+    s_bq.frame_confirm_reset_count = 0u;
+    s_bq.pre_ctrl1 = 0u;
+    s_bq.pre_ctrl2 = 0u;
+    s_bq.pre_sys_stat = 0u;
+    s_bq.pre_cellbal1 = 0u;
+    s_bq.pre_snapshot_valid = 0u;
+    s_bq.post_ctrl1 = 0u;
+    s_bq.post_ctrl2 = 0u;
+    s_bq.post_sys_stat = 0u;
+    s_bq.settle_sys_stat = 0u;
+    s_bq.adc_off_ctrl1 = 0u;
+    s_bq.adc_off_ctrl2 = 0u;
+    s_bq.xready_at_settle = 0u;
+    s_bq.xready_count = 0u;
+    s_bq.xready_streak = 0u;
+    s_bq.adc_restart_pending = 0u;
+    s_bq.adc_restart_reason = 0u;
+    s_bq.adc_restart_attempts = 0u;
+    s_bq.adc_recovery_failed = 0u;
+    s_bq.adc_restart_count = 0u;
+    s_bq.adc_restart_last_ms = 0u;
+    s_bq.adc_restart_block_until_ms = 0u;
+    s_bq.pending_sysstat_clear = 0u;
+    s_bq.sysstat_sync_active = 0u;
+    s_bq.sysstat_job.op = 0u;
+    s_bq.sysstat_job.reg = 0u;
+    s_bq.sysstat_job.data = 0u;
 
     Bq_HwInit();
 
-    /* PB1 高脉冲 ≥2 ms 保证从 SHIP 启动；boot 后必须回低（否则短路 NTC）。 */
-    HAL_GPIO_WritePin(BQ_BOOT_GPIO_Port, BQ_BOOT_Pin, GPIO_PIN_SET);
-    s_bq.state = BQ_ST_BOOT_PULSE;
-    s_bq.state_enter_ms = HAL_GetTick();
+    /* BQ 不一定随 MCU 复位：若它已 ACK（NORMAL/已上电），跳过 PB1 TS1 脉冲，
+     * 直接进入配置；配置序列会强制 ADC off→on 并回读验证。SHIP/无应答时
+     * 才用 PB1 高脉冲 ≥2 ms 唤醒，boot 后必须回低（否则短路 NTC）。 */
+    {
+        uint8_t probe = 0u;
+
+        if (Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &probe) == 0)
+        {
+            /* BQ 已运行：确保 BOOT 回低（Q4 会短接 NTC）。 */
+            HAL_GPIO_WritePin(BQ_BOOT_GPIO_Port, BQ_BOOT_Pin, GPIO_PIN_RESET);
+            s_bq.state = BQ_ST_BOOT_WAIT;
+            s_bq.state_enter_ms = HAL_GetTick();
+        }
+        else
+        {
+            HAL_GPIO_WritePin(BQ_BOOT_GPIO_Port, BQ_BOOT_Pin, GPIO_PIN_SET);
+            s_bq.state = BQ_ST_BOOT_PULSE;
+            s_bq.state_enter_ms = HAL_GetTick();
+        }
+    }
 }
 
 void BQ_ReInitAfterLp(void)
@@ -810,6 +1649,15 @@ void BQ_ReInitAfterLp(void)
     s_bq.irq_error = 0u;
     s_bq.retry = 0u;
     s_bq.req_read = 0u;
+    /* LP 期间 HAL tick 暂停；旧 last_update_ms 可能仍被误判为 fresh，
+     * 强制等唤醒后的第一帧新数据再允许策略动作。 */
+    s_bq.fresh = 0u;
+
+    /* LP 期间 ADC 完全断电，唤醒后的受控重启算新恢复回合。 */
+    s_bq.adc_restart_pending = 0u;
+    s_bq.adc_restart_attempts = 0u;
+    s_bq.adc_recovery_failed = 0u;
+    s_bq.adc_restart_block_until_ms = 0u;
 
     Bq_HwInit();
     Bq_StartConfig();
@@ -830,13 +1678,18 @@ void BQ_DeInitForLp(void)
     (void)HAL_I2C_DeInit(&hi2c1);
 }
 
-int BQ_PrepareForLp(void)
+int BQ_PrepareForLpMask(uint8_t fet_mask)
 {
     uint8_t stat = 0u;
+    uint8_t rb1 = 0u;
+    uint8_t rb2 = 0u;
 
-    if (BQ_IsIdle() == 0u)
+    /* ADC 重启/配置/settle 期间不允许进入 LP：否则会中断重启序列，
+     * 留下未验证的 SYS_CTRL 状态。 */
+    if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN) ||
+        (s_bq.adc_restart_pending != 0u))
     {
-        return -1;
+        return -2;
     }
 
     /* 关 ADC 与 TS1/NTC 偏置（SYS_CTRL1=0x00）：LP 期间无电压/电流/温度检测，
@@ -847,23 +1700,42 @@ int BQ_PrepareForLp(void)
         return -1;
     }
 
-    /* CC_EN=0，保持 DSG_ON/CHG_ON；再清 SYS_STAT（含 CC_READY）防 ALERT 唤醒。 */
-    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2, BQ_SYS_CTRL2_LP) != 0)
+    /* CC_EN=0，FET 按传入 mask；等待最后一笔 CC 转换结束后只清
+     * CC_READY/XREADY，保护锁存（OV/UV/SCD/OCD）保留。 */
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2,
+                         (uint8_t)(fet_mask & BQ_FET_MASK_ALL)) != 0)
     {
         return -1;
     }
+    HAL_Delay(300u);   /* 一个 CC 周期 250 ms + 余量，防最后一笔转换重新置位 */
     if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
     {
         return -1;
     }
-    if (Bq_BlockingWrite(BQ_REG_SYS_STAT, 0xFFu) != 0)
+    if (Bq_BlockingWrite(BQ_REG_SYS_STAT, BQ_SYS_STAT_IRQ_CLR) != 0)
     {
         return -1;
     }
 
-    s_bq.sys_stat = 0u;
+    /* 回读确认 ADC/TEMP 与 CC 已真正关闭（FET 位可能被硬件保护覆盖，不在此检查）。 */
+    if ((Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &rb1) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &rb2) != 0))
+    {
+        return -1;
+    }
+    if (((rb1 & (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL)) != 0u) ||
+        ((rb2 & BQ_SYS_CTRL2_CC_EN) != 0u))
+    {
+        return -1;
+    }
+
+    s_bq.sys_stat = (uint8_t)(stat & ~BQ_SYS_STAT_IRQ_CLR);
     s_bq.req_read = 0u;
-    s_bq.fet_mask_applied = 0x03u;   /* LP 写 SYS_CTRL2=0x03，两颗 MOS 保持导通 */
+    s_bq.voltage_settled = 0u;
+    s_bq.frame_valid = 0u;
+    /* LP mask 成为新基线，避免唤醒后把进入 LP 前的 NORM 请求重新应用。 */
+    s_bq.request_fet_mask = (uint8_t)(fet_mask & BQ_FET_MASK_ALL);
+    s_bq.fet_mask_applied = (uint8_t)(fet_mask & BQ_FET_MASK_ALL);
     return 0;
 }
 
@@ -930,19 +1802,68 @@ void BQ_Poll(void)
         }
         break;
 
+    case BQ_ST_ADC_RESTART_OFF:
+        if ((s_bq.script == NULL) && (s_bq.xfer_phase == 0u) &&
+            ((s_bq.now_ms - s_bq.state_enter_ms) >= BQ_ADC_RESTART_OFF_HOLD_MS))
+        {
+            Bq_StartConfigScript();
+        }
+        break;
+
     case BQ_ST_CONFIG:
         if ((s_bq.script == NULL) && (s_bq.xfer_phase == 0u) &&
             (s_bq.state == BQ_ST_CONFIG))
         {
             /* 脚本已收尾但未切到 RUN：配置未完成（不应发生），重试。 */
-            Bq_StartConfig();
+            Bq_ConfigFailed();
+        }
+        break;
+
+    case BQ_ST_SETTLE:
+        if ((s_bq.script == NULL) && (s_bq.xfer_phase == 0u) &&
+            ((s_bq.now_ms - s_bq.state_enter_ms) >= BQ_ADC_SETTLE_MS))
+        {
+            if (Bq_VerifySettleStatus() == 0)
+            {
+                s_bq.voltage_settled = 1u;
+                s_bq.state = BQ_ST_RUN;
+                s_bq.state_enter_ms = s_bq.now_ms;
+                s_bq.req_read = 1u;
+            }
+            else
+            {
+                Bq_ConfigFailed();
+            }
         }
         break;
 
     case BQ_ST_RUN:
-        if ((s_bq.script == NULL) && (s_bq.req_read != 0u) && (s_bq.xfer_phase == 0u))
+        if ((s_bq.script == NULL) && (s_bq.xfer_phase == 0u))
         {
-            Bq_StartRunScript();
+            if ((s_bq.adc_restart_pending != 0u) && (BQ_IsIdle() != 0u))
+            {
+                s_bq.adc_restart_pending = 0u;
+                if (s_bq.adc_restart_attempts < 0xFFu)
+                {
+                    s_bq.adc_restart_attempts++;
+                }
+                if (s_bq.adc_restart_count < 0xFFu)
+                {
+                    s_bq.adc_restart_count++;
+                }
+                s_bq.adc_restart_last_ms = s_bq.now_ms;
+                s_bq.voltage_settled = 0u;
+                s_bq.frame_valid = 0u;
+                s_bq.fresh = 0u;
+                s_bq.frame_confirm_count = 0u;
+                s_bq.reject_since_publish = 0u;
+                Bq_StartConfig();
+                break;
+            }
+            if (s_bq.req_read != 0u)
+            {
+                Bq_StartRunScript();
+            }
         }
         break;
 
@@ -982,6 +1903,7 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
         return;
     }
 
+    *out = (bq_snapshot_t){0};
     out->cell_mv[0] = s_bq.cell_mv[0];
     out->cell_mv[1] = s_bq.cell_mv[1];
     out->cell_mv[2] = s_bq.cell_mv[2];
@@ -994,6 +1916,377 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
     out->adc_offset = s_bq.adc_offset;
     out->fresh = s_bq.fresh;
     out->last_update_ms = s_bq.last_update_ms;
+    out->valid = s_bq.frame_valid;
+    out->reject_reason = s_bq.reject_reason;
+    out->pack_residual_mv = s_bq.pack_residual_mv;
+
+    out->raw_cell[0] = s_bq.raw_cell[0];
+    out->raw_cell[1] = s_bq.raw_cell[1];
+    out->raw_cell[2] = s_bq.raw_cell[2];
+    out->raw_pack = s_bq.raw_pack;
+    out->raw_vc3 = s_bq.raw_vc3;
+    out->raw_vc4 = s_bq.raw_vc4;
+    out->frame_ok_count = s_bq.frame_ok_count;
+    out->frame_reject_count = s_bq.frame_reject_count;
+    out->reject_streak = s_bq.reject_streak;
+    out->reject_since_publish = s_bq.reject_since_publish;
+    out->xready_count = s_bq.xready_count;
+    out->frame_confirm_count = s_bq.frame_confirm_count;
+    out->frame_confirm_reset_count = s_bq.frame_confirm_reset_count;
+    out->adc_restart_count = s_bq.adc_restart_count;
+    out->adc_restart_attempts = s_bq.adc_restart_attempts;
+    out->adc_restart_reason = s_bq.adc_restart_reason;
+    out->adc_recovery_failed = s_bq.adc_recovery_failed;
+    out->adc_restart_last_ms = s_bq.adc_restart_last_ms;
+    out->pre_ctrl1 = s_bq.pre_ctrl1;
+    out->pre_ctrl2 = s_bq.pre_ctrl2;
+    out->pre_sys_stat = s_bq.pre_sys_stat;
+    out->pre_cellbal1 = s_bq.pre_cellbal1;
+    out->pre_snapshot_valid = s_bq.pre_snapshot_valid;
+    out->post_ctrl1 = s_bq.post_ctrl1;
+    out->post_ctrl2 = s_bq.post_ctrl2;
+    out->post_sys_stat = s_bq.post_sys_stat;
+    out->settle_sys_stat = s_bq.settle_sys_stat;
+    out->adc_off_ctrl1 = s_bq.adc_off_ctrl1;
+    out->adc_off_ctrl2 = s_bq.adc_off_ctrl2;
+    out->xready_at_settle = s_bq.xready_at_settle;
+    out->last_reject_reason = s_bq.last_reject_reason;
+    out->last_reject_cell_mv[0] = s_bq.last_reject_cell_mv[0];
+    out->last_reject_cell_mv[1] = s_bq.last_reject_cell_mv[1];
+    out->last_reject_cell_mv[2] = s_bq.last_reject_cell_mv[2];
+    out->last_reject_pack_mv = s_bq.last_reject_pack_mv;
+    out->last_reject_vc3_raw = s_bq.last_reject_vc3_raw;
+    out->last_reject_vc4_raw = s_bq.last_reject_vc4_raw;
+    out->last_reject_ms = s_bq.last_reject_ms;
+    out->last_reject_sys_stat = s_bq.last_reject_sys_stat;
+}
+
+uint8_t BQ_IsRecovering(void)
+{
+    return ((s_bq.adc_restart_pending != 0u) ||
+            (s_bq.state == BQ_ST_CONFIG) ||
+            (s_bq.state == BQ_ST_SETTLE) ||
+            (s_bq.state == BQ_ST_ADC_RESTART_OFF)) ? 1u : 0u;
+}
+
+uint8_t BQ_GetAdcRecoveryFailed(void)
+{
+    return s_bq.adc_recovery_failed;
+}
+
+void BQ_RequestFetMask(uint8_t mask)
+{
+    s_bq.request_fet_mask = (uint8_t)(mask & BQ_FET_MASK_ALL);
+}
+
+uint8_t BQ_GetFetMaskRequested(void)
+{
+    return s_bq.request_fet_mask;
+}
+
+uint8_t BQ_GetFetMaskApplied(void)
+{
+    return s_bq.fet_mask_applied;
+}
+
+int BQ_ApplyFetMaskNow(uint8_t mask)
+{
+    if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN))
+    {
+        return -1;
+    }
+
+    mask &= BQ_FET_MASK_ALL;
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2,
+                         (uint8_t)(BQ_SYS_CTRL2_CC_EN | mask)) != 0)
+    {
+        return -1;
+    }
+    s_bq.request_fet_mask = mask;
+    s_bq.fet_mask_applied = mask;
+    return 0;
+}
+
+int BQ_ReadRegSafe(uint8_t reg, uint8_t *out)
+{
+    return BQ_ReadBlockSafe(reg, out, 1u);
+}
+
+int BQ_ReadBlockSafe(uint8_t reg, uint8_t *out, uint8_t count)
+{
+    if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN))
+    {
+        return -1;
+    }
+    return Bq_BlockingReadBlock(reg, out, count);
+}
+
+int BQ_LpSniffInit(void)
+{
+    if (hi2c1.State != HAL_I2C_STATE_RESET)
+    {
+        (void)HAL_I2C_DeInit(&hi2c1);
+    }
+
+    hi2c1.Init.Timing = BQ_I2C_TIMINGR_HSI16_100K;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        return -1;
+    }
+
+    /* 与生成配置保持一致；HAL_I2C_Init 不负责这两个滤波设置。 */
+    (void)HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE);
+    (void)HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 4u);
+    return 0;
+}
+
+void BQ_LpSniffDeInit(void)
+{
+    (void)HAL_I2C_DeInit(&hi2c1);
+}
+
+int BQ_LpSniffRead(uint8_t reg, uint8_t *out)
+{
+    if (out == NULL)
+    {
+        return -1;
+    }
+    return Bq_BlockingRead1(reg, out);
+}
+
+int BQ_LpSniffClearSysStat(uint8_t sys_stat_mask)
+{
+    if (sys_stat_mask == 0u)
+    {
+        return 0;
+    }
+    return (Bq_BlockingWrite(BQ_REG_SYS_STAT, sys_stat_mask) == 0) ? 0 : -1;
+}
+
+/* 30 min 储存监测：临时打开 ADC/TEMP 与 CC。FET mask 保持不变（默认 0），
+ * 因此 LOAD_PRESENT 仍有效、PACK 输出仍断开。调用者负责等待 ADC 稳定。 */
+int BQ_LpMonitorStart(uint8_t fet_mask)
+{
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, BQ_SYS_CTRL1_VALUE) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2,
+                         (uint8_t)(BQ_SYS_CTRL2_CC_EN |
+                                   (fet_mask & BQ_FET_MASK_ALL))) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+int BQ_LpMonitorRead(bq_snapshot_t *out)
+{
+    uint8_t vc[6];
+    uint8_t bat[2];
+    uint8_t ts[2];
+    uint8_t cc[2];
+    uint8_t stat = 0u;
+    uint16_t raw[3];
+    uint16_t raw_pack;
+    uint16_t residual = 0u;
+    uint8_t reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+    int16_t cc_raw;
+
+    if (out == NULL)
+    {
+        return -1;
+    }
+    *out = (bq_snapshot_t){0};
+    out->valid = 0u;
+    out->fresh = 0u;
+    out->reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
+    out->pack_residual_mv = 0;
+    /* 3S 正确接法：CELL3 在 VC5-VC4，不能从 VC1 连续读到。 */
+    if (Bq_BlockingReadBlock(BQ_REG_VC1, &vc[0], 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_VC2, &vc[2], 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_VC5, &vc[4], 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_BAT, bat, 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_TS1, ts, 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_CC, cc, 2u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+
+    raw[0] = (uint16_t)((((uint16_t)vc[0] << 8) | vc[1]) & BQ_CELL_ADC_MASK);
+    raw[1] = (uint16_t)((((uint16_t)vc[2] << 8) | vc[3]) & BQ_CELL_ADC_MASK);
+    raw[2] = (uint16_t)((((uint16_t)vc[4] << 8) | vc[5]) & BQ_CELL_ADC_MASK);
+    raw_pack = (uint16_t)(((uint16_t)bat[0] << 8) | bat[1]);
+    cc_raw = (int16_t)(((uint16_t)cc[0] << 8) | cc[1]);
+
+    out->raw_cell[0] = raw[0];
+    out->raw_cell[1] = raw[1];
+    out->raw_cell[2] = raw[2];
+    out->raw_pack = raw_pack;
+    out->cell_mv[0] = Bq_RawToMv(raw[0]);
+    out->cell_mv[1] = Bq_RawToMv(raw[1]);
+    out->cell_mv[2] = Bq_RawToMv(raw[2]);
+    out->pack_mv = Bq_RawPackToMv(raw_pack);
+    out->cc_raw = cc_raw;
+    out->current_ma = ((int32_t)cc_raw * BQ_CURRENT_MA_NUM) / BQ_CURRENT_MA_DEN;
+    out->ts1_raw = (uint16_t)((((uint16_t)ts[0] << 8) | ts[1]) &
+                              BQ_CELL_ADC_MASK);
+    out->sys_stat = stat;
+    out->adc_gain = s_bq.adc_gain;
+    out->adc_offset = s_bq.adc_offset;
+    out->last_update_ms = HAL_GetTick();
+
+    if (Bq_ValidateFrameValues(out->cell_mv, out->pack_mv,
+                               &residual, &reason) == 0u)
+    {
+        out->valid = 0u;
+        out->reject_reason = reason;
+        out->pack_residual_mv = (int16_t)residual;
+        out->fresh = 0u;
+        return -1;
+    }
+
+    out->valid = 1u;
+    out->reject_reason = (uint8_t)BQ_FRAME_OK;
+    out->pack_residual_mv = (int16_t)residual;
+    out->fresh = 1u;
+    return 0;
+}
+
+int BQ_LpMonitorStop(uint8_t fet_mask)
+{
+    return BQ_PrepareForLpMask(fet_mask);
+}
+
+static int Bq_BlockingAllowed(void)
+{
+    return ((BQ_IsIdle() != 0u) && (s_bq.state == BQ_ST_RUN)) ? 0 : -1;
+}
+
+int BQ_SetBalanceMask(uint8_t mask)
+{
+    if (Bq_BlockingAllowed() != 0)
+    {
+        return -1;
+    }
+    return (Bq_BlockingWrite(BQ_REG_CELLBAL1, (uint8_t)(mask & 0x07u)) == 0) ?
+           0 : -1;
+}
+
+int BQ_ShipMode(void)
+{
+    if (Bq_BlockingAllowed() != 0)
+    {
+        return -1;
+    }
+
+    /* 先关 CC/FET，再连续写 SHUT_A/SHUT_B；两次 SYS_CTRL1 之间不得插其他写。 */
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2, 0x00u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, 0x01u) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, 0x02u) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+int BQ_ClearProtection(uint8_t sys_stat_mask)
+{
+    if (Bq_BlockingAllowed() != 0)
+    {
+        return -1;
+    }
+    if (sys_stat_mask == 0u)
+    {
+        return 0;
+    }
+    return (Bq_BlockingWrite(BQ_REG_SYS_STAT, sys_stat_mask) == 0) ? 0 : -1;
+}
+
+int BQ_WriteProtectionRaw(const uint8_t protect[3], uint8_t ov_trip,
+                          uint8_t uv_trip)
+{
+    if ((protect == NULL) || (Bq_BlockingAllowed() != 0))
+    {
+        return -1;
+    }
+    if ((Bq_BlockingWrite(BQ_REG_PROTECT1, protect[0]) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_PROTECT2, protect[1]) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_PROTECT3, protect[2]) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_OV_TRIP, ov_trip) != 0) ||
+        (Bq_BlockingWrite(BQ_REG_UV_TRIP, uv_trip) != 0))
+    {
+        return -1;
+    }
+    s_bq.ov_trip = ov_trip;
+    s_bq.uv_trip = uv_trip;
+    Bq_UpdateTripThresholds();
+    return 0;
+}
+
+int BQ_SetTempSource(uint8_t die_temp)
+{
+    uint8_t ctrl1 = 0u;
+
+    if (Bq_BlockingAllowed() != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &ctrl1) != 0)
+    {
+        return -1;
+    }
+
+    if (die_temp != 0u)
+    {
+        ctrl1 &= (uint8_t)~BQ_SYS_CTRL1_TEMP_SEL;   /* 0 = 内部 die */
+    }
+    else
+    {
+        ctrl1 |= BQ_SYS_CTRL1_TEMP_SEL;             /* 1 = 外部 NTC */
+    }
+    return (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, ctrl1) == 0) ? 0 : -1;
+}
+
+int BQ_ReadTs1RawSafe(uint16_t *raw)
+{
+    uint8_t data[2];
+
+    if ((raw == NULL) || (Bq_BlockingAllowed() != 0))
+    {
+        return -1;
+    }
+    if (Bq_BlockingReadBlock(BQ_REG_TS1, data, 2u) != 0)
+    {
+        return -1;
+    }
+    *raw = (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+    return 0;
 }
 
 bq_state_t BQ_GetState(void)

@@ -25,10 +25,16 @@ typedef enum
 #define POWER_WAKE_RTC          (1u << 0)
 #define POWER_WAKE_BUTTON       (1u << 1)
 #define POWER_WAKE_BQ_ALERT     (1u << 2)
+#define POWER_WAKE_CHARGER      (1u << 3)   /* LP 内 LOAD_PRESENT+COMP2 判定为充电 */
+#define POWER_WAKE_MONITOR      (1u << 4)   /* 30 min LP 维护唤醒（M2b-2 挂点） */
 
 void PowerMode_Init(void);
+void PowerMode_LogBootRtcState(void);    /* 上电把备份寄存器最后 LP 阶段写到黑匣子 */
+void PowerMode_SetSelfTestResult(uint16_t fail_mask, uint8_t blackbox_error);
 void PowerMode_Loop(void);
 void PowerMode_EnterLp(void);
+void PowerMode_RequestLp(void);          /* 主循环自动空闲/调试器请求入口 */
+uint32_t PowerMode_GetWakeCount(void);   /* 主循环据此识别 LP 唤醒并重置活动计时 */
 
 /* 冷启动/唤醒共用：PA1=0 → OSC1 稳定 → HSE BYPASS → PLL 80 MHz。返回 1 成功。 */
 uint8_t PowerMode_ClkSwitchToHsePll(void);

@@ -55,7 +55,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 25 | PA15 | — | — | 未连接（原理图打 X） | — |
 | 26 | PB3 | `GPIO_Output` / `IND_ROHT` | `IND_ROHT` | R11 510 Ω → LED1 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。**高 = 点亮**（高有效）；由 `led_status.c` 驱动：NORM 常灭、故障时 5 Hz 快闪、LP 灭 |
 | 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 灭 |
-| 28 | PB5 | `GPXTI5` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；R24 10 kΩ 上拉到 3.3 V | 输入，EXTI **下降沿中断**（`.ioc` 已改；`power_mode.c` 幂等覆写）。按下即触发。EXTI9_5 NVIC 优先级 0，生成的 `EXTI9_5_IRQHandler` 只派发 `WAKE_EXTI5_Pin`；`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `app/power_mode.c`，只置唤醒标志 |
+| 28 | PB5 | `GPXTI5` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 本身没有外部上拉**（原理图中的 10 kΩ 上拉不在 PB5 网络） | 输入，EXTI **下降沿中断**。`.ioc` 明确配置 `GPXTI5`、`GPIO_MODE_IT_FALLING`、`GPIO_PULLUP` 和 EXTI9_5 NVIC prio0，由生成的 `MX_GPIO_Init` 一次性配置；App 不再每次进 LP 重配。**必须启用 MCU 内部上拉**，否则 PB5 悬空，LP 中按键无法产生可靠下降沿。按下即触发。`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `app/power_mode.c`，只置唤醒标志 |
 | 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道 |
 | 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1 |
 | 31 | PH3-BOOT0 | — | `BOOT0` | R15 10 kΩ 到 REF_GND | 从 Flash 启动；无 BOOT 按键 |
@@ -160,8 +160,41 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 器件变体（数据手册 Device Comparison Table）：
 
 - **BQ7692003PWR：3–5 节，I2C 7 位地址 0x08（HAL 用 0x10），LDO = 3.3 V，CRC = Yes。**
-- 本板用 VC0–VC3 共 3 节；VC4/VC5 未用（NC，原理图打 X）。
+- **V0.80 已按 3S 飞线完成**：CELL3 使用 VC5–VC4，VC4/VC3/VC2 短接到第 2 节正端。软件固定读 VC1/VC2/VC5，不再保留 4S/VC3 兼容分支。
 - CRC 使能意味着 I2C 读写每个字节后要跟 CRC-8；不能按普通无 CRC 器件访问。
+
+### 3S 接法（BQ76920 Table 9-2，飞线后）
+
+| Cell | 输入对 | 飞线后 |
+| --- | --- | --- |
+| CELL1 | VC1–VC0 | 正确 |
+| CELL2 | VC2–VC1 | 正确 |
+| CELL3 | **VC5–VC4** | R29/C6 移到 VC5，VC5 = `BTT_3P_12V` |
+| 未用 | **VC4–VC3、VC3–VC2 short** | VC2/VC3/VC4 一起接到 `BTT_2P_8V` |
+
+飞线前“第 3 节开机 6 V 后缓慢下降、BAT 不等于三节之和”的根因是 VC3/VC4/VC5 不在 3S 正确电位，BAT 寄存器还会计入悬空通道；**VC3–VC4 互短后若悬空仍会出错**，必须和 VC2 一起接 `BTT_2P_8V`（第 3 节负端）。飞线后已实测三节与包压正常。
+
+### 保护/告警阈值（固件配置）
+
+配置脚本完成后由 `Bq_ApplyProtectionConfig()` 写入并逐项回读；失败按配置重试处理（3 次后 sticky `FAULT_BQ_COMM`）。OV/UV 只在 NORM 的 `ADC_EN=1` 时有效，LP 关闭 ADC 后 OV/UV 暂停，SCD/OCD 仍工作。
+
+| 项目 | 阈值 | 寄存器值 | 说明 |
+| --- | --- | --- | --- |
+| OV | 4.25 V/cell（NMC），delay 1 s | `PROTECT3=0x40`，`OV_TRIP` 动态计算 | 充电上限 4.20 V，留 50 mV 防 CV 末端误触发；数据手册范围 3.15–4.7 V |
+| UV | 2.80 V/cell（NMC），delay 4 s | `PROTECT3=0x40`，`UV_TRIP` 动态计算 | 硬件最后保护；软件 5%/0% 切断应更早；短接未用 VC 通道低于 UVMINQUAL，UV 自动忽略 |
+| OCD | 56 mV（1.5 mΩ → 37.3 A），320 ms | `PROTECT2=0x57` | 高于 30 A 正常放电 |
+| SCD | 67 mV（1.5 mΩ → 44.7 A），100 µs | `PROTECT1=0x89` | RSNS=1，硬件短路保护 |
+
+`OV_TRIP/UV_TRIP` 按读回的 `ADCGAIN`（µV/LSB）和 `ADCOFFSET`（mV）反算：
+`FULL=((V_mV−offset)×1000)/(365+gain)`，取 `FULL>>4` 的低 8 位；OV 全码高 2 位固定 `10`、低 4 位 `1000`，UV 固定 `01`/`0000`。
+
+### L1 充放电 FET 策略
+
+- `COMP2` 充电方向稳定为高：`ChargePolicy_Task()` 进入 CHARGE，请求 `SYS_CTRL2=0x43`（CC + CHG + DSG）。
+- 无充电器时，`GESTURE_PAIR_HOLD3` 切换 DISCHARGE/IDLE；DISCHARGE 同样双管全开，IDLE 请求 `SYS_CTRL2=0x40`（双管关）。
+- 充电器优先：DISCHARGE 中插入充电器转 CHARGE，并清放电 latch；拔出后回 IDLE，不自动恢复放电。
+- 关键故障强制双管关；LP 进入前 `BQ_PrepareForLpMask()` 把请求影子同步为 LP mask（默认 0），避免唤醒后重放旧请求。
+- 调试器 CAL 模式：`s_policy.cal_fet_mask` 指定 0x00..0x03，`s_policy.cal_mode=1` 进入；用于充放电/OCV/SOC 标定，自动 LP 关闭，BQ 硬件保护仍有效。
 
 | BQ 引脚 | 名称 | 原理图网络 | 连接 / 功能 |
 | --- | --- | --- | --- |
@@ -176,10 +209,10 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 | 9 | REGSRC | `VBAT_12V`（应为） | 外部 LDO 输入；**V0.80 原理图只接了 C4 1 µF，未接 VBAT_12V**，必须飞线到 VBAT_12V（BAT/pin 10 节点），否则 REGOUT 不输出、CHG/DSG 栅极驱动无电源 |
 | 10 | BAT | `VBAT_12V` | 电池组最高端 |
 | 11 | NC | — | 未连接 |
-| 12 | VC5 | — | 未连接（3 节，打 X） |
-| 13 | VC4 | — | 未连接（3 节，打 X） |
-| 14 | VC3 | `BQ_VC3` | R29 100 Ω / C6 100 nF → `BTT_3P_12V`（第 3 节正端） |
-| 15 | VC2 | `BQ_VC2` | R30 100 Ω / C7 100 nF → `BTT_2P_8V` |
+| 12 | VC5 | `BQ_VC5`（飞线） | **3S 第 3 节正端**：R29 100 Ω / C6 100 nF 已从 VC3 移到 VC5，接 `BTT_3P_12V` |
+| 13 | VC4 | 飞线 | 与 VC3/VC2 一起短接到 `BTT_2P_8V` |
+| 14 | VC3 | 飞线 | 与 VC2/VC4 一起短接到 `BTT_2P_8V`；R29/C6 已移除，不再接第 3 节 |
+| 15 | VC2 | `BQ_VC2` | R30 100 Ω / C7 100 nF → `BTT_2P_8V`；3S 时与 VC3/VC4 短接 |
 | 16 | VC1 | `BQ_VC1` | R31 100 Ω / C8 100 nF → `BTT_1P_4V` |
 | 17 | VC0 | `BQ_VC0` | R32 100 Ω / C9 100 nF → `BTT_0P_0V`（第 1 节负端） |
 | 18 | SRP | `BQ_SRP` | R6 100 Ω → BTT_N 侧（靠近 VSS）的分流电阻端；数据手册定义为“负电流检测” |
@@ -263,9 +296,9 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
 9. **CAN 终端**：TJA1044 的 STB 接 GND（正常模式），板上只看到共模电感 L13、TVS D3，**未见 120 Ω 终端电阻**；
    确认整车线束两端终端由其他节点提供，否则通信反射/误码。
 10. **LSE/RTC**：32.768 kHz 晶振已装；`.ioc` 已含 RTC，生成的 `SystemClock_Config()` 打开 LSE，
-    `MX_RTC_Init()` 配置 1 Hz 时基。LP 进入时固件布防 RTC WUT 20 s；布防失败会放弃进入 LP（防止无唤醒源）。
-11. **Flash 容量**：链接脚本已改为 128 K（实际 STM32L432KBU6 为 128 K）；**CubeMX 重生成会恢复成 256 K，必须手动改回**，
-    否则大镜像会链接通过但烧录失败。黑匣子占用 `0x0801A000–0x0801FFFF`，`_etext` 必须低于 `0x0801A000`。
+    `MX_RTC_Init()` 配置 1 Hz 时基。LP 进入时布防 RTC WUT 1 s 嗅探（自由运行、自动重装）；布防失败会放弃进入 LP（防止无唤醒源）；30 min 储存监测在 LP 内完成。
+11. **Flash 容量**：链接脚本的应用区已改为 **96 K**（实际 STM32L432KBU6 为 128 K，页 48–63 保留给 NVM/黑匣子）；**CubeMX 重生成会恢复成 256 K，必须手动改回**，
+    否则大镜像会链接通过但烧录失败。应用区限制为 96K（`_image_end <= 0x08018000`）；页 48–49 为 SOC/SOH NVM、页 50–51 为 L1 StateStore，黑匣子占用 `0x0801A000–0x0801FFFF`。
 12. **DAC1**：当前为内部模式（`DAC_OUT1_Int`），不占 PA4、不接 COMP2（INM=IO4）；不要改成外部引脚输出
     或把 COMP2_INM 改为 DAC，否则会干扰 `SC_PACK`。
 13. **LED 极性**：PB3/PB4 经 510 Ω 驱动 LED 阳极，LED 阴极到 REF_GND → **高电平点亮**；`MX_GPIO_Init` 后为低 = 灭。

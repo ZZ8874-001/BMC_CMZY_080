@@ -16,16 +16,22 @@
 
 #include "board.h"
 #include "app/black_box.h"
+#include "app/cal_stream.h"
+#include "app/charge_policy.h"
 #include "app/faults.h"
 #include "app/led_status.h"
 #include "app/power_mode.h"
 #include "app/reset_cause.h"
 #include "app/self_test.h"
 #include "app/state_machine.h"
+#include "app/state_store.h"
 #include "bsp/bq_ic.h"
+#include "bsp/button.h"
 #include "bsp/buzzer.h"
 #include "bsp/ws2812_uart.h"
 #include "comm/app_log.h"
+#include "detect/gesture.h"
+#include "detect/soc_est.h"
 
 #define APP_TIM2_PRESCALER          319u    /* 80 MHz / 320 = 250 kHz */
 #define APP_TIM2_AUTORELOAD         999u    /* 250 kHz / 1000 = 250 Hz */
@@ -37,6 +43,17 @@
 #define APP_DIAG_LOG_PERIOD_MS      10000u
 #define APP_DEGRADED_BLINK_MS       250u
 #define APP_5V_STARTUP_DELAY_MS     20u
+#define APP_IDLE_LP_MS              5000u   /* 无操作/无充电 5 s 自动进 LP */
+
+/* s_app.auto_lp_block：自动 LP 被哪一项条件挡住（Ozone 直接看）。 */
+#define APP_LP_BLOCK_CHARGING       (1u << 0)
+#define APP_LP_BLOCK_BUTTON         (1u << 1)
+#define APP_LP_BLOCK_TEST           (1u << 2)   /* 自检未完成/失败 */
+#define APP_LP_BLOCK_STATE          (1u << 3)   /* 状态机非 NORM */
+#define APP_LP_BLOCK_BQ             (1u << 4)   /* BQ 不新鲜 */
+#define APP_LP_BLOCK_LSE            (1u << 5)
+#define APP_LP_BLOCK_POWER          (1u << 6)   /* 电源模式非 NORM */
+#define APP_LP_BLOCK_POLICY         (1u << 7)   /* CHARGE/DISCHARGE/CAL 或 CAL pending */
 
 static struct
 {
@@ -62,9 +79,14 @@ static struct
     uint8_t comparator_match_count;
 
     /* 运行时/调试可见状态 */
-    uint8_t boot_announced;
     uint32_t diag_log_ms;
     uint32_t loop_count;
+    uint32_t gesture_count;
+    uint8_t last_gesture;
+    uint32_t last_activity_ms;      /* 自动 LP 的活动计时基准 */
+    uint32_t last_wake_count;       /* 识别 PowerMode_Loop 从 LP 返回 */
+    uint32_t auto_lp_request_count; /* 自动 LP 请求次数（诊断） */
+    uint8_t auto_lp_block;          /* 自动 LP 阻止原因位图（诊断） */
 
     /* 降级模式（80 MHz 切换失败）灯闪 */
     uint32_t degraded_blink_ms;
@@ -168,6 +190,21 @@ static void App_OnTick250Hz(void)
 static void App_UpdateLedMode(void)
 {
     led_flow_t flow;
+    charge_policy_state_t policy_state;
+
+    if (StateMachine_GetState() == SM_STATE_FAULT)
+    {
+        LedStatus_SetMode(LED_MODE_FAULT, LED_FLOW_FAULT);
+        return;
+    }
+
+    policy_state = ChargePolicy_GetState();
+    if (policy_state == CHARGE_POLICY_CAL)
+    {
+        /* CAL 允许绕过自检失败；BQ 就绪性由策略层保证。 */
+        LedStatus_SetMode(LED_MODE_NORM, LED_FLOW_CAL);
+        return;
+    }
 
     if ((SelfTest_IsDone() != 0u) && (SelfTest_IsPassed() == 0u))
     {
@@ -187,11 +224,11 @@ static void App_UpdateLedMode(void)
 
     case SM_STATE_NORM:
     default:
-        if (StateMachine_GetFlow() == SM_FLOW_CHARGING)
+        if (policy_state == CHARGE_POLICY_CHARGE)
         {
             flow = LED_FLOW_CHARGING;
         }
-        else if (StateMachine_GetFlow() == SM_FLOW_DISCHARGING)
+        else if (policy_state == CHARGE_POLICY_DISCHARGE)
         {
             flow = LED_FLOW_DISCHARGING;
         }
@@ -206,21 +243,34 @@ static void App_UpdateLedMode(void)
 
 static void App_HandleSelfTestCompletion(void)
 {
-    if ((SelfTest_IsDone() == 0u) || (s_app.boot_announced != 0u))
+    uint8_t event = SelfTest_TakeEvent();
+
+    /* 自检结果可动态恢复/再次失败，电源模式侧每圈同步最新位图。 */
+    if (SelfTest_IsDone() != 0u)
+    {
+        PowerMode_SetSelfTestResult(SelfTest_GetFailMask(), BlackBox_HasError());
+    }
+
+    if (event == SELFTEST_EVENT_NONE)
     {
         return;
     }
 
-    s_app.boot_announced = 1u;
-    if (SelfTest_IsPassed() != 0u)
+    s_app.last_activity_ms = HAL_GetTick();   /* 自检完成后再给 5 s 空闲窗口 */
+    if (event == SELFTEST_EVENT_PASS)
     {
         Buzzer_StartPattern(BUZZER_PATTERN_BOOT_OK);
         App_Log_Printf("[TEST] pass\r\n");
     }
-    else
+    else if (event == SELFTEST_EVENT_FAIL)
     {
         Buzzer_StartPattern(BUZZER_PATTERN_FAULT);
         App_Log_Printf("[TEST] fail=0x%04X\r\n", SelfTest_GetFailMask());
+    }
+    else
+    {
+        /* BQ 动态项恢复：更新 LED/策略阻止状态即可，不再响故障音。 */
+        App_Log_Printf("[TEST] recovered\r\n");
     }
 }
 
@@ -244,8 +294,18 @@ static void App_DiagTask(uint32_t now_ms)
     s_app.diag_log_ms = now_ms;
 
     BQ_GetSnapshot(&snapshot);
+    {
+        soc_est_snapshot_t soc;
+        SocEst_GetSnapshot(&soc);
+        App_Log_Printf("[SOC] soc=%ld soh=%ld T=%d TSR=%u TSV=%u "
+                       "fv=%u tv=%u cv=%u upd=%lu\r\n",
+                       (long)soc.soc01, (long)soc.soh01, (int)soc.temp_dc,
+                       (unsigned)soc.ts1_raw, (unsigned)soc.ts1_mv,
+                       (unsigned)soc.frame_valid, (unsigned)soc.temp_valid,
+                       (unsigned)soc.cal_valid, (unsigned long)soc.update_count);
+    }
     App_Log_Printf("[DIAG] sm=%u flow=%u V=%u/%u/%u P=%u CC=%d I=%ld TS=%u "
-                   "flt=%04X bq=%u up=%lu\r\n",
+                   "flt=%04X bq=%u lpblk=%02X up=%lu\r\n",
                    (unsigned)StateMachine_GetState(),
                    (unsigned)StateMachine_GetFlow(),
                    (unsigned)snapshot.cell_mv[0],
@@ -257,7 +317,56 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)snapshot.ts1_raw,
                    (unsigned)Fault_GetAll(),
                    (unsigned)BQ_GetState(),
+                   (unsigned)s_app.auto_lp_block,
                    (unsigned long)App_GetUptimeSeconds());
+
+    App_Log_Printf("[BQ] pre=%02X/%02X ss=%02X bal=%02X post=%02X/%02X "
+                   "ss=%02X off=%02X/%02X rst=%lu a=%u r=%u f=%u\r\n",
+                   (unsigned)snapshot.pre_ctrl1,
+                   (unsigned)snapshot.pre_ctrl2,
+                   (unsigned)snapshot.pre_sys_stat,
+                   (unsigned)snapshot.pre_cellbal1,
+                   (unsigned)snapshot.post_ctrl1,
+                   (unsigned)snapshot.post_ctrl2,
+                   (unsigned)snapshot.post_sys_stat,
+                   (unsigned)snapshot.adc_off_ctrl1,
+                   (unsigned)snapshot.adc_off_ctrl2,
+                   (unsigned long)snapshot.adc_restart_count,
+                   (unsigned)snapshot.adc_restart_attempts,
+                   (unsigned)snapshot.adc_restart_reason,
+                   (unsigned)snapshot.adc_recovery_failed);
+    App_Log_Printf("[BQ] ok=%lu rej=%lu stk=%u fcon=%u/%lu vc3=%u vc4=%u "
+                   "xr=%u fv=%u/%u\r\n",
+                   (unsigned long)snapshot.frame_ok_count,
+                   (unsigned long)snapshot.frame_reject_count,
+                   (unsigned)snapshot.reject_streak,
+                   (unsigned)snapshot.frame_confirm_count,
+                   (unsigned long)snapshot.frame_confirm_reset_count,
+                   (unsigned)snapshot.raw_vc3,
+                   (unsigned)snapshot.raw_vc4,
+                   (unsigned)snapshot.xready_count,
+                   (unsigned)snapshot.fresh,
+                   (unsigned)snapshot.valid);
+    App_Log_Printf("[BQ] last=%u V=%u/%u/%u/%u vc=%u/%u ss=%02X\r\n",
+                   (unsigned)snapshot.last_reject_reason,
+                   (unsigned)snapshot.last_reject_cell_mv[0],
+                   (unsigned)snapshot.last_reject_cell_mv[1],
+                   (unsigned)snapshot.last_reject_cell_mv[2],
+                   (unsigned)snapshot.last_reject_pack_mv,
+                   (unsigned)snapshot.last_reject_vc3_raw,
+                   (unsigned)snapshot.last_reject_vc4_raw,
+                   (unsigned)snapshot.last_reject_sys_stat);
+
+    App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u rsn=%u\r\n",
+                   (unsigned)ChargePolicy_GetState(),
+                   (unsigned)ChargePolicy_GetRequestedMask(),
+                   (unsigned)BQ_GetFetMaskApplied(),
+                   (unsigned)((ChargePolicy_GetState() ==
+                               CHARGE_POLICY_CHARGE) ? 1u : 0u),
+                   (unsigned)((ChargePolicy_GetState() ==
+                               CHARGE_POLICY_DISCHARGE) ? 1u : 0u),
+                   (unsigned)ChargePolicy_IsCalibration(),
+                   (unsigned)ChargePolicy_GetCalEndReason());
 }
 
 static void App_DegradedLoop(void)
@@ -293,9 +402,14 @@ void App_Init(void)
     s_app.comparator_charging = 0u;
     s_app.comparator_last_sample = 0u;
     s_app.comparator_match_count = 0u;
-    s_app.boot_announced = 0u;
     s_app.diag_log_ms = 0u;
     s_app.loop_count = 0u;
+    s_app.gesture_count = 0u;
+    s_app.last_gesture = (uint8_t)GESTURE_NONE;
+    s_app.last_activity_ms = 0u;
+    s_app.last_wake_count = 0u;
+    s_app.auto_lp_request_count = 0u;
+    s_app.auto_lp_block = 0u;
     s_app.degraded_blink_ms = 0u;
     s_app.degraded_blink_on = 0u;
 
@@ -304,7 +418,9 @@ void App_Init(void)
     PowerMode_Init();          /* 16 MHz → 80 MHz；LSE/RTC 初始化 */
 
     BlackBox_Init();
+    StateStore_Init();
     s_app.uptime_base_s = BlackBox_GetUptimeBase();
+    PowerMode_LogBootRtcState();   /* 备份寄存器里的最后 LP 阶段 -> 黑匣子 */
 
     if (PowerMode_IsDegraded() != 0u)
     {
@@ -321,25 +437,38 @@ void App_Init(void)
                    (unsigned)ResetCause_GetLatched());
 
     BQ_Init();
+    SocEst_Init();
     /* Ws2812_HwInit 按 80 MHz 重设 USART2SEL=PCLK1 并在 UE=0 时写 BRR。 */
     Ws2812_Init();
     LedStatus_Init();
     Buzzer_Init();
+    Button_Init();
+    Gesture_Init();
 
     SelfTest_Init();
     SelfTest_Request();
     StateMachine_Init();
+    ChargePolicy_Init();
+    CalStream_Init();
 
     (void)HAL_COMP_Start(&hcomp2);
 
     s_app.diag_log_ms = HAL_GetTick();
     App_TickTimerInit();
     App_TickStart();           /* ★ 时基最后启动 */
+
+    s_app.last_activity_ms = HAL_GetTick();
+    s_app.last_wake_count = PowerMode_GetWakeCount();
 }
 
 void App_Loop(void)
 {
     uint32_t now_ms;
+    uint32_t wake_count;
+    uint8_t had_activity = 0u;
+    button_event_t button_ev;
+    gesture_event_t gesture_ev;
+    bq_snapshot_t bq_snap;
 
     if (PowerMode_IsDegraded() != 0u)
     {
@@ -347,10 +476,43 @@ void App_Loop(void)
         return;
     }
 
-    now_ms = HAL_GetTick();
-
     /* 1) LP 请求（调试器写 s_power.request_lp=1）——阻塞到唤醒返回。 */
     PowerMode_Loop();
+
+    /* LP 可能阻塞很久：必须在返回后重新取时基。 */
+    now_ms = HAL_GetTick();
+
+    /* 从 LP 返回：重新开始 5 s 空闲计时。 */
+    wake_count = PowerMode_GetWakeCount();
+    if (wake_count != s_app.last_wake_count)
+    {
+        s_app.last_wake_count = wake_count;
+        s_app.last_activity_ms = now_ms;
+        ChargePolicy_OnLpWake(now_ms);
+    }
+
+    /* 按键/手势：任何事件都算活动；按下期间不自动进 LP。 */
+    Button_Poll(now_ms);
+    while (Button_GetEvent(&button_ev) != 0u)
+    {
+        had_activity = 1u;
+        Gesture_OnButtonEvent(&button_ev);
+    }
+    Gesture_Poll(now_ms);
+    while (Gesture_GetEvent(&gesture_ev) != 0u)
+    {
+        had_activity = 1u;
+        s_app.gesture_count++;
+        s_app.last_gesture = (uint8_t)gesture_ev;
+        if (gesture_ev == GESTURE_PAIR_HOLD3)
+        {
+            ChargePolicy_OnPairHold3(now_ms);
+        }
+    }
+    if ((had_activity != 0u) || (Button_IsPressed() != 0u))
+    {
+        s_app.last_activity_ms = now_ms;
+    }
 
     /* 2) BQ 事务推进 + 500 ms 周期读。 */
     if (s_app.flag_bq_read_request != 0u)
@@ -359,6 +521,9 @@ void App_Loop(void)
         BQ_RequestRead();
     }
     BQ_Poll();
+    BQ_GetSnapshot(&bq_snap);
+    SocEst_OnSnapshot(&bq_snap, now_ms);
+    SocEst_Task();
 
     /* 3) 自检与状态分类。 */
     SelfTest_Poll(now_ms);
@@ -373,13 +538,66 @@ void App_Loop(void)
 
     StateMachine_Update(BQ_IsFresh(now_ms), s_app.comparator_charging,
                         Fault_GetAll());
+    ChargePolicy_Task(now_ms, s_app.comparator_charging);
+    CalStream_Task(now_ms, App_GetUptimeSeconds(), &bq_snap);
     App_UpdateLedMode();
+
+    /* 4b) 自动 LP：逐项记录阻止原因，5 s 无活动且无阻止项时请求 LP。
+     * 请求后重置计时，避免准备失败时每圈重试。 */
+    {
+        uint8_t block = 0u;
+
+        if (s_app.comparator_charging != 0u)
+        {
+            block |= APP_LP_BLOCK_CHARGING;
+            s_app.last_activity_ms = now_ms;
+        }
+        if (Button_IsPressed() != 0u)
+        {
+            block |= APP_LP_BLOCK_BUTTON;
+        }
+        if ((SelfTest_IsDone() == 0u) || (SelfTest_IsPassed() == 0u))
+        {
+            block |= APP_LP_BLOCK_TEST;
+        }
+        if (StateMachine_GetState() != SM_STATE_NORM)
+        {
+            block |= APP_LP_BLOCK_STATE;
+        }
+        if ((BQ_IsFresh(now_ms) == 0u) || (BQ_IsRecovering() != 0u))
+        {
+            block |= APP_LP_BLOCK_BQ;
+        }
+        if ((Fault_GetAll() & FAULT_BIT_LSE) != 0u)
+        {
+            block |= APP_LP_BLOCK_LSE;
+        }
+        if (PowerMode_GetState() != POWER_STATE_NORM)
+        {
+            block |= APP_LP_BLOCK_POWER;
+        }
+        if (ChargePolicy_IsLpBlocked() != 0u)
+        {
+            block |= APP_LP_BLOCK_POLICY;
+            s_app.last_activity_ms = now_ms;
+        }
+
+        s_app.auto_lp_block = block;
+        if ((block == 0u) &&
+            ((now_ms - s_app.last_activity_ms) >= APP_IDLE_LP_MS))
+        {
+            PowerMode_RequestLp();
+            s_app.auto_lp_request_count++;
+            s_app.last_activity_ms = now_ms;
+        }
+    }
 
     /* 5) 黑匣子 30 min 记录。 */
     if (s_app.flag_blackbox_request != 0u)
     {
         s_app.flag_blackbox_request = 0u;
         (void)BlackBox_WritePeriodic(App_GetUptimeSeconds());
+        (void)SocEst_CommitStateStore();
     }
 
     /* 6) 蜂鸣器 / RGB / 日志。 */
@@ -387,7 +605,7 @@ void App_Loop(void)
     LedStatus_Flush();
 
     App_Log_Poll();
-    App_Log_FlushSmall(4u);
+    App_Log_FlushSmall((ChargePolicy_IsCalibration() != 0u) ? 32u : 4u);
 
     s_app.loop_count++;
 }
