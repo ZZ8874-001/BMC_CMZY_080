@@ -28,6 +28,9 @@
 #define BB_EVENT_CAL_BEGIN      0x12u
 #define BB_EVENT_CAL_END        0x13u
 #define BB_EVENT_LP_DIAG        0x14u
+#define BB_EVENT_BQ_ADC_RESTART 0x15u
+#define BB_EVENT_BQ_ADC_FAULT   0x16u
+#define BB_EVENT_BQ_ADC_RECOVERED 0x17u
 
 /* 旧记录的唤醒原因编码（flags 第 3–5 位）。 */
 #define BB_WAKE_NONE        0u

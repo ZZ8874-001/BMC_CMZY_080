@@ -33,6 +33,15 @@ static void ResetCause_RecordAndReset(uint8_t cause)
 {
     ResetCause_EnableBackupAccess();
     RTC->BKP0R = RESET_CAUSE_BKP_MAGIC | (uint32_t)cause;
+    /* HardFault 现场：BKP9R..BKP12R 留给复位后的 Ozone 直接读取。
+     * 只在 cause=HARDFAULT 时有意义；正常复位不写这些寄存器。 */
+    if (cause == RESET_CAUSE_HARDFAULT)
+    {
+        RTC->BKP9R = SCB->CFSR;
+        RTC->BKP10R = SCB->HFSR;
+        RTC->BKP11R = SCB->MMFAR;
+        RTC->BKP12R = SCB->BFAR;
+    }
     __DSB();
     NVIC_SystemReset();
     while (1)

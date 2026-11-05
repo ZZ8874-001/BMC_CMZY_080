@@ -22,6 +22,7 @@
 #include "stm32l4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app/reset_cause.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -86,7 +87,10 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  /* 不要在 HardFault 里死循环：记录 BKP0R 原因并复位，下一次上电
+   * stage61 的 ResetCause_GetLatched() 会显示 HARDFAULT。
+   * 这也能把“LP 进 STOP1 后永远不醒”与 CPU 真死区分开。 */
+  ResetCause_RecordHardFaultAndReset();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

@@ -123,6 +123,15 @@ typedef struct
     uint16_t xready_count;
     uint8_t  frame_confirm_count;
     uint32_t frame_confirm_reset_count;
+    uint16_t oor_streak;        /* 连续超出合理性范围的帧数 */
+    uint16_t resample_count;    /* OOR 触发的快速重采样次数 */
+    uint8_t  strict_window;     /* 1=下次首次发布用 ±4 raw LSB 严格确认 */
+    uint8_t  recovery_episode;  /* 1=ADC 恢复回合进行中 */
+    uint8_t  verdict_active;    /* 1=本轮 ADC 重启等待“有果” */
+    uint32_t verdict_deadline_ms;
+    uint16_t good_publish_streak; /* 连续成功发布帧数，5 帧清除故障 */
+    uint16_t pending_raw_cell[3];
+    uint16_t pending_raw_pack;
     uint32_t adc_restart_count;
     uint8_t  adc_restart_attempts;
     uint8_t  adc_restart_reason;
@@ -210,6 +219,12 @@ void BQ_GetSnapshot(bq_snapshot_t *out);
 /* ADC 受控重启/恢复状态，主循环和自检只读使用。 */
 uint8_t BQ_IsRecovering(void);
 uint8_t BQ_GetAdcRecoveryFailed(void);
+
+/* ADC 恢复过程的一次性事件位；由主循环取走并写黑匣子，bsp 不直接写 Flash。 */
+#define BQ_ADC_EVENT_RESTART    (1u << 0)
+#define BQ_ADC_EVENT_FAULT      (1u << 1)
+#define BQ_ADC_EVENT_RECOVERED  (1u << 2)
+uint8_t BQ_TakeAdcEvent(void);
 
 bq_state_t BQ_GetState(void);
 

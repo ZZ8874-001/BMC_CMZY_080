@@ -54,7 +54,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 24 | PA14 | `SYS_JTCK-SWCLK` | `SWCLK` | CN5 SWD 口 | SWCLK |
 | 25 | PA15 | — | — | 未连接（原理图打 X） | — |
 | 26 | PB3 | `GPIO_Output` / `IND_ROHT` | `IND_ROHT` | R11 510 Ω → LED1 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。**高 = 点亮**（高有效）；由 `led_status.c` 驱动：NORM 常灭、故障时 5 Hz 快闪、LP 灭 |
-| 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 灭 |
+| 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 平时灭；LP 每次 WUT 嗅探由 `power_mode.c` 打 `lp_sniff_led_ms`（默认 50 ms）高脉冲，作为“WUT/嗅探还活着”的心跳 |
 | 28 | PB5 | `GPXTI5` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 本身没有外部上拉**（原理图中的 10 kΩ 上拉不在 PB5 网络） | 输入，EXTI **下降沿中断**。`.ioc` 明确配置 `GPXTI5`、`GPIO_MODE_IT_FALLING`、`GPIO_PULLUP` 和 EXTI9_5 NVIC prio0，由生成的 `MX_GPIO_Init` 一次性配置；App 不再每次进 LP 重配。**必须启用 MCU 内部上拉**，否则 PB5 悬空，LP 中按键无法产生可靠下降沿。按下即触发。`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `app/power_mode.c`，只置唤醒标志 |
 | 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道 |
 | 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1 |

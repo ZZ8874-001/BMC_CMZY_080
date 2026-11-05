@@ -99,10 +99,11 @@ app.mk              # App/ 的源文件与 include 路径，独立于 CubeMX 生
 2. **SYS_CTRL1/2 回读**：配置结束必须确认 `ADC_EN|TEMP_SEL=1`、`CC_EN=1`、FET 位符合预期；回读失败按配置失败重试，不能继续发布电压。
 3. **保护写入时序**：保护阈值必须在 ADC off 阶段写入并回读，不能先开 ADC 再写保护。
 4. **XREADY**：settle 后读 `SYS_STAT`，XREADY 置位时按“清一次 + 等待 10 ms + 再确认”的有界流程处理；持久 XREADY 报故障。
-5. **连续有效帧确认**：首帧（以及 reject 后的首帧）只作为候选，连续 2 帧 cells 差 ≤250 mV、pack 差 ≤300 mV 才发布；发布值不能掩盖 raw 异常。
-6. **reject 恢复**：连续 4 帧拒绝触发一次受控 ADC 重启；连续 12 帧或 3 次重启仍失败置 `FAULT_BIT_BQ_ADC_STUCK`，不能只让 `reject_count` 静默增长。
-7. **自检动态复查**：BQ 首帧短暂异常只进入 12 s 恢复宽限，不立即锁死三声报错；完成后 MONITOR 持续复查，恢复后自动清除 BQ 失败位并解除 LP 阻止。
-8. **pre/post 快照**：保留 `pre_ctrl1/pre_ctrl2/pre_sys_stat/pre_cellbal1`、`adc_off_ctrl1/2`、`post_ctrl1/2`、`settle_sys_stat`、`xready_*`、`adc_restart_*`、`last_reject_*`，台架复位循环时用它们证明软件初始化是否产生真实 ADC 重启。
+5. **连续有效帧确认**：启动/LP/ADC 重启后的首次发布只作为候选，必须连续 2 帧原始码每个寄存器差 ≤4 LSB（cell ≈1.5 mV，BAT ≈6 mV）才发布；若连续 3 对仍不满足，可能是真实电压回弹/负载变化而非 ADC 异常，允许一次回退到 250 mV cell / 300 mV pack 粗确认，避免误判 ADC 故障。普通运行期偶发拒绝后的重新确认直接用粗容差。发布值不能掩盖 raw 异常。
+6. **OOR 与重置额度**：只有 `CELL_RANGE/PACK_RANGE/PACK_SUM/VC34_SANITY` 计入 OOR；OOR 后 300 ms 重新采样（BQ 转换约 250 ms，不能立刻读同一帧）；连续 4 帧 OOR 触发一次受控 ADC 重启；每个电源周期累计最多 **4 次**重启。每次重启 SETTLE→RUN 后有 1.5 s verdict 窗口，成功发布才算“有果”；4 次无果才锁存 `FAULT_BIT_BQ_ADC_STUCK`，不能只让 `reject_count` 静默增长。锁存后不再自动重置，正常采样继续，连续 **5 帧**有效发布才清故障/额度；上电/LP 唤醒重新给额度。
+7. **自检动态复查**：BQ 首帧短暂异常只进入恢复宽限，`BQ_IsRecovering()` 期间不计宽限时间，并有 30 s 硬上限；`BQ_GetAdcRecoveryFailed()` 锁存时立即报一次 FAIL。完成后 MONITOR 持续复查，恢复后自动清除 BQ 失败位并解除 LP 阻止，不重复响故障音。
+8. **pre/post 快照与事件**：保留 `pre_ctrl1/pre_ctrl2/pre_sys_stat/pre_cellbal1`、`adc_off_ctrl1/2`、`post_ctrl1/2`、`settle_sys_stat`、`xready_*`、`adc_restart_*`、`oor_streak`、`resample_count`、`verdict_*`、`good_publish_streak`、`last_reject_*`；黑匣子事件 `0x15/0x16/0x17` 记录 restart/fault/recovered，bsp 不得直接写 Flash。
+9. **真实保护不受影响**：OOR 门限是合理性检查，不是 OV/UV 保护阈值（4.25/2.80 V 仍在合理范围内）；ADC 重启/清假锁存不得清掉真实 OV/UV/SCD/OCD，假 OV/UV 只在 5 帧有效且低于/高于安全门限后清。
 
 硬件结论只能在这些软件路径全部验证、且 pre/post 快照与 raw VC3/VC4 仍异常后才能提出，并需给出可复现的引脚/波形证据。
 

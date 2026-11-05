@@ -241,6 +241,42 @@ static void App_UpdateLedMode(void)
     }
 }
 
+static void App_BqAdcEventTask(void)
+{
+    uint8_t events;
+
+    /* Flash 写只能在主循环、BQ 空闲且不处于恢复回合时进行；
+     * 事件位保留在 bq_ic，等到可写窗口再落盘。 */
+    if ((BQ_IsIdle() == 0u) || (BQ_GetState() != BQ_ST_RUN) ||
+        (BQ_IsRecovering() != 0u) ||
+        (PowerMode_GetState() != POWER_STATE_NORM))
+    {
+        return;
+    }
+
+    events = BQ_TakeAdcEvent();
+    if (events == 0u)
+    {
+        return;
+    }
+
+    if ((events & BQ_ADC_EVENT_RESTART) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_BQ_ADC_RESTART,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & BQ_ADC_EVENT_FAULT) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_BQ_ADC_FAULT,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & BQ_ADC_EVENT_RECOVERED) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_BQ_ADC_RECOVERED,
+                                  App_GetUptimeSeconds());
+    }
+}
+
 static void App_HandleSelfTestCompletion(void)
 {
     uint8_t event = SelfTest_TakeEvent();
@@ -347,7 +383,7 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)snapshot.xready_count,
                    (unsigned)snapshot.fresh,
                    (unsigned)snapshot.valid);
-    App_Log_Printf("[BQ] last=%u V=%u/%u/%u/%u vc=%u/%u ss=%02X\r\n",
+    App_Log_Printf("[BQ] last=%u V=%u/%u/%u/%u vc=%u/%u ss=%02X lm=%lu\r\n",
                    (unsigned)snapshot.last_reject_reason,
                    (unsigned)snapshot.last_reject_cell_mv[0],
                    (unsigned)snapshot.last_reject_cell_mv[1],
@@ -355,7 +391,18 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)snapshot.last_reject_pack_mv,
                    (unsigned)snapshot.last_reject_vc3_raw,
                    (unsigned)snapshot.last_reject_vc4_raw,
-                   (unsigned)snapshot.last_reject_sys_stat);
+                   (unsigned)snapshot.last_reject_sys_stat,
+                   (unsigned long)snapshot.last_reject_ms);
+    App_Log_Printf("[BQ] oor=%u rs=%u sw=%u ep=%u va=%u gp=%u "
+                   "vd=%lu rl=%lu\r\n",
+                   (unsigned)snapshot.oor_streak,
+                   (unsigned)snapshot.resample_count,
+                   (unsigned)snapshot.strict_window,
+                   (unsigned)snapshot.recovery_episode,
+                   (unsigned)snapshot.verdict_active,
+                   (unsigned)snapshot.good_publish_streak,
+                   (unsigned long)snapshot.verdict_deadline_ms,
+                   (unsigned long)snapshot.adc_restart_last_ms);
 
     App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u rsn=%u\r\n",
                    (unsigned)ChargePolicy_GetState(),
@@ -524,6 +571,7 @@ void App_Loop(void)
     BQ_GetSnapshot(&bq_snap);
     SocEst_OnSnapshot(&bq_snap, now_ms);
     SocEst_Task();
+    App_BqAdcEventTask();
 
     /* 3) 自检与状态分类。 */
     SelfTest_Poll(now_ms);
@@ -564,7 +612,8 @@ void App_Loop(void)
         {
             block |= APP_LP_BLOCK_STATE;
         }
-        if ((BQ_IsFresh(now_ms) == 0u) || (BQ_IsRecovering() != 0u))
+        if ((BQ_IsFresh(now_ms) == 0u) || (BQ_IsRecovering() != 0u) ||
+            (BQ_GetAdcRecoveryFailed() != 0u))
         {
             block |= APP_LP_BLOCK_BQ;
         }

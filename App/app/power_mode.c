@@ -9,13 +9,15 @@
  *   - PA1（HSE_DIS/CHGSC_DIS）低 = OSC1 使能 + PACK_SC 前端使能。
  *
  * LP 进入顺序（不可打乱）：
- *   排空通信 → BQ 关 ADC/TEMP、CC_EN=0/清状态 → 黑匣子转换记录 → 停外设 → 灭灯 →
- *   布防 RTC 20 s → 清挂起 → SYSCLK 切 MSI 4 MHz → 关 PLL → 关 HSE →
+ *   排空通信 → BQ 关 ADC/TEMP、CC_EN=0/清状态 → 黑匣子转换记录 → 布防 RTC WUT
+ *   (1 s，自由运行) → 停外设 → 清挂起 → SYSCLK 切 HSI16 → 关 PLL → 关 HSE →
  *   PA1=1/PB0=0 → WFI(STOP1)。
- *   唤醒后：MSI 下先修 SysTick → PA1=0 → HSE/PLL 80 MHz → PB0=1 → 重建外设。
+ *   唤醒后：HSI16 下先修 SysTick → PA1=0 → HSE/PLL 80 MHz → PB0=1 → 重建外设。
+ *   若 HSE/PLL 恢复失败：保持 5 V、PB3 故障闪烁并进入 DEGRADED。
  *
  * 唤醒原因：RTC（WUT 中断）、PB5 按下（EXTI5 中断）、PA8 BQ ALERT（EXTI 事件，
- * 无中断标志）——三者都清过挂起，因此“无 RTC/按键标志”即判定为 BQ ALERT。
+ * 无中断标志）。三者都不成立时不再误归因为 BQ ALERT，而是记录 unknown 并
+ * 完整唤醒；RTC_WKUP 向量/回调次数由 BKP2R/BKP3R 跨复位保留。
  ******************************************************************************
  */
 #include "app/power_mode.h"
@@ -24,6 +26,7 @@
 #include "app/main_app.h"
 #include "app/black_box.h"
 #include "app/faults.h"
+#include "app/reset_cause.h"
 #include "comm/app_log.h"
 #include "bsp/bq_ic.h"
 #include "bsp/button.h"
@@ -42,13 +45,21 @@
 #endif
 
 #define POWER_CLK_RETRY             3u
-#define POWER_LP_SNIFF_WUT_SECONDS  1u
-#define POWER_LP_MAX_TICKS          1800u    /* 30 min @1 s；到点做 HSI16 储存监测 */
+/* A/B 验证：上一次已知可唤醒的固件使用 WUTR=1（2 s）；当前故障现场在
+ * WUTR=0 时进入 STOP1 后 20 s 无 WUT ISR。先回到 WUTR=1 验证是否为
+ * 0 reload 的硬件/HAL 行为问题，确认后再决定是否恢复 1 s。 */
+#define POWER_LP_WUT_PERIOD_S       2u
+#define POWER_LP_WUT_RELOAD         (POWER_LP_WUT_PERIOD_S - 1u) /* WUTR+1 秒 */
+#define POWER_LP_MAX_TICKS          900u     /* 30 min @2 s；到点做 HSI16 储存监测 */
 #define POWER_LP_CHARGER_SETTLE_MS  30u
 #define POWER_LP_MONITOR_SETTLE_MS  BQ_ADC_SETTLE_MS
+#define POWER_LP_SNIFF_LED_MS       50u     /* PB4 每次 WUT 嗅探闪 50 ms；0=关闭 */
 #define POWER_DRAIN_TIMEOUT_MS      100u
 #define POWER_LP_BUTTON_FLAG_KEEP_MS 2000u  /* 进入 LP 时保留最近按键标志的窗口 */
 #define POWER_LP_BKP_MARKER         0xA5A50000u  /* RTC BKP0R 有效标志 */
+#define POWER_LP_BKP_ISR_MARKER     0xA5A50000u  /* BKP2R/3R 高 16 位有效标志 */
+#define POWER_LP_BKP_CTX_MARKER     0xA5000000u  /* BKP16R 上下文高字节标志 */
+#define POWER_LSE_RECOVER_MS        100u   /* LSERDY/RTCSEL 连续正常多久才清 LSE 故障 */
 
 static struct
 {
@@ -60,6 +71,9 @@ static struct
     volatile uint32_t flag_button_ms;  /* flag_button 置位时刻（EXTI ISR） */
     uint8_t lse_ok;
     uint8_t degraded;
+    uint32_t lse_lost_count;       /* 运行中 LSERDY/RTCSEL 失效次数 */
+    uint32_t lse_recover_count;    /* LSE 稳定后自动清故障次数 */
+    uint32_t lse_healthy_since_ms; /* 本次 LSERDY 连续正常的起点 */
     uint8_t clock_ok;
     uint32_t lp_enter_count;
     uint32_t wake_count;
@@ -68,8 +82,10 @@ static struct
     uint32_t wake_alert_count;
     uint32_t wake_charger_count;
     uint32_t wake_monitor_count;
+    uint32_t wake_unknown_count;      /* WFI 返回但无 RTC/按键/ALERT 标志 */
     uint32_t clock_fail_count;
     uint32_t lp_prepare_fail_count;
+    uint32_t lp_alert_abort_count;   /* BQ ALERT/保护锁存导致取消 LP 的次数 */
     uint32_t wake_clock_fail_count;
     volatile uint8_t lp_stage;   /* ENTER_LP 阶段码，卡死时用于定位 */
     volatile uint8_t hse_off_timeout; /* HSERDY 在限时内未落：继续 LP，供诊断 */
@@ -82,12 +98,14 @@ static struct
     volatile uint8_t diag_blackbox_error;  /* 自检完成时 BlackBox_HasError() */
     volatile uint8_t lp_charger_pending; /* 本次嗅探判定为充电，待完整唤醒 */
     volatile uint16_t lp_monitor_ticks;  /* 30 min 监测阈值；调试器可改小做台架测试 */
+    volatile uint16_t lp_sniff_led_ms;   /* PB4 每次 WUT 嗅探闪灯脉宽；0=关闭 */
     volatile uint8_t lp_disable_auto;    /* 1=禁止 5 s 自动 LP（台架/调试用） */
     volatile uint32_t button_irq_count;  /* PB5 EXTI 进入次数（诊断按键唤醒） */
     uint8_t lp_diag_button_logged;       /* 本次 LP 已写一条按键 LP_DIAG 记录 */
     uint8_t lp_diag_entry_logged;   /* 本次 LP 已写进入循环诊断 */
     uint8_t lp_diag_wut_logged;     /* 本次 LP 已写首个 WUT 诊断 */
     uint8_t lp_diag_wfi_logged;     /* 本次 LP 已写首次 WFI 前 RTC 诊断 */
+    uint8_t lp_diag_unknown_logged; /* 本次 LP 已写未知唤醒诊断 */
     uint16_t lp_diag_stage_mask;    /* 本次 LP 各关键阶段已写诊断 */
 } s_power;
 
@@ -128,6 +146,84 @@ static void PowerMode_DbgStopEnable(void);
 static uint8_t PowerMode_LpButtonPathFlags(void);
 static uint8_t PowerMode_LpWutPathFlags(void);
 
+/* 时钟切换失败/重试前强制回到 HSI16，并同步 SystemCoreClock + SysTick。
+ * HAL_RCC_ClockConfig 可能在 MODIFY_REG(SW) 之后才因 SWS 超时返回
+ * HAL_TIMEOUT；此时硬件已经切到 PLL，但 HAL 还没更新 SystemCoreClock/
+ * SysTick。若不先回落，后续 HAL_Delay/HAL_GetTick 会按旧 16 MHz 的 tick
+ * 运行，30 ms 等延时全部失真。 */
+static void PowerMode_ClkForceHsi16(void)
+{
+    __HAL_RCC_HSI_ENABLE();
+    while (__HAL_RCC_GET_FLAG(RCC_FLAG_HSIRDY) == 0u)
+    {
+    }
+    __HAL_RCC_SYSCLK_CONFIG(RCC_SYSCLKSOURCE_HSI);
+    while (__HAL_RCC_GET_SYSCLK_SOURCE() != RCC_CFGR_SWS_HSI)
+    {
+    }
+    SystemCoreClock = 16000000u;
+    (void)HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE2);
+    (void)HAL_InitTick(TICK_INT_PRIORITY);
+}
+
+/* LSE + RTC 时钟源是否可用。RTCSEL=LSE 是 RTC 继续走 LSE 的硬条件；
+ * 只看 LSERDY 不够（RTCSEL 被改掉时 LSE 仍可能 ready）。 */
+static uint8_t PowerMode_LseReady(void)
+{
+    return ((__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) != 0u) &&
+            ((RCC->BDCR & RCC_BDCR_RTCSEL) == RCC_BDCR_RTCSEL_0)) ? 1u : 0u;
+}
+
+/* LSE 故障不应该是“一次失败永久锁死”。外部 32.768 kHz 可能被干扰，
+ * 干扰撤去后 LSERDY 会恢复；旧代码在 WUT 布防失败时置 sticky LSE，
+ * auto-LP 的 APP_LP_BLOCK_LSE 又在 main_app 里读 Fault_GetAll，导致
+ * 第一次失败后永远不再尝试 LP（表现为 PB5 回 NORM 后自动 LP 不再闪灯）。
+ * 这里用连续 POWER_LSE_RECOVER_MS 的 LSERDY+RTCSEL 正常作为恢复条件：
+ *   - 失效时只置 live，保证 auto-LP 停下；
+ *   - 稳定后清 live + 历史 sticky，允许下一次 LP 重试；
+ *   - 不清除真实失效（LSERDY 不恢复就不会清）。 */
+static void PowerMode_LseHealthTask(void)
+{
+    uint32_t now;
+
+    if (PowerMode_LseReady() == 0u)
+    {
+        if (s_power.lse_ok != 0u)
+        {
+            s_power.lse_lost_count++;
+        }
+        s_power.lse_ok = 0u;
+        s_power.lse_healthy_since_ms = 0u;
+        Fault_SetLive(FAULT_BIT_LSE);
+        return;
+    }
+
+    now = HAL_GetTick();
+    if ((s_power.lse_ok == 0u) ||
+        ((Fault_GetAll() & FAULT_BIT_LSE) != 0u))
+    {
+        if (s_power.lse_healthy_since_ms == 0u)
+        {
+            s_power.lse_healthy_since_ms = now;
+            return;
+        }
+        if ((now - s_power.lse_healthy_since_ms) < POWER_LSE_RECOVER_MS)
+        {
+            return;
+        }
+
+        s_power.lse_ok = 1u;
+        s_power.lse_healthy_since_ms = 0u;
+        s_power.lse_recover_count++;
+        Fault_ClearLive(FAULT_BIT_LSE);
+        Fault_ClearSticky(FAULT_BIT_LSE);
+    }
+    else
+    {
+        s_power.lse_healthy_since_ms = 0u;
+    }
+}
+
 uint8_t PowerMode_ClkSwitchToHsePll(void)
 {
     RCC_OscInitTypeDef osc = {0};
@@ -154,12 +250,14 @@ uint8_t PowerMode_ClkSwitchToHsePll(void)
         if (HAL_RCC_OscConfig(&osc) != HAL_OK)
         {
             s_power.clock_fail_count++;
+            PowerMode_ClkForceHsi16();
             continue;
         }
 
         if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
         {
             s_power.clock_fail_count++;
+            PowerMode_ClkForceHsi16();
             continue;
         }
 
@@ -172,6 +270,7 @@ uint8_t PowerMode_ClkSwitchToHsePll(void)
         if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK)
         {
             s_power.clock_fail_count++;
+            PowerMode_ClkForceHsi16();
             continue;
         }
 
@@ -179,6 +278,7 @@ uint8_t PowerMode_ClkSwitchToHsePll(void)
         return 1u;
     }
 
+    PowerMode_ClkForceHsi16();   /* 降级模式也必须让 HAL tick 与 HSI16 一致 */
     s_power.clock_ok = 0u;
     return 0u;
 }
@@ -193,6 +293,9 @@ void PowerMode_Init(void)
     s_power.flag_button_ms = 0u;
     s_power.lse_ok = 0u;
     s_power.degraded = 0u;
+    s_power.lse_lost_count = 0u;
+    s_power.lse_recover_count = 0u;
+    s_power.lse_healthy_since_ms = 0u;
     s_power.clock_ok = 0u;
     s_power.lp_enter_count = 0u;
     s_power.wake_count = 0u;
@@ -203,6 +306,7 @@ void PowerMode_Init(void)
     s_power.wake_monitor_count = 0u;
     s_power.clock_fail_count = 0u;
     s_power.lp_prepare_fail_count = 0u;
+    s_power.lp_alert_abort_count = 0u;
     s_power.wake_clock_fail_count = 0u;
     s_power.lp_stage = 0u;
     s_power.hse_off_timeout = 0u;
@@ -216,12 +320,14 @@ void PowerMode_Init(void)
     s_power.diag_blackbox_error = 0u;
     s_power.lp_charger_pending = 0u;
     s_power.lp_monitor_ticks = POWER_LP_MAX_TICKS;
+    s_power.lp_sniff_led_ms = POWER_LP_SNIFF_LED_MS;
     s_power.lp_disable_auto = 0u;
     s_power.button_irq_count = 0u;
     s_power.lp_diag_button_logged = 0u;
     s_power.lp_diag_entry_logged = 0u;
     s_power.lp_diag_wut_logged = 0u;
     s_power.lp_diag_wfi_logged = 0u;
+    s_power.lp_diag_unknown_logged = 0u;
     s_power.lp_diag_stage_mask = 0u;
 
     __HAL_RCC_PWR_CLK_ENABLE();
@@ -231,11 +337,14 @@ void PowerMode_Init(void)
                       (HAL_RTC_GetState(&hrtc) == HAL_RTC_STATE_READY)) ? 1u : 0u;
     if (s_power.lse_ok == 0u)
     {
-        Fault_SetSticky(FAULT_BIT_LSE);
+        /* 可恢复故障：LSERDY/RTCSEL 稳定后由 PowerMode_LseHealthTask 清除。
+         * 旧代码用 sticky，导致一次上电/布防失败后 auto-LP 永久被挡住。 */
+        Fault_SetLive(FAULT_BIT_LSE);
     }
 
     HAL_NVIC_DisableIRQ(RTC_WKUP_IRQn);
     HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+    EXTI->PR1 = EXTI_PR1_PIF20;   /* 清上电/复位遗留的 WUT 挂起 */
 
     /* PB5 的 IT_FALLING + 内部上拉 + EXTI9_5 NVIC 全部由 CubeMX 生成的
      * MX_GPIO_Init 配置（.ioc: GPXTI5 / GPIO_MODE_IT_FALLING / GPIO_PULLUP），
@@ -582,9 +691,10 @@ static uint8_t PowerMode_LpButtonPathFlags(void)
 }
 
 /* RTC WUT 唤醒通路现场（stage30 专用）：
- * bit0=WUTE, bit1=WUTIE, bit2=WUTF, bit3=WUTWF,
+ * bit0=WUTE, bit1=WUTIE, bit2=WUTF, bit3=LSERDY,
  * bit4=EXTI line20 IMR, bit5=EXTI line20 RTSR,
- * bit6=RTC_WKUP NVIC 使能, bit7=EXTI line20 pending。 */
+ * bit6=RTC_WKUP NVIC 使能, bit7=EXTI line20 pending。
+ * WUTWF/LSE/RTCSEL 等放在 PowerMode_LpRtcAux。 */
 static uint8_t PowerMode_LpWutPathFlags(void)
 {
     uint8_t flags = 0u;
@@ -609,7 +719,7 @@ static uint8_t PowerMode_LpWutPathFlags(void)
     {
         flags |= 0x10u;
     }
-    if ((EXTI->RTSR1 & EXTI_IMR1_IM20) != 0u)
+    if ((EXTI->RTSR1 & EXTI_RTSR1_RT20) != 0u)
     {
         flags |= 0x20u;
     }
@@ -617,11 +727,172 @@ static uint8_t PowerMode_LpWutPathFlags(void)
     {
         flags |= 0x40u;
     }
-    if ((EXTI->PR1 & EXTI_IMR1_IM20) != 0u)
+    if ((EXTI->PR1 & EXTI_PR1_PIF20) != 0u)
     {
         flags |= 0x80u;
     }
     return flags;
+}
+
+/* 清掉 RTC WUT 的 stale 挂起：WUTF、EXTI line20、NVIC。只在 WUTF=0
+ * 或准备重新布防时调用；WUTF=1 代表一个有效 tick，不能在这里丢。 */
+static void PowerMode_LpClearWutPending(void)
+{
+    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    EXTI->PR1 = EXTI_PR1_PIF20;
+    HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+}
+
+static uint8_t PowerMode_LpWutArmed(void)
+{
+    return ((RTC->CR & (RTC_CR_WUTE | RTC_CR_WUTIE)) ==
+            (RTC_CR_WUTE | RTC_CR_WUTIE)) ? 1u : 0u;
+}
+
+/* BKP18R：最后一次 WUT 布防结果（低 8 位 HAL 状态，bit8=guard 重布防），
+ * 跨复位保留。用于判断第二次 LP 是否卡在 WUT 布防失败。 */
+static void PowerMode_LpRecordWutArm(HAL_StatusTypeDef status, uint8_t guard)
+{
+    HAL_PWR_EnableBkUpAccess();
+    RTC->BKP18R = POWER_LP_BKP_ISR_MARKER |
+                  ((uint32_t)status & 0xFFu) |
+                  ((guard != 0u) ? 0x100u : 0u);
+}
+
+/* BKP19R：本次 LP 进入前最后一次 BQ/ALERT 现场，跨复位可查。
+ * bit31..24=0xA5，bit23..20=BQ 状态机，bit19=verdict_active，bit18=recovery_episode，
+ * bit17=adc_recovery_failed，bit16=fresh，bit15..8=SYS_STAT，
+ * bit0=PA8/BQ ALERT 电平（1=高）。ADC 异常/恢复后若 PA8 仍高，
+ * BQ_PrepareForLpMask 只清 CC_READY/XREADY，不清 OV/UV/SCD/OCD 锁存；
+ * 直接睡下会在首个 WUT 的 PA8 检查处完整唤醒，PB4 心跳还没执行。 */
+static void PowerMode_LpRecordEntryBq(const bq_snapshot_t *snap, uint8_t pa8_high)
+{
+    uint32_t value;
+
+    HAL_PWR_EnableBkUpAccess();
+    value = POWER_LP_BKP_CTX_MARKER |
+            (((uint32_t)BQ_GetState() & 0x0Fu) << 20) |
+            ((snap->verdict_active != 0u) ? (1u << 19) : 0u) |
+            ((snap->recovery_episode != 0u) ? (1u << 18) : 0u) |
+            ((snap->adc_recovery_failed != 0u) ? (1u << 17) : 0u) |
+            ((snap->fresh != 0u) ? (1u << 16) : 0u) |
+            ((uint32_t)snap->sys_stat << 8) |
+            ((pa8_high != 0u) ? 1u : 0u);
+    RTC->BKP19R = value;
+}
+
+/* BKP13R/14R 计数：PB5 EXTI 进入次数、按钮完整唤醒次数。跨复位保留，
+ * 用于判断“按键边沿根本没到 CPU”还是“到了但完整唤醒路径没走”。 */
+static void PowerMode_LpBumpBkp(volatile uint32_t *reg)
+{
+    uint32_t n;
+
+    HAL_PWR_EnableBkUpAccess();
+    n = *reg & 0xFFFFu;
+    if (n < 0xFFFFu)
+    {
+        n++;
+    }
+    *reg = POWER_LP_BKP_ISR_MARKER | n;
+}
+
+/* NORM→LP 进入窗口的按键请求：flag、PIF5、PB5 电平任一成立。 */
+static uint8_t PowerMode_LpButtonRequested(void)
+{
+    if (s_power.flag_button != 0u)
+    {
+        return 1u;
+    }
+    if ((EXTI->PR1 & EXTI_PR1_PIF5) != 0u)
+    {
+        return 1u;
+    }
+    return (HAL_GPIO_ReadPin(WAKE_EXTI5_GPIO_Port, WAKE_EXTI5_Pin) ==
+            GPIO_PIN_RESET) ? 1u : 0u;
+}
+
+/* NORM→LP 进入窗口内收到按键：不要继续走完停外设/关 5V/切时钟再靠
+ * pre-STOP1 guard 唤醒；直接取消本次 LP，保持 NORM。BQ 已经进入 LP
+ * 寄存器态时（300 ms 准备之后）必须先恢复 BQ 配置。按键事件要合成进
+ * Button 队列，避免 ISR 已清 PIF5 后丢失。 */
+static void PowerMode_LpAbortForButton(uint8_t bq_prepared)
+{
+    Button_OnWake(1u,
+                  (uint8_t)((HAL_GPIO_ReadPin(WAKE_EXTI5_GPIO_Port,
+                                              WAKE_EXTI5_Pin) ==
+                             GPIO_PIN_RESET) ? 1u : 0u),
+                  HAL_GetTick());
+    s_power.flag_button = 0u;
+    EXTI->PR1 = EXTI_PR1_PIF5;
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    if (bq_prepared != 0u)
+    {
+        BQ_ReInitAfterLp();   /* 把 SYS_CTRL1/2/FET/保护恢复到 NORM */
+    }
+
+    s_power.request_lp = 0u;
+    s_power.state = POWER_STATE_NORM;
+    s_power.lp_stage = 0u;
+}
+
+static void PowerMode_LpEnsureButtonPath(void)
+{
+    uint8_t flags = PowerMode_LpButtonPathFlags();
+
+    if ((flags & 0x0Fu) != 0x0Fu)
+    {
+        GPIO_InitTypeDef gpio = {0};
+
+        __HAL_RCC_SYSCFG_CLK_ENABLE();
+        gpio.Pin = WAKE_EXTI5_Pin;
+        gpio.Mode = GPIO_MODE_IT_FALLING;
+        gpio.Pull = GPIO_PULLUP;
+        gpio.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(WAKE_EXTI5_GPIO_Port, &gpio);
+    }
+
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0u, 0u);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    if (((EXTI->PR1 & EXTI_PR1_PIF5) == 0u) &&
+        (s_power.flag_button == 0u) &&
+        (HAL_GPIO_ReadPin(WAKE_EXTI5_GPIO_Port, WAKE_EXTI5_Pin) !=
+         GPIO_PIN_RESET))
+    {
+        HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    }
+
+    HAL_PWR_EnableBkUpAccess();
+    RTC->BKP15R = POWER_LP_BKP_ISR_MARKER | (uint32_t)flags;
+}
+
+/* 在真正 WFI 前把睡眠/中断现场写入 BKP4R..BKP8R，跨复位保留：
+ *   BKP4R = PWR_CR1[15:0] | SCB_SCR[23:16] | PRIMASK[24] | BASEPRI[31:25]
+ *   BKP5R = NVIC ISER[0]（bit3=RTC_WKUP）
+ *   BKP6R = NVIC ISPR[0]
+ *   BKP7R = EXTI line5/8/20 的 IMR/EMR/RTSR/PR 关键位
+ *   BKP8R = RTC_CR[15:0] | RTC_ISR[31:16]
+ * 这能区分“真的进了 STOP1 且中断全开”与“HardFault/中断被屏蔽/没设 SLEEPDEEP”。 */
+static void PowerMode_LpSnapshotSleepRegs(void)
+{
+    HAL_PWR_EnableBkUpAccess();
+    RTC->BKP4R = ((uint32_t)PWR->CR1 & 0xFFFFu) |
+                 (((uint32_t)SCB->SCR & 0xFFu) << 16) |
+                 (((uint32_t)__get_PRIMASK() & 1u) << 24) |
+                 (((uint32_t)__get_BASEPRI() & 0x7Fu) << 25);
+    RTC->BKP5R = NVIC->ISER[0];
+    RTC->BKP6R = NVIC->ISPR[0];
+    RTC->BKP7R = ((EXTI->IMR1 & EXTI_IMR1_IM5) ? 0x01u : 0u) |
+                 ((EXTI->EMR1 & EXTI_EMR1_EM5) ? 0x02u : 0u) |
+                 ((EXTI->IMR1 & EXTI_IMR1_IM8) ? 0x04u : 0u) |
+                 ((EXTI->EMR1 & EXTI_EMR1_EM8) ? 0x08u : 0u) |
+                 ((EXTI->IMR1 & EXTI_IMR1_IM20) ? 0x10u : 0u) |
+                 ((EXTI->EMR1 & EXTI_EMR1_EM20) ? 0x20u : 0u) |
+                 ((EXTI->RTSR1 & EXTI_RTSR1_RT20) ? 0x40u : 0u) |
+                 ((EXTI->PR1 & EXTI_PR1_PIF20) ? 0x80u : 0u);
+    RTC->BKP8R = ((uint32_t)RTC->CR & 0xFFFFu) |
+                 (((uint32_t)RTC->ISR & 0xFFFFu) << 16);
 }
 
 /* stage30 的附加 RTC 时钟信息，放入记录的 cell3（低 16 位）：
@@ -718,6 +989,64 @@ void PowerMode_LogBootRtcState(void)
         (RTC->BKP1R & 0xFFFFu) << 16,
         (uint32_t)RTC->ISR & 0xFFFFu,
         60u, flags);
+
+    /* stage61：上一次运行的 RTC_WKUP 向量/回调计数（BKP2R/BKP3R），
+     * 以及复位原因。写入成功后清零，供本次上电重新累计。
+     * 字段：cc_raw=BKP2R[15:0], ts1_raw=BKP3R[15:0],
+     *       cell3=ResetCause_GetLatched()。 */
+    if (BlackBox_WriteLpDiag(
+            App_GetUptimeSeconds(),
+            (RTC->BKP2R & 0xFFFFu) << 16,
+            (RTC->BKP3R & 0xFFFFu) << 16,
+            (uint32_t)ResetCause_GetLatched(),
+            61u, 0u) == 0)
+    {
+        HAL_PWR_EnableBkUpAccess();
+        RTC->BKP2R = 0u;
+        RTC->BKP3R = 0u;
+    }
+
+    /* stage62：PB5 诊断。cc_raw=BKP13R（PB5 EXTI ISR 次数），
+     * ts1_raw=BKP14R（按钮完整唤醒次数），cell3=BKP15R（最后一次
+     * LP 进入前的 PB5 通路 flags）。这里不清 BKP13R/14R/15R：
+     * NRST 后 Ozone 可直接读；它们是本电源周期的累计值。
+     * 若整机断电（无 VBAT），备份寄存器会丢，但本条 stage62 Flash
+     * 记录仍保留上一次 boot 时的值。 */
+    (void)BlackBox_WriteLpDiag(
+        App_GetUptimeSeconds(),
+        (RTC->BKP13R & 0xFFFFu) << 16,
+        (RTC->BKP14R & 0xFFFFu) << 16,
+        (uint32_t)(RTC->BKP15R & 0xFFFFu),
+        62u, 0u);
+
+    /* stage63：完整 BKP16R（最后一次 PB5 ISR 上下文）。整机断电会清
+     * 备份寄存器，这条 Flash 记录保留断电前最后一次 boot 读到的值。
+     * 24 B 映射：cell1=BKP16R[15:0]，cc=BKP16R[31:16]。 */
+    (void)BlackBox_WriteLpDiag(App_GetUptimeSeconds(), RTC->BKP16R, 0u, 0u,
+                               63u, 0u);
+
+    /* stage64：BKP17R=累计进入 LP 次数，BKP18R=最后一次 WUT 布防结果
+     * （低 8 位 HAL 状态，bit8=guard 重布防）。cc_raw=BKP17R[15:0]，
+     * ts1_raw=BKP18R[15:0]。 */
+    (void)BlackBox_WriteLpDiag(
+        App_GetUptimeSeconds(),
+        (RTC->BKP17R & 0xFFFFu) << 16,
+        (RTC->BKP18R & 0xFFFFu) << 16,
+        0u, 64u, 0u);
+
+    /* stage65：最近一次 LP 进入前的 BQ ALERT/SYS_STAT 现场（BKP19R）。
+     * 24 B 映射：cell1=BKP19R[15:0]，cc=BKP19R[31:16]；布局见
+     * PowerMode_LpRecordEntryBq。用于区分“ADC 异常后假保护锁存仍高”
+     * 与“WUT 没起来”。不清零，保持最近一次进入现场。 */
+    (void)BlackBox_WriteLpDiag(App_GetUptimeSeconds(), RTC->BKP19R,
+                               0u, 0u, 65u, 0u);
+
+    /* stage66：最近一次 LP 准备失败（BKP20R）。上面 stage65 只在真正
+     * 走到 BQ 准备成功后才写；ADC 恢复回合中 BQ_PrepareForLpMask 返回
+     * -2 时 LP 根本没进入，BKP19 不会更新。24 B 映射同 stage65：
+     * cell1=BKP20R[15:0]，cc=BKP20R[31:16]；布局见 EnterLp 的失败分支。 */
+    (void)BlackBox_WriteLpDiag(App_GetUptimeSeconds(), RTC->BKP20R,
+                               0u, 0u, 66u, 0u);
 }
 
 /* LP 进入阶段诊断：每次 LP 进入、每个阶段只写一条记录。上一次 LP 成功
@@ -751,6 +1080,14 @@ void PowerMode_EnterLp(void)
     {
         return;
     }
+    PowerMode_LseHealthTask();
+    if (s_power.lse_ok == 0u)
+    {
+        /* 没有 LSE 就没有 RTC WUT；不要为了进入 LP 而冒“睡下后无唤醒源”
+         * 的风险。LSE 恢复后 health task 会清 live 故障，auto-LP 自动重试。 */
+        s_power.request_lp = 0u;
+        return;
+    }
     s_power.state = POWER_STATE_ENTER_LP;
     s_power.lp_stage = 1u;      /* 1=drain */
 
@@ -758,6 +1095,9 @@ void PowerMode_EnterLp(void)
      * 本次 WUT ISR 已经进入；BKP1R 由本次 RTC_WKUP 向量/回调重新写。 */
     HAL_PWR_EnableBkUpAccess();
     RTC->BKP1R = 0u;
+    /* BKP4R..8R 不在这里清：保留上一次 LP 的睡眠现场，直到本次真正
+     * 走到 stage32 再覆盖。这样即使下一次 LP 在进入早期失败，上次
+     * 的 PRIMASK/SCB/EXTI/RTC 证据也不会丢。 */
 
     /* 不要无条件清 flag_button：请求之后到 STOP1 之间（约几百 ms）的
      * 按键可能已被 EXTI ISR 消费掉 PIF5，只剩这个标志。只清 2 s 以前
@@ -776,6 +1116,7 @@ void PowerMode_EnterLp(void)
     s_power.lp_diag_entry_logged = 0u;
     s_power.lp_diag_wut_logged = 0u;
     s_power.lp_diag_wfi_logged = 0u;
+    s_power.lp_diag_unknown_logged = 0u;
     s_power.lp_diag_stage_mask = 0u;
 
     /* stage=0：LP 进入前的 RTC/LSE 现场。flags：
@@ -833,6 +1174,11 @@ void PowerMode_EnterLp(void)
         BQ_Poll();
     }
     /* 超时未排空也继续进入 LP；在飞事务由各外设的 LP 停机路径中止。 */
+    if (PowerMode_LpButtonRequested() != 0u)
+    {
+        PowerMode_LpAbortForButton(0u);
+        return;
+    }
 
     /* 2) BQ：关 ADC/TEMP（SYS_CTRL1=0x00，LP 期间无电压/电流/温度检测）+
      *    CC_EN=0（FET 按 s_power.lp_fet_mask；默认全关）+ 清 SYS_STAT，
@@ -843,6 +1189,21 @@ void PowerMode_EnterLp(void)
 
         if (prep != 0)
         {
+            /* BKP20R：LP 准备失败现场。ADC 恢复回合/配置/verdict 期间
+             * BQ_PrepareForLpMask 返回 -2，本次请求被静默作废（自动 LP
+             * 要再等 5 s）；跨复位保留，避免只看到“没有 PB4 心跳”。
+             * bit31..24=0xA6，bit19..16=BQ 状态，bit22=recovering，
+             * bit21=adc_recovery_failed，bit20=fresh，bit15..8=prep。 */
+            HAL_PWR_EnableBkUpAccess();
+            RTC->BKP20R = 0xA6000000u |
+                          (((uint32_t)BQ_GetState() & 0x0Fu) << 16) |
+                          ((BQ_IsRecovering() != 0u) ? (1u << 22) : 0u) |
+                          ((BQ_GetAdcRecoveryFailed() != 0u) ? (1u << 21) : 0u) |
+                          ((BQ_IsFresh(HAL_GetTick()) != 0u) ? (1u << 20) : 0u) |
+                          (((uint32_t)(uint8_t)prep) << 8);
+            /* 不在这里写 Flash：prep=-2 时 BQ 正在 ADC 恢复回合，Flash
+             * 编程的指令取指停顿会拉长 I2C/DMA 事务。BKP20R 跨 NRST
+             * 保留，下一次 boot 的 stage66 再落盘。 */
             s_power.lp_prepare_fail_count++;
             s_power.request_lp = 0u;
             s_power.state = POWER_STATE_NORM;
@@ -861,21 +1222,80 @@ void PowerMode_EnterLp(void)
     }
     s_power.lp_stage = 2u;      /* 2=BQ prepare done */
 
+    /* 300 ms BQ 准备窗口内按下：在停外设/关 5 V 之前取消 LP，并恢复
+     * BQ 的 ADC/FET 配置；不要让用户看到 5 V/灯先灭再被 pre-STOP1
+     * guard 唤回。 */
+    if (PowerMode_LpButtonRequested() != 0u)
+    {
+        PowerMode_LpAbortForButton(1u);
+        return;
+    }
+
+    /* 2b) BQ 准备完成后、睡下之前检查 ALERT/SYS_STAT。
+     * BQ_PrepareForLpMask 只清 CC_READY/XREADY；ADC 异常、受控重启或
+     * 准备窗口内新锁存的 OV/UV/SCD/OCD 会让 PA8 保持高。此时如果直接
+     * 进入 STOP1，首个 WUT 醒来会在 PA8 检查处完整唤醒，PB4 心跳分支
+     * 还没执行，现场表现为“进了 LP 但没有 LED 脉冲”。先取消本次 LP，
+     * 让 NORM 的 5 帧假锁存清理/故障处理跑完；BKP19R 保留 PA8/SYS_STAT
+     * 现场。这里是“ALERT 实际为高”的物理判据，保护锁存本身的故障
+     * 处置仍由 BQ/状态机负责。 */
+    {
+        bq_snapshot_t lp_bq;
+        uint8_t pa8_high;
+
+        BQ_GetSnapshot(&lp_bq);
+        pa8_high = (HAL_GPIO_ReadPin(BQ_ALT_EXTI8_GPIO_Port,
+                                     BQ_ALT_EXTI8_Pin) == GPIO_PIN_SET) ? 1u : 0u;
+        /* SYS_STAT 的 OCD/SCD/OV/UV 锁存保留是安全设计；这里只以实际
+         * PA8 电平作为“睡下会立即被 ALERT 唤醒”的判据。保护锁存本身
+         * 仍由状态机/故障处理消化，BKP19R 记录 SYS_STAT 供诊断。 */
+        PowerMode_LpRecordEntryBq(&lp_bq, pa8_high);
+        if (pa8_high != 0u)
+        {
+            s_power.lp_alert_abort_count++;
+            s_power.request_lp = 0u;
+            s_power.state = POWER_STATE_NORM;
+            s_power.lp_stage = 0u;
+            PowerMode_LpDiagStage(65u, 0x0400u);   /* 65=LP aborted: PA8/BQ ALERT high */
+            BQ_ReInitAfterLp();                    /* 恢复 ADC/FET 到 NORM 配置 */
+            return;
+        }
+    }
+
     /* 3) 黑匣子转换记录（此时仍在 NORM，Flash 可写）。 */
     (void)BlackBox_WriteTransition(BB_KIND_LP_ENTER, BB_WAKE_NONE,
                                    App_GetUptimeSeconds());
     s_power.lp_stage = 3u;      /* 3=black-box LP record done */
 
-    /* 4) 布防 RTC 1 s 嗅探唤醒；充电/按键/ALERT/30 min 维护才回 NORM。
-     *    布防失败则不进入 LP。 */
+    /* 4) 布防 RTC 2 s 嗅探唤醒；充电/按键/ALERT/30 min 维护才回 NORM。
+     *    布防失败则不进入 LP。先清掉上一次 WUT 的残留状态，再 arm；
+     *    失败重试一次，并把 HAL 返回码写入 BKP18R（跨复位可查）。 */
     s_power.flag_rtc = 0u;
     s_power.wake_cause = 0u;
     HAL_NVIC_SetPriority(RTC_WKUP_IRQn, 1u, 0u);
     HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
     HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+    if ((RTC->CR & RTC_CR_WUTE) != 0u)
+    {
+        (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    }
+    PowerMode_LpClearWutPending();
+    HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+    EXTI->PR1 = EXTI_PR1_PIF20;
     PowerMode_LpDiagStage(4u, 0x0001u); /* 4=about to arm RTC WUT */
-    wut_status = HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_SNIFF_WUT_SECONDS,
+    wut_status = HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_WUT_RELOAD,
                                              RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+    if (wut_status != HAL_OK)
+    {
+        /* 第二次 LP 若上一次 WUT 状态残留，先彻底清一次再重试。 */
+        (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+        PowerMode_LpClearWutPending();
+        HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+        EXTI->PR1 = EXTI_PR1_PIF20;
+        wut_status = HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_WUT_RELOAD,
+                                                 RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+    }
+    PowerMode_LpRecordWutArm(wut_status, 0u);
     if (wut_status != HAL_OK)
     {
         /* flags = HAL 返回码（1=ERROR, 2=BUSY, 3=TIMEOUT），便于区分
@@ -884,7 +1304,7 @@ void PowerMode_EnterLp(void)
         s_power.lse_ok = 0u;
         s_power.request_lp = 0u;
         s_power.state = POWER_STATE_NORM;
-        Fault_SetSticky(FAULT_BIT_LSE);
+        Fault_SetLive(FAULT_BIT_LSE);
         (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
         HAL_NVIC_DisableIRQ(RTC_WKUP_IRQn);
         return;
@@ -901,7 +1321,12 @@ void PowerMode_EnterLp(void)
     /* 6) 只清 PA8 事件；**不要清 PIF5**——按键可能正好在停外设/布防窗口
      *    按下并释放，清 PR1 会把真实下降沿丢掉。PIF5 由 EXTI ISR 清除；
      *    若 ISR 尚未执行，保留的 pending 位还会让 STOP1 立即唤醒。 */
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    if ((RTC->ISR & RTC_ISR_WUTF) == 0u)
+    {
+        PowerMode_LpClearWutPending();
+    }
+    /* WUTF=1 是有效 tick：保留 WUTF/PR20/NVIC pending，让第一次 WFI
+     * 立即醒来并走 callback，不能在这里清掉。 */
     EXTI->PR1 = (uint32_t)EXTI_PR1_PIF8;
 
     /* 7) LP 时钟：HSI16（1 s 嗅探的 I2C 也在这个时钟下）；STOPWUCK=HSI。 */
@@ -961,6 +1386,7 @@ void PowerMode_EnterLp(void)
     s_power.state = POWER_STATE_LP;
     s_power.lp_enter_count++;
     s_bb_shadow.diag_lp_enter_count = s_power.lp_enter_count;
+    PowerMode_LpBumpBkp(&RTC->BKP17R);   /* 跨复位累计进入 LP 次数 */
     s_power.lp_stage = 12u;     /* 12=LP loop entry */
 
     /* 每次 LP 进入写一条“已进入 STOP 循环”的诊断记录；如果卡在进入
@@ -998,8 +1424,11 @@ void PowerMode_EnterLp(void)
      * 重装的，只要 WUTE/WUTIE 仍置位就继续运行。这里只清标志/挂起，不再
      * 关掉再重布防，避免 HAL 在 1 Hz CK_SPRE 下等待 WUTWF 超时。 */
     s_power.flag_rtc = 0u;
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-    HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+    if ((RTC->ISR & RTC_ISR_WUTF) == 0u)
+    {
+        PowerMode_LpClearWutPending();
+    }
+    /* WUTF=1：保留这次已发生的 tick，第一次 STOP1 会立即返回并处理。 */
     HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
 
     /* 11) 1 s 嗅探循环：RTC tick 做 I2C/充电判定；充电、按键、ALERT 或
@@ -1009,11 +1438,11 @@ void PowerMode_EnterLp(void)
     if ((RTC->CR & (RTC_CR_WUTE | RTC_CR_WUTIE)) !=
         (RTC_CR_WUTE | RTC_CR_WUTIE))
     {
-        if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_SNIFF_WUT_SECONDS,
+        if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_WUT_RELOAD,
                                         RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
         {
             s_power.lse_ok = 0u;
-            Fault_SetSticky(FAULT_BIT_LSE);
+            Fault_SetLive(FAULT_BIT_LSE);
             full_wake = 1u;
             cause |= POWER_WAKE_RTC;
         }
@@ -1056,21 +1485,79 @@ void PowerMode_EnterLp(void)
         /* 进入 STOP1 前做最后一道保险：RTC WUT 的定时器和中断使能必须
          * 同时为 1，否则 STM32 不会从 STOP1 被 WUT 唤醒。若被意外清除，
          * 这里重布防；重布防失败则直接完整唤醒，绝不在无唤醒源下睡。 */
-        if ((RTC->CR & (RTC_CR_WUTE | RTC_CR_WUTIE)) !=
-            (RTC_CR_WUTE | RTC_CR_WUTIE))
         {
-            __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-            HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
-            HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
-            if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, POWER_LP_SNIFF_WUT_SECONDS,
-                                            RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
+            uint8_t repair_arm = (PowerMode_LpWutArmed() == 0u) ? 1u : 0u;
+
+            if (repair_arm == 0u)
             {
-                s_power.lse_ok = 0u;
-                Fault_SetSticky(FAULT_BIT_LSE);
-                full_wake = 1u;
-                cause |= POWER_WAKE_RTC;
-                break;
+                /* WUTE/WUTIE 在，但 EXTI/NVIC 侧可能被意外清掉：
+                 * 直接补位，避免做一次会等待 WUTWF 的完整重布防。 */
+                if ((EXTI->IMR1 & EXTI_IMR1_IM20) == 0u)
+                {
+                    EXTI->IMR1 |= EXTI_IMR1_IM20;
+                }
+                if ((EXTI->RTSR1 & EXTI_RTSR1_RT20) == 0u)
+                {
+                    EXTI->RTSR1 |= EXTI_RTSR1_RT20;
+                }
+                if (((NVIC->ISER[0] >> (uint32_t)RTC_WKUP_IRQn) & 1u) == 0u)
+                {
+                    HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+                }
+                if ((RTC->ISR & RTC_ISR_WUTF) == 0u)
+                {
+                    /* 只清 stale EXTI/NVIC；WUTF=1 是有效 tick，保留。 */
+                    EXTI->PR1 = EXTI_PR1_PIF20;
+                    HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+                }
             }
+            else
+            {
+                HAL_StatusTypeDef status;
+
+                if ((RTC->CR & RTC_CR_WUTE) != 0u)
+                {
+                    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+                }
+                PowerMode_LpClearWutPending();
+                HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+                status = HAL_RTCEx_SetWakeUpTimer_IT(
+                    &hrtc, POWER_LP_WUT_RELOAD,
+                    RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+                if (status != HAL_OK)
+                {
+                    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+                    PowerMode_LpClearWutPending();
+                    HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+                    status = HAL_RTCEx_SetWakeUpTimer_IT(
+                        &hrtc, POWER_LP_WUT_RELOAD,
+                        RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+                }
+                PowerMode_LpRecordWutArm(status, 1u);
+                if (status != HAL_OK)
+                {
+                    s_power.lse_ok = 0u;
+                    Fault_SetLive(FAULT_BIT_LSE);
+                    full_wake = 1u;
+                    cause |= POWER_WAKE_RTC;
+                    break;
+                }
+            }
+        }
+
+        /* 最后一层 LSE 健康检查：WUTE/WUTIE 只是寄存器位，LSERDY=0 时
+         * WUT 不会产生 tick。ADC/时钟切换或外部干扰可能让 LSE 在布防后
+         * 失振；此时绝不进入 STOP1，直接完整唤醒回 NORM，让 health task
+         * 在 LSE 恢复后清 live 故障并重试 auto-LP。STOP1 内部 LSE 失振
+         * 仍需要一个独立于 LSE 的 watchdog（见 LPTIM/LSI 方案）。 */
+        if (PowerMode_LseReady() == 0u)
+        {
+            s_power.lse_ok = 0u;
+            s_power.lse_healthy_since_ms = 0u;
+            Fault_SetLive(FAULT_BIT_LSE);
+            full_wake = 1u;
+            cause |= POWER_WAKE_RTC;
+            break;
         }
 
         /* 首次 WFI 前记录 RTC 的最终布防状态（WUTE/WUTIE/WUTF）和 PB5
@@ -1097,6 +1584,7 @@ void PowerMode_EnterLp(void)
         /* 编译开关：默认保持 STOP1 中的 SWD（DBG_STOP），便于观察 lp_stage；
          * 量产低功耗构建用 -DPOWER_LP_KEEP_SWD=0 关闭。 */
         PowerMode_DbgStopEnable();
+        PowerMode_LpEnsureButtonPath();
 
         /* 请求自动 LP 到真正 WFI 之间用户可能已经按下；同时看
          * PIF5 pending（ISR 还没跑）、flag_button（按下后已释放）和
@@ -1126,10 +1614,21 @@ void PowerMode_EnterLp(void)
             (uint8_t)((s_power.debugger_attached != 0u ? 0x01u : 0u) |
                       (s_power.lp_keep_swd != 0u ? 0x02u : 0u)));
         HAL_SuspendTick();
-        HAL_PWREx_EnterSTOP1Mode(PWR_STOPENTRY_WFI);
+        /* 32=已挂起 SysTick，下一步就是 WFI；32 存在但无 33 表示
+         * CPU 真正进入了 STOP1 且没有返回。 */
+        PowerMode_LpMarkStage(32u, PowerMode_LpWutPathFlags());
+        /* 与 HAL_PWREx_EnterSTOP1Mode(WFI) 等价，但在设置 SLEEPDEEP/LPMS
+         * 之后、WFI 之前把睡眠现场写入 BKP4R..8R。这样复位后能区分
+         * “已正确进入 STOP1 且中断全开”与“HardFault/PRIMASK/没设 SLEEPDEEP”。 */
+        MODIFY_REG(PWR->CR1, PWR_CR1_LPMS, PWR_CR1_LPMS_STOP1);
+        SET_BIT(SCB->SCR, SCB_SCR_SLEEPDEEP_Msk);
+        PowerMode_LpSnapshotSleepRegs();
+        __DSB();
+        __WFI();
+        CLEAR_BIT(SCB->SCR, SCB_SCR_SLEEPDEEP_Msk);
 
         /* 33=WFI 已经返回（即使后续 stage14 的 Flash 诊断失败也可区分）；
-         * 31 而没有 33 表示 CPU 从未退出 STOP1/WFI。 */
+         * 31/32 而没有 33 表示 CPU 从未退出 STOP1/WFI。 */
         PowerMode_LpMarkStage(33u, 0u);
 
         /* 每次 STOP1 醒来都在 HSI16；先恢复 SysTick，再做任何 Flash
@@ -1139,8 +1638,26 @@ void PowerMode_EnterLp(void)
         s_power.lp_stage = 14u;     /* 14=woken from STOP1 */
         SystemCoreClock = 16000000u;
         (void)HAL_InitTick(TICK_INT_PRIORITY);
+        /* 34=WFI 返回且 SysTick 已恢复；33 有而 34 无表示卡在 tick 恢复。 */
+        PowerMode_LpMarkStage(34u, PowerMode_LpButtonPathFlags());
         PowerMode_LpDiagStageFlags(14u, 0x0200u,
                                    PowerMode_LpButtonPathFlags());
+
+        /* LP 嗅探心跳：PB4（IND_NORM，3V3 供电、高有效）每次 WUT tick
+         * 闪 lp_sniff_led_ms。必须放在下面的按键/PA8 检查之前：
+         * 若 BQ ALERT 在 LP 中变高，旧代码先在 PA8 检查处完整唤醒、
+         * 根本走不到原在 flag_rtc 分支里的心跳，现场就表现为“进过 LP
+         * 但没有 LED 脉冲”。现在只要有 RTC WUT tick 就先闪一下，再决定
+         * 是否完整唤醒；无脉冲仍然表示没有 WUT tick（或根本没进 LP）。
+         * 生产测电流可把 lp_sniff_led_ms 写 0。 */
+        if ((s_power.flag_rtc != 0u) && (s_power.lp_sniff_led_ms != 0u))
+        {
+            HAL_GPIO_WritePin(IND_NORM_GPIO_Port, IND_NORM_Pin,
+                              GPIO_PIN_SET);
+            HAL_Delay(s_power.lp_sniff_led_ms);
+            HAL_GPIO_WritePin(IND_NORM_GPIO_Port, IND_NORM_Pin,
+                              GPIO_PIN_RESET);
+        }
 
         /* EXTI pending/flag 优先；同时读引脚电平：若 PB5 一直被按到
          * WUT tick，即使 ISR 尚未执行也能唤醒。 */
@@ -1178,7 +1695,8 @@ void PowerMode_EnterLp(void)
                 /* WUT 保持自由运行（WUTE/WUTIE 不关），这里不再每个 tick
                  * 关掉再重布防：1 Hz CK_SPRE 下 WUTWF 同步可能超过 HAL 的
                  * 1 s 超时，且重布防窗口内到达的 tick 会让回调清 WUTIE，
-                 * 使下一条 STOP1 没有 RTC 唤醒源。 */
+                 * 使下一条 STOP1 没有 RTC 唤醒源。PB4 心跳已在上面
+                 * （任何 RTC tick、按键/PA8 检查之前）完成。 */
                 PowerMode_LpSniffOnce();
                 s_power.lp_stage = 15u;     /* 15=1 s sniff done */
 
@@ -1221,9 +1739,21 @@ void PowerMode_EnterLp(void)
             }
             else
             {
-                /* 无 RTC/按键标志：按现行约定归因为 BQ ALERT。 */
+                /* WFI 返回但没有任何 RTC/按键/PA8 标志：不要误归因为
+                 * BQ ALERT。完整唤醒并留下 stage35 现场，便于区分
+                 * stale EXTI/WUTF、调试器 halt 或其它 EXTI 事件。 */
+                s_power.wake_unknown_count++;
                 full_wake = 1u;
-                cause |= POWER_WAKE_BQ_ALERT;
+                if (s_power.lp_diag_unknown_logged == 0u)
+                {
+                    s_power.lp_diag_unknown_logged = 1u;
+                    (void)BlackBox_WriteLpDiag(
+                        App_GetUptimeSeconds(),
+                        (uint32_t)EXTI->PR1,
+                        (uint32_t)RTC->ISR & 0xFFFFu,
+                        s_power.wake_unknown_count,
+                        35u, PowerMode_LpWutPathFlags());
+                }
             }
         }
 
@@ -1238,6 +1768,7 @@ void PowerMode_EnterLp(void)
     s_power.flag_rtc = 0u;
     s_power.flag_button = 0u;
     EXTI->PR1 = (uint32_t)(EXTI_PR1_PIF5 | EXTI_PR1_PIF8);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
     if (s_power.lp_keep_swd == 0u)
     {
         DBGMCU->CR &= (uint32_t)~DBGMCU_CR_DBG_STOP;   /* 运行期关闭调试时恢复最低功耗 */
@@ -1259,6 +1790,7 @@ void PowerMode_EnterLp(void)
     if ((cause & POWER_WAKE_BUTTON) != 0u)
     {
         s_power.wake_button_count++;
+        PowerMode_LpBumpBkp(&RTC->BKP14R);
     }
     if ((cause & POWER_WAKE_BQ_ALERT) != 0u)
     {
@@ -1275,12 +1807,18 @@ void PowerMode_EnterLp(void)
 
     (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
     __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    EXTI->PR1 = EXTI_PR1_PIF20;   /* 关 WUT 后清 stale EXTI pending */
     HAL_NVIC_DisableIRQ(RTC_WKUP_IRQn);
     HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
     s_power.flag_rtc = 0u;
     s_power.flag_button = 0u;
 
-    /* 当前在 HSI16；恢复 HSE/PLL 80 MHz，失败则降级。 */
+    /* 当前在 HSI16；恢复 HSE/PLL 80 MHz，失败则降级。先把 5 V 和故障灯
+     * 打开：即使 HSE/PLL 恢复失败或卡住，也不能让用户看到“醒了但
+     * 5 V/灯全灭”。正常路径随后由 LedStatus 接管。 */
+    HAL_GPIO_WritePin(SUP_5V_EN_GPIO_Port, SUP_5V_EN_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(IND_ROHT_GPIO_Port, IND_ROHT_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(IND_NORM_GPIO_Port, IND_NORM_Pin, GPIO_PIN_RESET);
     SystemCoreClock = 16000000u;
     (void)HAL_InitTick(TICK_INT_PRIORITY);
     if (PowerMode_ClkSwitchToHsePll() == 0u)
@@ -1289,6 +1827,10 @@ void PowerMode_EnterLp(void)
         s_power.wake_clock_fail_count++;
         s_power.request_lp = 0u;
         s_power.state = POWER_STATE_DEGRADED;
+        s_power.lp_stage = 18u;    /* 18=唤醒后 HSE/PLL 恢复失败 */
+        PowerMode_LpMarkStage(18u, 0u);
+        /* 这里时钟可能处于 HSE/PLL 尝试失败后的不确定状态，不做 Flash
+         * 写入；stage18 备份寄存器 + 5 V + PB3 降级闪烁已足够定位。 */
         Fault_SetSticky(FAULT_BIT_CLK);
         return;
     }
@@ -1328,6 +1870,10 @@ void PowerMode_Loop(void)
     {
         return;
     }
+
+    /* 每个 NORM 主循环检查一次 LSE/LSE→RTC 时钟源；LSE 受扰恢复后
+     * 自动清 live/sticky LSE，让 auto-LP 的 APP_LP_BLOCK_LSE 解除。 */
+    PowerMode_LseHealthTask();
 
     if ((s_power.request_lp != 0u) && (s_power.state == POWER_STATE_NORM))
     {
@@ -1372,8 +1918,19 @@ void RTC_WKUP_IRQHandler(void)
 {
     /* 先写 BKP1R=0x0E 证明 RTC_WKUP 向量确实进入过（即使 HAL 因 WUTF
      * 已清而没调用 callback）；callback 再覆盖为 0x0F。stage60.ts1 低
-     * 16 位为 0 时，才能确定是事件没有到达 CPU/NVIC，而不是主循环问题。 */
+     * 16 位为 0 时，才能确定是事件没有到达 CPU/NVIC，而不是主循环问题。
+     * BKP2R 低 16 位累计向量进入次数，跨复位保留，用于区分“从未进入”
+     * 与“只进入过、callback 被跳过”。 */
     HAL_PWR_EnableBkUpAccess();
+    {
+        uint32_t isr_count = RTC->BKP2R & 0xFFFFu;
+
+        if (isr_count < 0xFFFFu)
+        {
+            isr_count++;
+        }
+        RTC->BKP2R = POWER_LP_BKP_ISR_MARKER | isr_count;
+    }
     RTC->BKP1R = 0xA5A5000Eu;
     HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
 }
@@ -1389,8 +1946,19 @@ void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc_ptr)
 
         /* BKP1R=0xA5A5000F：证明 RTC WUT ISR 确实进入过。若复位后
          * stage60 的 ts1 低 16 位为 0，而 BKP0R 停在 30，说明 WUT 事件
-         * 没有到达 CPU/NVIC，而不是主循环唤醒路径的问题。 */
+         * 没有到达 CPU/NVIC，而不是主循环唤醒路径的问题。
+         * BKP3R 低 16 位累计 callback 次数；BKP2R>0 而 BKP3R=0 表示
+         * 向量进了但 HAL 因 WUTF=0 跳过 callback。 */
         HAL_PWR_EnableBkUpAccess();
+        {
+            uint32_t cb_count = RTC->BKP3R & 0xFFFFu;
+
+            if (cb_count < 0xFFFFu)
+            {
+                cb_count++;
+            }
+            RTC->BKP3R = POWER_LP_BKP_ISR_MARKER | cb_count;
+        }
         RTC->BKP1R = 0xA5A5000Fu;
     }
 }
@@ -1404,6 +1972,19 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         s_power.flag_button_ms = HAL_GetTick();
         s_power.button_irq_count++;
         s_bb_shadow.diag_button_irq_count++;
+        PowerMode_LpBumpBkp(&RTC->BKP13R);
+        /* BKP16R：最后一次 PB5 ISR 发生时的状态/阶段，跨复位可读。
+         * high16=marker；bits16..23=state；bits8..15=lp_stage；
+         * bit0=ISR 时 PB5 是否为低。用来区分“按键时其实还在 NORM”与
+         * “已在 LP 但 EXTI/唤醒路径没走通”。 */
+        HAL_PWR_EnableBkUpAccess();
+        /* BKP16R 布局：bit31..24=0xA5 标志，bit23..16=state，
+         * bit15..8=lp_stage，bit0=ISR 时 PB5 电平低。 */
+        RTC->BKP16R = POWER_LP_BKP_CTX_MARKER |
+                      ((uint32_t)s_power.state << 16) |
+                      ((uint32_t)s_power.lp_stage << 8) |
+                      ((HAL_GPIO_ReadPin(WAKE_EXTI5_GPIO_Port,
+                                         WAKE_EXTI5_Pin) == GPIO_PIN_RESET) ? 1u : 0u);
         Button_NotifyExtiFromIsr();
     }
 }

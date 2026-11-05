@@ -77,14 +77,17 @@
 #define BQ_UV_CLEAR_GUARD_MV    100
 
 /* 受控 ADC 重启/恢复。 */
+#define BQ_ADC_CONVERSION_MS             250u  /* BQ ADC 帧周期，采样最小间隔 */
+#define BQ_ADC_RESAMPLE_MS               300u  /* OOR 后重采样间隔（250 + 余量） */
 #define BQ_ADC_RESTART_OFF_HOLD_MS       300u
-#define BQ_ADC_RESTART_MAX_ATTEMPTS      3u
-#define BQ_ADC_RESTART_EPISODE_COOLDOWN_MS 60000u
-#define BQ_FRAME_CONFIRM_COUNT           2u
-#define BQ_FRAME_CONFIRM_CELL_DELTA_MV   250u
+#define BQ_ADC_RESTART_MAX_ATTEMPTS      4u
+#define BQ_ADC_VERDICT_MS                1500u /* 每轮重启后等待有效发布的窗口 */
+#define BQ_ADC_GOOD_FRAMES_CLEAR         5u    /* 连续有效发布帧数 → 清故障/额度 */
+#define BQ_FRAME_CONFIRM_RAW_LSB         4u    /* 首次发布：每寄存器 ±4 raw LSB */
+#define BQ_STRICT_MAX_MISMATCHES         3u    /* 连续不严格一致后回退粗确认 */
+#define BQ_FRAME_CONFIRM_CELL_DELTA_MV   250u  /* 普通拒绝后的粗确认 */
 #define BQ_FRAME_CONFIRM_PACK_DELTA_MV   300u
-#define BQ_REJECT_STREAK_RESTART         4u
-#define BQ_REJECT_STREAK_FAULT           12u
+#define BQ_OOR_STREAK_RESTART            4u
 #define BQ_VC34_MAX_RAW                  128u
 
 /* ---------------- 事务描述 ---------------- */
@@ -220,10 +223,21 @@ static struct
 
     /* 首帧必须连续两帧一致才发布。 */
     uint8_t frame_confirm_count;
+    uint8_t strict_window;      /* 1=启动/LP/ADC 重启后的首次发布用 ±4 raw LSB */
+    uint8_t strict_mismatch_count;
     uint16_t pending_cell_mv[3];
     uint16_t pending_pack_mv;
+    uint16_t pending_raw_cell[3];
+    uint16_t pending_raw_pack;
     int16_t pending_pack_residual_mv;
     uint32_t frame_confirm_reset_count;
+
+    /* OOR 快速重采样。 */
+    uint16_t oor_streak;
+    uint16_t resample_count;
+    uint8_t resample_pending;
+    uint32_t resample_due_ms;
+    uint32_t last_sample_ms;
 
     /* 受控 ADC 重启/恢复。 */
     uint8_t pre_ctrl1;
@@ -244,9 +258,14 @@ static struct
     uint8_t adc_restart_reason;
     uint8_t adc_restart_attempts;
     uint8_t adc_recovery_failed;
+    uint8_t recovery_episode;
+    uint8_t verdict_arm_pending;
+    uint8_t verdict_active;
+    uint32_t verdict_deadline_ms;
+    uint16_t good_publish_streak;
+    uint8_t adc_event_flags;
     uint32_t adc_restart_count;
     uint32_t adc_restart_last_ms;
-    uint32_t adc_restart_block_until_ms;
 
     volatile uint8_t pending_sysstat_clear; /* 只清 OV/UV 的延迟位 */
     uint8_t sysstat_sync_active;
@@ -300,6 +319,7 @@ static uint8_t Bq_Crc8_ReadNext(uint8_t data)
 /* ---------------- 硬件层 ---------------- */
 static void Bq_RecoverBus(void);
 static void Bq_RequestAdcRestart(uint8_t reason);
+static void Bq_LatchAdcFault(void);
 static void Bq_ConfigFailed(void);
 static int Bq_PreConfigSnapshot(void);
 static int Bq_ForceAdcOff(void);
@@ -727,35 +747,45 @@ static uint8_t Bq_ValidateFrame(const uint16_t cells[3], uint16_t pack,
     return Bq_ValidateFrameValues(cells, pack, residual_mv, reason);
 }
 
+static void Bq_LatchAdcFault(void)
+{
+    if (s_bq.adc_recovery_failed == 0u)
+    {
+        s_bq.adc_event_flags |= BQ_ADC_EVENT_FAULT;
+    }
+    s_bq.adc_restart_pending = 0u;
+    s_bq.verdict_arm_pending = 0u;
+    s_bq.verdict_active = 0u;
+    s_bq.resample_pending = 0u;
+    s_bq.adc_recovery_failed = 1u;
+    Fault_SetLive(FAULT_BIT_BQ_ADC_STUCK);
+}
+
 static void Bq_RequestAdcRestart(uint8_t reason)
 {
-    if (s_bq.adc_restart_pending != 0u)
+    if ((s_bq.adc_recovery_failed != 0u) ||
+        (s_bq.adc_restart_pending != 0u))
     {
         return;
-    }
-    if (s_bq.adc_restart_block_until_ms != 0u)
-    {
-        if ((int32_t)(s_bq.now_ms - s_bq.adc_restart_block_until_ms) < 0)
-        {
-            return;
-        }
-        /* 冷却结束：开启新的有界恢复回合。 */
-        s_bq.adc_restart_block_until_ms = 0u;
-        s_bq.adc_restart_attempts = 0u;
-        s_bq.adc_recovery_failed = 0u;
     }
 
     if (s_bq.adc_restart_attempts >= BQ_ADC_RESTART_MAX_ATTEMPTS)
     {
-        s_bq.adc_recovery_failed = 1u;
-        s_bq.adc_restart_block_until_ms =
-            s_bq.now_ms + BQ_ADC_RESTART_EPISODE_COOLDOWN_MS;
-        Fault_SetLive(FAULT_BIT_BQ_ADC_STUCK);
+        Bq_LatchAdcFault();
         return;
     }
 
     s_bq.adc_restart_pending = 1u;
     s_bq.adc_restart_reason = reason;
+    s_bq.verdict_active = 0u;   /* 当前轮提前结束，交给下一次重启 */
+}
+
+static uint8_t Bq_IsOorReason(uint8_t reason)
+{
+    return ((reason == (uint8_t)BQ_FRAME_REJECT_CELL_RANGE) ||
+            (reason == (uint8_t)BQ_FRAME_REJECT_PACK_RANGE) ||
+            (reason == (uint8_t)BQ_FRAME_REJECT_PACK_SUM) ||
+            (reason == (uint8_t)BQ_FRAME_REJECT_VC34_SANITY)) ? 1u : 0u;
 }
 
 static void Bq_RecordReject(const uint16_t cells[3], uint16_t pack,
@@ -775,6 +805,7 @@ static void Bq_RecordReject(const uint16_t cells[3], uint16_t pack,
     s_bq.last_reject_ms = s_bq.now_ms;
     s_bq.frame_confirm_count = 0u;
     s_bq.fresh = 0u;
+    s_bq.good_publish_streak = 0u;
 
     if (s_bq.reject_streak < 0xFFFFu)
     {
@@ -806,15 +837,23 @@ static void Bq_RecordReject(const uint16_t cells[3], uint16_t pack,
         s_bq.reject_vc34_count++;
     }
 
-    if (reason != (uint8_t)BQ_FRAME_REJECT_UNSETTLED)
+    /* 只有“明显超限/不自洽”的帧计入 OOR；UNSETTLED/NOT_CONFIGURED 不算。
+     * 连续 4 帧 OOR 才触发一次受控 ADC 重启。 */
+    if (Bq_IsOorReason(reason) != 0u)
     {
-        if (s_bq.reject_streak >= BQ_REJECT_STREAK_FAULT)
+        if (s_bq.oor_streak < 0xFFFFu)
         {
-            Fault_SetLive(FAULT_BIT_BQ_ADC_STUCK);
+            s_bq.oor_streak++;
         }
-        else if (s_bq.reject_streak >= BQ_REJECT_STREAK_RESTART)
+
+        if (s_bq.adc_recovery_failed == 0u)
         {
-            Bq_RequestAdcRestart((uint8_t)BQ_RESTART_REASON_REJECT_STREAK);
+            s_bq.resample_pending = 1u;
+            s_bq.resample_due_ms = s_bq.now_ms + BQ_ADC_RESAMPLE_MS;
+            if (s_bq.oor_streak >= BQ_OOR_STREAK_RESTART)
+            {
+                Bq_RequestAdcRestart((uint8_t)BQ_RESTART_REASON_REJECT_STREAK);
+            }
         }
     }
 }
@@ -825,6 +864,7 @@ static void Bq_PublishFrame(const uint16_t cells[3], uint16_t pack,
     uint8_t false_ov = 0u;
     uint8_t false_uv = 0u;
     uint8_t pending = 0u;
+    uint8_t allow_false_clear = 0u;
 
     s_bq.cell_mv[0] = cells[0];
     s_bq.cell_mv[1] = cells[1];
@@ -848,34 +888,64 @@ static void Bq_PublishFrame(const uint16_t cells[3], uint16_t pack,
     s_bq.frame_valid = 1u;
     s_bq.reject_reason = (uint8_t)BQ_FRAME_OK;
     s_bq.frame_confirm_count = 2u;
+    s_bq.strict_window = 0u;
+    s_bq.strict_mismatch_count = 0u;
+    s_bq.verdict_arm_pending = 0u;
+    s_bq.verdict_active = 0u;       /* 本轮 ADC 重启已有结果 */
+    s_bq.adc_restart_pending = 0u;
+    s_bq.resample_pending = 0u;
+    s_bq.oor_streak = 0u;
     s_bq.reject_streak = 0u;
     s_bq.reject_since_publish = 0u;
-    s_bq.adc_restart_pending = 0u;
-    s_bq.adc_restart_attempts = 0u;
-    s_bq.adc_recovery_failed = 0u;
-    s_bq.adc_restart_block_until_ms = 0u;
-    Fault_ClearLive(FAULT_BIT_BQ_ADC_STUCK);
     s_bq.fresh = 1u;
 
-    /* ADC 建立期可能已经锁存假 OV/UV。只有稳定帧中三相电压
-     * 明显落在实际 OV/UV 阈值内时才清对应锁存；真实故障保留。 */
-    if (((s_bq.sys_stat & BQ_SYS_STAT_OV) != 0u) &&
-        (s_bq.max_cell_mv <= (s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV ?
-                              (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u)))
+    if (s_bq.good_publish_streak < 0xFFFFu)
     {
-        false_ov = 1u;
-        pending |= BQ_SYS_STAT_OV;
+        s_bq.good_publish_streak++;
     }
-    if (((s_bq.sys_stat & BQ_SYS_STAT_UV) != 0u) &&
-        ((uint32_t)s_bq.min_cell_mv >=
-         ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV)))
+
+    /* 连续 5 帧有效才清故障/额度，避免单帧偶发恢复造成反复。 */
+    if (s_bq.good_publish_streak >= BQ_ADC_GOOD_FRAMES_CLEAR)
     {
-        false_uv = 1u;
-        pending |= BQ_SYS_STAT_UV;
+        uint8_t had_fault = s_bq.adc_recovery_failed;
+
+        s_bq.good_publish_streak = 0u;
+        s_bq.adc_restart_attempts = 0u;
+        s_bq.recovery_episode = 0u;
+        s_bq.verdict_arm_pending = 0u;
+        s_bq.verdict_active = 0u;
+        s_bq.adc_recovery_failed = 0u;
+        s_bq.adc_restart_pending = 0u;
+        Fault_ClearLive(FAULT_BIT_BQ_ADC_STUCK);
+        if (had_fault != 0u)
+        {
+            s_bq.adc_event_flags |= BQ_ADC_EVENT_RECOVERED;
+        }
+        allow_false_clear = 1u;
     }
-    if (pending != 0u)
+
+    /* ADC 建立期可能已经锁存假 OV/UV。连续 5 帧有效后，只有三相电压
+     * 明显落在实际 OV/UV 阈值内才清对应锁存；真实故障保留。 */
+    if (allow_false_clear != 0u)
     {
-        s_bq.pending_sysstat_clear |= pending;
+        if (((s_bq.sys_stat & BQ_SYS_STAT_OV) != 0u) &&
+            (s_bq.max_cell_mv <= (s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV ?
+                                  (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u)))
+        {
+            false_ov = 1u;
+            pending |= BQ_SYS_STAT_OV;
+        }
+        if (((s_bq.sys_stat & BQ_SYS_STAT_UV) != 0u) &&
+            ((uint32_t)s_bq.min_cell_mv >=
+             ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV)))
+        {
+            false_uv = 1u;
+            pending |= BQ_SYS_STAT_UV;
+        }
+        if (pending != 0u)
+        {
+            s_bq.pending_sysstat_clear |= pending;
+        }
     }
     Bq_UpdateVoltageFaults(s_bq.sys_stat, false_ov, false_uv);
 }
@@ -912,39 +982,77 @@ static void Bq_FrameCommit(void)
 
     s_bq.frame_ok_count++;
     s_bq.reject_streak = 0u;
+    s_bq.oor_streak = 0u;
+    s_bq.resample_pending = 0u;
+
     if (s_bq.frame_confirm_count == 0u)
     {
         for (i = 0u; i < 3u; i++)
         {
             s_bq.pending_cell_mv[i] = cells[i];
+            s_bq.pending_raw_cell[i] = s_bq.raw_cell[i];
         }
         s_bq.pending_pack_mv = pack;
+        s_bq.pending_raw_pack = s_bq.raw_pack;
         s_bq.pending_pack_residual_mv = (int16_t)residual;
         s_bq.frame_confirm_count = 1u;
         s_bq.frame_valid = 0u;
         s_bq.fresh = 0u;
+        if ((s_bq.strict_window != 0u) || (s_bq.recovery_episode != 0u))
+        {
+            /* 首次/恢复确认不等 500 ms 调度：300 ms 后再取一帧。 */
+            s_bq.resample_pending = 1u;
+            s_bq.resample_due_ms = s_bq.now_ms + BQ_ADC_RESAMPLE_MS;
+        }
         return;
     }
 
     if (s_bq.frame_confirm_count == 1u)
     {
-        for (i = 0u; i < 3u; i++)
+        if (s_bq.strict_window != 0u)
         {
-            uint16_t diff = (cells[i] >= s_bq.pending_cell_mv[i]) ?
-                            (uint16_t)(cells[i] - s_bq.pending_cell_mv[i]) :
-                            (uint16_t)(s_bq.pending_cell_mv[i] - cells[i]);
-            if (diff > BQ_FRAME_CONFIRM_CELL_DELTA_MV)
+            /* 启动/LP/ADC 重启后的首次发布：每个寄存器原始码 ±4 LSB。 */
+            for (i = 0u; i < 3u; i++)
             {
-                delta_ok = 0u;
+                uint16_t diff = (s_bq.raw_cell[i] >= s_bq.pending_raw_cell[i]) ?
+                                (uint16_t)(s_bq.raw_cell[i] - s_bq.pending_raw_cell[i]) :
+                                (uint16_t)(s_bq.pending_raw_cell[i] - s_bq.raw_cell[i]);
+                if (diff > BQ_FRAME_CONFIRM_RAW_LSB)
+                {
+                    delta_ok = 0u;
+                }
+            }
+            {
+                uint16_t diff = (s_bq.raw_pack >= s_bq.pending_raw_pack) ?
+                                (uint16_t)(s_bq.raw_pack - s_bq.pending_raw_pack) :
+                                (uint16_t)(s_bq.pending_raw_pack - s_bq.raw_pack);
+                if (diff > BQ_FRAME_CONFIRM_RAW_LSB)
+                {
+                    delta_ok = 0u;
+                }
             }
         }
+        else
         {
-            uint16_t diff = (pack >= s_bq.pending_pack_mv) ?
-                            (uint16_t)(pack - s_bq.pending_pack_mv) :
-                            (uint16_t)(s_bq.pending_pack_mv - pack);
-            if (diff > BQ_FRAME_CONFIRM_PACK_DELTA_MV)
+            /* 普通运行期偶发拒绝后的粗确认：保留 mV 容差，避免负载跳变饿死。 */
+            for (i = 0u; i < 3u; i++)
             {
-                delta_ok = 0u;
+                uint16_t diff = (cells[i] >= s_bq.pending_cell_mv[i]) ?
+                                (uint16_t)(cells[i] - s_bq.pending_cell_mv[i]) :
+                                (uint16_t)(s_bq.pending_cell_mv[i] - cells[i]);
+                if (diff > BQ_FRAME_CONFIRM_CELL_DELTA_MV)
+                {
+                    delta_ok = 0u;
+                }
+            }
+            {
+                uint16_t diff = (pack >= s_bq.pending_pack_mv) ?
+                                (uint16_t)(pack - s_bq.pending_pack_mv) :
+                                (uint16_t)(s_bq.pending_pack_mv - pack);
+                if (diff > BQ_FRAME_CONFIRM_PACK_DELTA_MV)
+                {
+                    delta_ok = 0u;
+                }
             }
         }
 
@@ -953,13 +1061,34 @@ static void Bq_FrameCommit(void)
             for (i = 0u; i < 3u; i++)
             {
                 s_bq.pending_cell_mv[i] = cells[i];
+                s_bq.pending_raw_cell[i] = s_bq.raw_cell[i];
             }
             s_bq.pending_pack_mv = pack;
+            s_bq.pending_raw_pack = s_bq.raw_pack;
             s_bq.pending_pack_residual_mv = (int16_t)residual;
             s_bq.frame_confirm_count = 1u;
             s_bq.frame_confirm_reset_count++;
             s_bq.frame_valid = 0u;
             s_bq.fresh = 0u;
+            if (s_bq.strict_window != 0u)
+            {
+                if (s_bq.strict_mismatch_count < 0xFFu)
+                {
+                    s_bq.strict_mismatch_count++;
+                }
+                if (s_bq.strict_mismatch_count >= BQ_STRICT_MAX_MISMATCHES)
+                {
+                    /* 可能是真实电压回弹/负载变化而非 ADC 异常：
+                     * 回退到 250/300 mV 粗确认，避免误判 ADC 故障。 */
+                    s_bq.strict_window = 0u;
+                }
+            }
+            if ((s_bq.strict_window != 0u) || (s_bq.recovery_episode != 0u))
+            {
+                /* 启动/恢复窗口内不等待 500 ms 调度：300 ms 后再取一帧。 */
+                s_bq.resample_pending = 1u;
+                s_bq.resample_due_ms = s_bq.now_ms + BQ_ADC_RESAMPLE_MS;
+            }
             return;
         }
         s_bq.frame_confirm_count = 2u;
@@ -1267,6 +1396,12 @@ static void Bq_ScriptComplete(void)
             s_bq.voltage_settled = 0u;
             s_bq.frame_valid = 0u;
             s_bq.frame_confirm_count = 0u;
+            s_bq.strict_window = 1u;   /* 重启后首次发布严格 ±4 raw LSB */
+            s_bq.strict_mismatch_count = 0u;
+            s_bq.oor_streak = 0u;
+            s_bq.resample_pending = 0u;
+            s_bq.verdict_active = 0u;
+            s_bq.good_publish_streak = 0u;
             s_bq.reject_streak = 0u;
             s_bq.reject_since_publish = 0u;
             s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
@@ -1396,9 +1531,19 @@ static void Bq_StartConfig(void)
     s_bq.voltage_settled = 0u;
     s_bq.frame_valid = 0u;
     s_bq.frame_confirm_count = 0u;
+    s_bq.strict_window = 0u;
+    s_bq.strict_mismatch_count = 0u;
     s_bq.reject_reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
     s_bq.fresh = 0u;
     s_bq.req_read = 0u;
+    s_bq.oor_streak = 0u;
+    s_bq.resample_pending = 0u;
+    s_bq.verdict_active = 0u;
+    /* 运行期 ADC 恢复回合中的每次 CONFIG（含总线恢复重试）都重新 arm verdict。 */
+    s_bq.verdict_arm_pending =
+        ((s_bq.recovery_episode != 0u) &&
+         (s_bq.adc_recovery_failed == 0u)) ? 1u : 0u;
+    s_bq.good_publish_streak = 0u;
     s_bq.pending_sysstat_clear = 0u;
     s_bq.sysstat_sync_active = 0u;
     s_bq.xready_at_settle = 0u;
@@ -1428,6 +1573,7 @@ static void Bq_StartRunScript(void)
     s_bq.script_len = (uint8_t)(sizeof(s_bq_run_script) / sizeof(s_bq_run_script[0]));
     s_bq.job_index = 0u;
     s_bq.state_enter_ms = HAL_GetTick();
+    s_bq.last_sample_ms = HAL_GetTick();
     Bq_StartNextJob();
 }
 
@@ -1584,12 +1730,23 @@ void BQ_Init(void)
     s_bq.last_reject_reason = 0u;
     s_bq.last_reject_sys_stat = 0u;
     s_bq.frame_confirm_count = 0u;
+    s_bq.strict_window = 0u;
+    s_bq.strict_mismatch_count = 0u;
     s_bq.pending_cell_mv[0] = 0u;
     s_bq.pending_cell_mv[1] = 0u;
     s_bq.pending_cell_mv[2] = 0u;
     s_bq.pending_pack_mv = 0u;
+    s_bq.pending_raw_cell[0] = 0u;
+    s_bq.pending_raw_cell[1] = 0u;
+    s_bq.pending_raw_cell[2] = 0u;
+    s_bq.pending_raw_pack = 0u;
     s_bq.pending_pack_residual_mv = 0;
     s_bq.frame_confirm_reset_count = 0u;
+    s_bq.oor_streak = 0u;
+    s_bq.resample_count = 0u;
+    s_bq.resample_pending = 0u;
+    s_bq.resample_due_ms = 0u;
+    s_bq.last_sample_ms = 0u;
     s_bq.pre_ctrl1 = 0u;
     s_bq.pre_ctrl2 = 0u;
     s_bq.pre_sys_stat = 0u;
@@ -1608,9 +1765,14 @@ void BQ_Init(void)
     s_bq.adc_restart_reason = 0u;
     s_bq.adc_restart_attempts = 0u;
     s_bq.adc_recovery_failed = 0u;
+    s_bq.recovery_episode = 0u;
+    s_bq.verdict_arm_pending = 0u;
+    s_bq.verdict_active = 0u;
+    s_bq.verdict_deadline_ms = 0u;
+    s_bq.good_publish_streak = 0u;
+    s_bq.adc_event_flags = 0u;
     s_bq.adc_restart_count = 0u;
     s_bq.adc_restart_last_ms = 0u;
-    s_bq.adc_restart_block_until_ms = 0u;
     s_bq.pending_sysstat_clear = 0u;
     s_bq.sysstat_sync_active = 0u;
     s_bq.sysstat_job.op = 0u;
@@ -1657,7 +1819,15 @@ void BQ_ReInitAfterLp(void)
     s_bq.adc_restart_pending = 0u;
     s_bq.adc_restart_attempts = 0u;
     s_bq.adc_recovery_failed = 0u;
-    s_bq.adc_restart_block_until_ms = 0u;
+    s_bq.recovery_episode = 0u;
+    s_bq.verdict_arm_pending = 0u;
+    s_bq.verdict_active = 0u;
+    s_bq.resample_pending = 0u;
+    s_bq.oor_streak = 0u;
+    s_bq.good_publish_streak = 0u;
+    s_bq.strict_window = 0u;
+    s_bq.strict_mismatch_count = 0u;
+    s_bq.adc_event_flags = 0u;
 
     Bq_HwInit();
     Bq_StartConfig();
@@ -1684,10 +1854,13 @@ int BQ_PrepareForLpMask(uint8_t fet_mask)
     uint8_t rb1 = 0u;
     uint8_t rb2 = 0u;
 
-    /* ADC 重启/配置/settle 期间不允许进入 LP：否则会中断重启序列，
-     * 留下未验证的 SYS_CTRL 状态。 */
+    /* ADC 重启/配置/settle/verdict/故障锁存期间不允许进入 LP：否则会中断
+     * 恢复序列或隐藏已上报的 ADC 故障。 */
     if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN) ||
-        (s_bq.adc_restart_pending != 0u))
+        (s_bq.adc_restart_pending != 0u) ||
+        (s_bq.verdict_active != 0u) ||
+        (s_bq.recovery_episode != 0u) ||
+        (s_bq.adc_recovery_failed != 0u))
     {
         return -2;
     }
@@ -1829,6 +2002,13 @@ void BQ_Poll(void)
                 s_bq.state = BQ_ST_RUN;
                 s_bq.state_enter_ms = s_bq.now_ms;
                 s_bq.req_read = 1u;
+                if (s_bq.verdict_arm_pending != 0u)
+                {
+                    /* 本轮重启开始判定期；必须有成功发布才算“有果”。 */
+                    s_bq.verdict_arm_pending = 0u;
+                    s_bq.verdict_active = 1u;
+                    s_bq.verdict_deadline_ms = s_bq.now_ms + BQ_ADC_VERDICT_MS;
+                }
             }
             else
             {
@@ -1840,27 +2020,61 @@ void BQ_Poll(void)
     case BQ_ST_RUN:
         if ((s_bq.script == NULL) && (s_bq.xfer_phase == 0u))
         {
-            if ((s_bq.adc_restart_pending != 0u) && (BQ_IsIdle() != 0u))
+            if (s_bq.adc_restart_pending != 0u)
             {
                 s_bq.adc_restart_pending = 0u;
-                if (s_bq.adc_restart_attempts < 0xFFu)
+                if (s_bq.adc_restart_attempts >= BQ_ADC_RESTART_MAX_ATTEMPTS)
                 {
-                    s_bq.adc_restart_attempts++;
+                    Bq_LatchAdcFault();
+                    break;
                 }
-                if (s_bq.adc_restart_count < 0xFFu)
-                {
-                    s_bq.adc_restart_count++;
-                }
+
+                s_bq.adc_restart_attempts++;
+                s_bq.adc_restart_count++;
                 s_bq.adc_restart_last_ms = s_bq.now_ms;
+                s_bq.recovery_episode = 1u;
+                s_bq.verdict_active = 0u;
                 s_bq.voltage_settled = 0u;
                 s_bq.frame_valid = 0u;
                 s_bq.fresh = 0u;
                 s_bq.frame_confirm_count = 0u;
                 s_bq.reject_since_publish = 0u;
+                s_bq.resample_pending = 0u;
+                s_bq.adc_event_flags |= BQ_ADC_EVENT_RESTART;
                 Bq_StartConfig();
                 break;
             }
-            if (s_bq.req_read != 0u)
+
+            if ((s_bq.verdict_active != 0u) &&
+                ((int32_t)(s_bq.now_ms - s_bq.verdict_deadline_ms) >= 0))
+            {
+                s_bq.verdict_active = 0u;
+                if (s_bq.adc_restart_attempts >= BQ_ADC_RESTART_MAX_ATTEMPTS)
+                {
+                    Bq_LatchAdcFault();
+                }
+                else
+                {
+                    Bq_RequestAdcRestart((uint8_t)BQ_RESTART_REASON_REJECT_STREAK);
+                }
+                break;
+            }
+
+            if ((s_bq.resample_pending != 0u) &&
+                ((int32_t)(s_bq.now_ms - s_bq.resample_due_ms) >= 0) &&
+                ((s_bq.now_ms - s_bq.last_sample_ms) >= BQ_ADC_CONVERSION_MS))
+            {
+                s_bq.resample_pending = 0u;
+                if (s_bq.resample_count < 0xFFFFu)
+                {
+                    s_bq.resample_count++;
+                }
+                Bq_StartRunScript();
+                break;
+            }
+
+            if ((s_bq.req_read != 0u) &&
+                ((s_bq.now_ms - s_bq.last_sample_ms) >= BQ_ADC_CONVERSION_MS))
             {
                 Bq_StartRunScript();
             }
@@ -1933,6 +2147,17 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
     out->xready_count = s_bq.xready_count;
     out->frame_confirm_count = s_bq.frame_confirm_count;
     out->frame_confirm_reset_count = s_bq.frame_confirm_reset_count;
+    out->oor_streak = s_bq.oor_streak;
+    out->resample_count = s_bq.resample_count;
+    out->strict_window = s_bq.strict_window;
+    out->recovery_episode = s_bq.recovery_episode;
+    out->verdict_active = s_bq.verdict_active;
+    out->verdict_deadline_ms = s_bq.verdict_deadline_ms;
+    out->good_publish_streak = s_bq.good_publish_streak;
+    out->pending_raw_cell[0] = s_bq.pending_raw_cell[0];
+    out->pending_raw_cell[1] = s_bq.pending_raw_cell[1];
+    out->pending_raw_cell[2] = s_bq.pending_raw_cell[2];
+    out->pending_raw_pack = s_bq.pending_raw_pack;
     out->adc_restart_count = s_bq.adc_restart_count;
     out->adc_restart_attempts = s_bq.adc_restart_attempts;
     out->adc_restart_reason = s_bq.adc_restart_reason;
@@ -1963,7 +2188,14 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
 
 uint8_t BQ_IsRecovering(void)
 {
+    /* 故障已锁存时不再是“恢复中”，让自检/上层能看到故障。 */
+    if (s_bq.adc_recovery_failed != 0u)
+    {
+        return 0u;
+    }
     return ((s_bq.adc_restart_pending != 0u) ||
+            (s_bq.recovery_episode != 0u) ||
+            (s_bq.verdict_active != 0u) ||
             (s_bq.state == BQ_ST_CONFIG) ||
             (s_bq.state == BQ_ST_SETTLE) ||
             (s_bq.state == BQ_ST_ADC_RESTART_OFF)) ? 1u : 0u;
@@ -1972,6 +2204,14 @@ uint8_t BQ_IsRecovering(void)
 uint8_t BQ_GetAdcRecoveryFailed(void)
 {
     return s_bq.adc_recovery_failed;
+}
+
+uint8_t BQ_TakeAdcEvent(void)
+{
+    uint8_t flags = s_bq.adc_event_flags;
+
+    s_bq.adc_event_flags = 0u;
+    return flags;
 }
 
 void BQ_RequestFetMask(uint8_t mask)
