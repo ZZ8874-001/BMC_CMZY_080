@@ -4,7 +4,8 @@
  * @brief   BQ7692003PWR 电池管理前端（I2C1 + 每字节 CRC + DMA）。
  *
  * 事务全部非阻塞：ISR 只置完成/错误标志，状态机在 BQ_Poll（主循环）推进。
- * 仅 LP 进入前的 BQ_PrepareForLpMask 使用有界阻塞调用（模式切换允许）。
+ * 复位式 LP 的 BQ_LpBootPrepare/BQ_LpMonitorRun 使用有界阻塞 I2C（轻量 boot
+ * 允许）；BQ_PrepareForLpMask 是旧的 NORM/LP 切换 API，保留兼容。
  ******************************************************************************
  */
 #ifndef APP_BQ_IC_H
@@ -169,7 +170,7 @@ uint8_t BQ_GetFetMaskRequested(void);
 uint8_t BQ_GetFetMaskApplied(void);
 int BQ_ApplyFetMaskNow(uint8_t mask);
 
-/* LP 进入时使用指定 FET mask（默认 0x00，两管全关）。
+/* 旧的非复位 LP 进入 API（保留兼容）：指定 FET mask（默认 0x00）。
  * 返回 0=成功，-1=通信/回读失败，-2=正在 ADC 重启/配置，暂不允许进入 LP。 */
 int BQ_PrepareForLpMask(uint8_t fet_mask);
 
@@ -178,21 +179,38 @@ int BQ_PrepareForLpMask(uint8_t fet_mask);
 int BQ_ReadRegSafe(uint8_t reg, uint8_t *out);
 int BQ_ReadBlockSafe(uint8_t reg, uint8_t *out, uint8_t count);
 
-/* LP 1 s 嗅探专用：HSI16 下重新初始化 I2C（无 DMA），阻塞读单个寄存器。
+/* LP 轻量 boot 嗅探专用：HSI16 下重新初始化 I2C（无 DMA），阻塞读单个寄存器。
  * 进入前必须已经 BQ_DeInitForLp()；嗅探结束调用 BQ_LpSniffDeInit()。 */
 int BQ_LpSniffInit(void);
 void BQ_LpSniffDeInit(void);
 int BQ_LpSniffRead(uint8_t reg, uint8_t *out);
 
-/* LP 储存监测（30 min）：在 BQ_LpSniffInit() 之后调用。
- * Start 只临时打开 ADC/TEMP 与 CC，不改 FET；调用者等 300 ms 后 Read；
- * Stop 用 BQ_PrepareForLpMask() 恢复 LP 状态并清 CC_READY/XREADY。 */
+/* LP 储存监测（30 min）底层 API：在 BQ_LpSniffInit() 之后调用。当前 30 min
+ * 路径使用复位安全的 BQ_LpMonitorRun()；Start 临时打开 ADC/TEMP 与 CC，不改
+ * FET，Stop 恢复 LP 状态并清 CC_READY/XREADY。 */
 int BQ_LpMonitorStart(uint8_t fet_mask);
 int BQ_LpMonitorRead(bq_snapshot_t *out);
 int BQ_LpMonitorStop(uint8_t fet_mask);
 
 /* LP 嗅探期间清除 SYS_STAT 的指定位（只建议清 CC_READY/XREADY，保护位保留）。 */
 int BQ_LpSniffClearSysStat(uint8_t sys_stat_mask);
+
+/* 复位安全 LP 路径：不依赖 s_bq.state / BQ_IsIdle()，供 IWDG 复位后的轻量
+ * boot 使用。调用前先 BQ_LpSniffInit()，结束后 BQ_LpSniffDeInit()。 */
+typedef struct
+{
+    uint8_t sys_ctrl1;
+    uint8_t sys_ctrl2;
+    uint8_t sys_stat;
+    uint8_t load_present;
+    uint8_t chg_on;
+    uint8_t adc_on;
+    uint8_t cc_on;
+    uint8_t fet_mask;
+} bq_lp_status_t;
+
+int BQ_LpBootPrepare(bq_lp_status_t *out);
+int BQ_LpMonitorRun(bq_snapshot_t *out);
 
 #define BQ_SYS_STAT_XREADY      (1u << 5)
 #define BQ_SYS_STAT_CC_READY    (1u << 7)

@@ -16,7 +16,6 @@
 static struct
 {
     uint8_t latched;
-    uint32_t csr_raw;
 } s_reset_cause;
 
 static void ResetCause_EnableBackupAccess(void)
@@ -33,14 +32,14 @@ static void ResetCause_RecordAndReset(uint8_t cause)
 {
     ResetCause_EnableBackupAccess();
     RTC->BKP0R = RESET_CAUSE_BKP_MAGIC | (uint32_t)cause;
-    /* HardFault 现场：BKP9R..BKP12R 留给复位后的 Ozone 直接读取。
-     * 只在 cause=HARDFAULT 时有意义；正常复位不写这些寄存器。 */
+    /* HardFault 现场：BKP20R..BKP23R 留给复位后的 Ozone 直接读取。
+     * BKP1..BKP10 是 IWDG LP 会话，不能被 HardFault 覆盖。 */
     if (cause == RESET_CAUSE_HARDFAULT)
     {
-        RTC->BKP9R = SCB->CFSR;
-        RTC->BKP10R = SCB->HFSR;
-        RTC->BKP11R = SCB->MMFAR;
-        RTC->BKP12R = SCB->BFAR;
+        RTC->BKP20R = SCB->CFSR;
+        RTC->BKP21R = SCB->HFSR;
+        RTC->BKP22R = SCB->MMFAR;
+        RTC->BKP23R = SCB->BFAR;
     }
     __DSB();
     NVIC_SystemReset();
@@ -52,9 +51,9 @@ static void ResetCause_RecordAndReset(uint8_t cause)
 void ResetCause_Init(void)
 {
     uint32_t backup;
+    uint32_t csr_raw = RCC->CSR;
 
     s_reset_cause.latched = 0u;
-    s_reset_cause.csr_raw = RCC->CSR;
 
     ResetCause_EnableBackupAccess();
     backup = RTC->BKP0R;
@@ -64,20 +63,20 @@ void ResetCause_Init(void)
         RTC->BKP0R = 0u;   /* 消费一次，避免正常复位重复上报 */
     }
 
-    if ((s_reset_cause.csr_raw & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) != 0u)
+    if ((csr_raw & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) != 0u)
     {
         s_reset_cause.latched |= RESET_CAUSE_WATCHDOG;
     }
-    if ((s_reset_cause.csr_raw & RCC_CSR_SFTRSTF) != 0u)
+    if ((csr_raw & RCC_CSR_SFTRSTF) != 0u)
     {
         s_reset_cause.latched |= RESET_CAUSE_SOFTWARE;
     }
-    if ((s_reset_cause.csr_raw & RCC_CSR_PINRSTF) != 0u)
+    if ((csr_raw & RCC_CSR_PINRSTF) != 0u)
     {
         s_reset_cause.latched |= RESET_CAUSE_PIN;
     }
-    if ((s_reset_cause.csr_raw & (RCC_CSR_BORRSTF | RCC_CSR_LPWRRSTF |
-                                  RCC_CSR_OBLRSTF)) != 0u)
+    if ((csr_raw & (RCC_CSR_BORRSTF | RCC_CSR_LPWRRSTF |
+                    RCC_CSR_OBLRSTF)) != 0u)
     {
         s_reset_cause.latched |= RESET_CAUSE_BOR;
     }
@@ -93,4 +92,11 @@ uint8_t ResetCause_GetLatched(void)
 void ResetCause_RecordHardFaultAndReset(void)
 {
     ResetCause_RecordAndReset(RESET_CAUSE_HARDFAULT);
+}
+
+void ResetCause_RecordNmiAndReset(void)
+{
+    /* NMI has no fault-status registers of its own; BKP0 records the cause
+     * so a STOP1 hang cannot be mistaken for a dead watchdog/timebase. */
+    ResetCause_RecordAndReset(RESET_CAUSE_NMI);
 }

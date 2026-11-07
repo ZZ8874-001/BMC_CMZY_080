@@ -24,6 +24,8 @@ extern TIM_HandleTypeDef  htim1;   /* 蜂鸣器 PWM（CH1N/PA7） */
 extern TIM_HandleTypeDef  htim2;   /* 250 Hz 应用时基 */
 extern UART_HandleTypeDef huart1;  /* 调试日志（PB6/PB7） */
 extern UART_HandleTypeDef huart2;  /* WS2812 RGB（PA2） */
+extern CAN_HandleTypeDef  hcan1;
+extern DAC_HandleTypeDef  hdac1;
 
 extern DMA_HandleTypeDef hdma_i2c1_tx;   /* DMA1_Ch6，I2C1_TX（CubeMX 生成） */
 extern DMA_HandleTypeDef hdma_i2c1_rx;   /* DMA1_Ch7，I2C1_RX（CubeMX 生成） */
@@ -36,6 +38,32 @@ extern DMA_HandleTypeDef hdma_log_usart1_tx;/* DMA1_Ch4，USART1_TX */
 #define APP_TICK_MS             4U
 #define APP_BQ_READ_PERIOD_MS   500U        /* BQ 电芯数据 250 ms 更新，500 ms 读一次 */
 #define APP_BQ_STALE_MS         2000U       /* 超过该时长无新数据 → FAULT_BQ_STALE */
+
+/* ==================== LP RTC 时基 / SMBA 备用路径 ==================== */
+/* RTC/LP 时基源。0 = LSI（当前默认；硬件 LSE 未起振），1 = LSE（修好后
+ * 手动切换）。LSI 仅作相对时间参考：RTC 与 IWDG 同源，30 min 绝对时间
+ * 会漂，IWDG 校准也只能保证相对一致。 */
+#ifndef LP_RTC_USE_LSE
+#define LP_RTC_USE_LSE          0
+#endif
+
+#if (LP_RTC_USE_LSE != 0)
+#define LP_RTC_EXPECT_RTCSEL    RCC_BDCR_RTCSEL_0   /* LSE */
+#define LP_RTC_EXPECT_RDY_FLAG  RCC_FLAG_LSERDY
+#else
+#define LP_RTC_EXPECT_RTCSEL    RCC_BDCR_RTCSEL_1   /* LSI */
+#define LP_RTC_EXPECT_RDY_FLAG  RCC_FLAG_LSIRDY
+#endif
+
+/* LSE 模式启动 LSE 时的驱动能力；按实际晶体调整。 */
+#define LP_LSE_DRIVE_CAPABILITY RCC_LSEDRIVE_MEDIUMHIGH
+
+/* SMBA 备用唤醒：0 = 生产只用 EXTI5；1 = 第一个 LP 周期做一次 SMBA
+ * host-alert 实测（EXTI5 始终回退），记录后自动恢复 EXTI5。仅台架使用。 */
+#ifndef LP_SMBA_WAKE_TEST
+#define LP_SMBA_WAKE_TEST       0
+#endif
+
 #define BQ_ADC_SETTLE_MS        300U        /* ADC_EN/SHIP 后 250 ms 建立 + 50 ms 余量 */
 #define APP_BB_PERIOD_MS        1800000UL   /* 黑匣子 30 min 一条 */
 
@@ -51,7 +79,7 @@ extern DMA_HandleTypeDef hdma_log_usart1_tx;/* DMA1_Ch4，USART1_TX */
  * BQ 要求 ≤100 kHz 且 tHIGH ≥ 4.0 µs，IOC 生成的 103.6 kHz/3.93 µs 不合格。 */
 #define BQ_I2C_TIMINGR_95K      0x1424A4FFUL
 /* HSI16 16 MHz PCLK1 下约 100 kHz（PRESC=1 → 8 MHz；SCLH=32/SCLL=47）。
- * 仅用于 LP 1 s 嗅探；M0 需用示波器确认 tHIGH/tLOW。 */
+ * 仅用于 LP 轻量 boot 的 BQ sniff；M0 需用示波器确认 tHIGH/tLOW。 */
 #define BQ_I2C_TIMINGR_HSI16_100K 0x1024202FUL
 #define BQ_I2C_TIMEOUT_MS       100U
 
@@ -126,6 +154,7 @@ extern uint32_t _image_end;    /* 链接脚本定义：FLASH 镜像真实末尾 
 #define FAULT_BIT_BQ_STALE      (1u << 12)
 #define FAULT_BIT_FLASH_STATE   (1u << 13)  /* StateStore/NVM 持久化故障 */
 #define FAULT_BIT_BQ_ADC_STUCK  (1u << 14)  /* ADC 重启/回读后仍无有效电压帧 */
+#define FAULT_BIT_TIMEBASE      (1u << 15)  /* RTC LP 时基不可用（LP 阻止） */
 
 #ifdef __cplusplus
 }

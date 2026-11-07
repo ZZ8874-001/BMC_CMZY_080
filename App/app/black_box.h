@@ -3,7 +3,7 @@
  * @file    black_box.h
  * @brief   黑匣子 Flash 环形日志（页 52–63，1020 条 × 24 B）。
  *
- * 记录由主循环写入：30 min 一条周期记录 + LP 进入/唤醒转换记录。
+ * 记录由主循环/轻量 LP 写入：30 min 一条周期记录 + 真实唤醒记录。
  * 上电扫描取 seq 最大者为头，写入点紧随其后；跨页首槽前先擦除整页。
  * 记录格式见 black_box.c 顶部注释。
  ******************************************************************************
@@ -17,7 +17,7 @@
 
 /* 记录种类（写入 flags 低 3 位）。 */
 #define BB_KIND_PERIODIC    0u
-#define BB_KIND_LP_ENTER    1u
+#define BB_KIND_LP_ENTER    1u   /* legacy decoder only; reset-based LP does not write it */
 #define BB_KIND_WAKE        2u   /* 兼容旧记录：wake 字段 0..3 */
 #define BB_KIND_WAKE_MASK   3u   /* 新记录：wake 字段直接存 POWER_WAKE_* 位图 */
 #define BB_KIND_EVENT       4u   /* 事件：flags[15:6] 为 event_code */
@@ -27,7 +27,6 @@
 #define BB_EVENT_WAKE_MONITOR   0x11u
 #define BB_EVENT_CAL_BEGIN      0x12u
 #define BB_EVENT_CAL_END        0x13u
-#define BB_EVENT_LP_DIAG        0x14u
 #define BB_EVENT_BQ_ADC_RESTART 0x15u
 #define BB_EVENT_BQ_ADC_FAULT   0x16u
 #define BB_EVENT_BQ_ADC_RECOVERED 0x17u
@@ -38,7 +37,7 @@
 #define BB_WAKE_BUTTON      2u
 #define BB_WAKE_BQ_ALERT    3u
 
-#define BB_SHADOW_COUNT         12u  /* 覆盖一次 LP 进入的全部 stage 诊断 */
+#define BB_SHADOW_COUNT         12u  /* 最近 12 条记录的 RAM 影子 */
 
 typedef struct
 {
@@ -55,23 +54,11 @@ typedef struct
     uint8_t  valid;
 } black_box_record_t;
 
-/* RAM 影子 + LP 诊断字段。诊断字段只写 RAM，不擦写 Flash；Ozone 可直接
- * 展开 s_bb_shadow.diag_*，用于 LP 中无法连接调试器时观察唤醒路径。 */
+/* RAM 影子：最近 12 条记录，只写 RAM，不擦写 Flash；Ozone 可直接展开。 */
 typedef struct
 {
     uint8_t count;
     black_box_record_t rec[BB_SHADOW_COUNT];  /* [0] 最新 */
-    volatile uint32_t diag_lp_enter_count;
-    volatile uint32_t diag_wut_count;
-    volatile uint32_t diag_lp_loop_count;
-    volatile uint32_t diag_button_irq_count;
-    volatile uint32_t diag_wake_count;
-    volatile uint8_t  diag_last_stage;
-    volatile uint8_t  diag_flag_button;
-    volatile uint8_t  diag_pb5_level;
-    volatile uint8_t  diag_exti_imr;
-    volatile uint8_t  diag_exti_pending;
-    volatile uint8_t  diag_last_wake_cause;
 } bb_shadow_t;
 
 extern bb_shadow_t s_bb_shadow;
@@ -102,12 +89,6 @@ int BlackBox_WriteTransition(uint8_t transition_kind, uint8_t wake_cause,
                              uint32_t uptime_s);
 int BlackBox_WriteWake(uint8_t power_wake_mask, uint32_t uptime_s);
 int BlackBox_WriteEvent(uint16_t event_code, uint32_t uptime_s);
-
-/* LP 按键诊断（只写一条/次 LP 按键尝试）：把计数器装进 24 B 记录，
- * 便于掉电/复位后从黑匣子影子或 Flash 头查看。字段映射见 black_box.c。 */
-int BlackBox_WriteLpDiag(uint32_t uptime_s, uint32_t wut_count,
-                         uint32_t button_irq_count, uint32_t loop_count,
-                         uint8_t stage, uint8_t flags);
 
 uint8_t BlackBox_HasError(void);
 

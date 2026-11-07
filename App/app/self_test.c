@@ -7,7 +7,7 @@
  *       绝对上限 30 s，仅 BQ 动态项失败）] → PASS/FAIL → MONITOR。
  *
  * 目的：BQ 首帧短暂异常（ADC 未建立/正在重启）不应永久锁死三声报错；
- * 只有静态项（LSE/COMP/黑匣子）立即失败，BQ 动态项有恢复宽限。
+ * 只有静态项（RTC LP 时基/COMP/黑匣子）立即失败，BQ 动态项有恢复宽限。
  * `BQ_GetAdcRecoveryFailed()` 锁存时立即报一次 FAIL；完成后 MONITOR
  * 每 1 s 复查：持续 5 s 不健康才重新判失败(只报一次)，连续健康 3 s
  * 自动恢复。ADC 重启/配置期间不参与健康计时，但恢复冻结最多 30 s。
@@ -18,6 +18,7 @@
 #include "board.h"
 #include "bsp/bq_ic.h"
 #include "app/black_box.h"
+#include "app/power_mode.h"
 
 #define SELFTEST_BQ_TIMEOUT_MS      3000u
 #define SELFTEST_BQ_GRACE_MS        12000u
@@ -52,17 +53,15 @@ static struct
     uint8_t passed;
     uint8_t event;
     uint16_t fail_mask;
-    uint32_t run_count;
-    uint32_t last_run_ms;
 } s_self_test;
 
 static uint16_t SelfTest_RunChecks(uint32_t now_ms)
 {
     uint16_t fail = 0u;
 
-    if (__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) == 0u)
+    if (PowerMode_LpTimebaseReady() == 0u)
     {
-        fail |= SELFTEST_FAIL_LSE;
+        fail |= SELFTEST_FAIL_TIMEBASE;
     }
 
     if (BQ_GetState() != BQ_ST_RUN)
@@ -101,8 +100,6 @@ static void SelfTest_Finish(uint16_t fail_mask, uint32_t now_ms,
     s_self_test.done = 1u;
     s_self_test.requested = 0u;
     s_self_test.state = SELFTEST_STATE_MONITOR;
-    s_self_test.run_count++;
-    s_self_test.last_run_ms = now_ms;
     s_self_test.last_monitor_ms = now_ms;
     s_self_test.bq_bad_start_ms = 0u;
     s_self_test.bq_good_start_ms = 0u;
@@ -130,8 +127,6 @@ void SelfTest_Init(void)
     s_self_test.passed = 0u;
     s_self_test.event = SELFTEST_EVENT_NONE;
     s_self_test.fail_mask = 0u;
-    s_self_test.run_count = 0u;
-    s_self_test.last_run_ms = 0u;
 }
 
 void SelfTest_Request(void)
@@ -162,7 +157,6 @@ static void SelfTest_Monitor(uint32_t now_ms)
         return;
     }
     s_self_test.last_monitor_ms = now_ms;
-    s_self_test.last_run_ms = now_ms;
 
     /* ADC 恢复额度耗尽：如果是 PASS 状态，立即一次性上报 FAIL，不等 5 s。 */
     if (BQ_GetAdcRecoveryFailed() != 0u)

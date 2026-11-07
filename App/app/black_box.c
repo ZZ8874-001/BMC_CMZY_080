@@ -58,10 +58,8 @@ static struct
     uint8_t err;
 } s_bb;
 
-/* RAM 影子：上电后从 Flash 头记录向前取最近 5 条，写记录时同步前插。
- * LP 中调试器连不上时，复位/重新上电后在 NORM 直接展开 s_bb_shadow 即可
- * 看到最近 5 次事件（LP_ENTER/WAKE/MONITOR/周期记录）；diag_* 字段只写
- * RAM，不消耗 Flash，用于观察 LP 唤醒路径。 */
+/* RAM 影子：上电后从 Flash 头记录向前取最近 BB_SHADOW_COUNT 条，写记录时
+ * 同步前插；只写 RAM，不消耗 Flash。 */
 bb_shadow_t s_bb_shadow;
 
 /* ---------------- 工具 ---------------- */
@@ -240,17 +238,6 @@ static void Bb_ShadowLoad(void)
     {
         s_bb_shadow.rec[i].valid = 0u;
     }
-    s_bb_shadow.diag_lp_enter_count = 0u;
-    s_bb_shadow.diag_wut_count = 0u;
-    s_bb_shadow.diag_lp_loop_count = 0u;
-    s_bb_shadow.diag_button_irq_count = 0u;
-    s_bb_shadow.diag_wake_count = 0u;
-    s_bb_shadow.diag_last_stage = 0u;
-    s_bb_shadow.diag_flag_button = 0u;
-    s_bb_shadow.diag_pb5_level = 0u;
-    s_bb_shadow.diag_exti_imr = 0u;
-    s_bb_shadow.diag_exti_pending = 0u;
-    s_bb_shadow.diag_last_wake_cause = 0u;
     if (s_bb.valid_head == 0u)
     {
         return;
@@ -532,28 +519,4 @@ int BlackBox_WriteEvent(uint16_t event_code, uint32_t uptime_s)
                                 ((uint16_t)(event_code & 0x03FFu) << 6));
 
     return Bb_WriteRecord(uptime_s, flags);
-}
-
-int BlackBox_WriteLpDiag(uint32_t uptime_s, uint32_t wut_count,
-                         uint32_t button_irq_count, uint32_t loop_count,
-                         uint8_t stage, uint8_t flags)
-{
-    bq_snapshot_t snap;
-    uint16_t rec_flags = (uint16_t)(BB_KIND_EVENT |
-                                    ((uint16_t)(BB_EVENT_LP_DIAG & 0x03FFu) << 6));
-
-    /* 复用 24 B 记录的字段承载诊断：
-     *   cell1=WUT count [15:0], cell2=button IRQ count [15:0],
-     *   cell3=LP loop count [15:0], pack=stage | (flags<<8),
-     *   cc=WUT count[31:16], ts1=button IRQ count[31:16].
-     * 这些值只在 LP 按键尝试时写一条，不逐秒写 Flash。 */
-    snap.cell_mv[0] = (uint16_t)(wut_count & 0xFFFFu);
-    snap.cell_mv[1] = (uint16_t)(button_irq_count & 0xFFFFu);
-    snap.cell_mv[2] = (uint16_t)(loop_count & 0xFFFFu);
-    snap.pack_mv = (uint16_t)(((uint16_t)stage & 0xFFu) |
-                              ((uint16_t)flags << 8));
-    snap.cc_raw = (int16_t)((wut_count >> 16) & 0xFFFFu);
-    snap.ts1_raw = (uint16_t)((button_irq_count >> 16) & 0xFFFFu);
-
-    return Bb_WriteRecordSnapshot(uptime_s, rec_flags, &snap);
 }

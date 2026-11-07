@@ -4,7 +4,7 @@
  * @brief   应用编排：App_Init / App_Loop / 250 Hz TIM2 时基。
  *
  * 初始化顺序（无时间预算，允许保守阻塞）：
- *   复位原因 → 故障图 → 电源模式（HSI16 → HSE/PLL 80 MHz + LSE/RTC）
+ *   复位原因 → 故障图 → 电源模式（HSI16 → HSE/PLL 80 MHz；RTC 源由 LP_RTC_USE_LSE 选择）
  *   → 黑匣子 → 5 V 上电 → 日志 → BQ → WS2812 → 状态灯 → 蜂鸣器
  *   → 自检 → 状态机 → COMP2 → TIM2（最后启动）。
  *
@@ -16,6 +16,9 @@
 
 #include "board.h"
 #include "app/black_box.h"
+#include "app/lp_cycle.h"
+#include "app/lp_session.h"
+#include "app/rtc_time.h"
 #include "app/cal_stream.h"
 #include "app/charge_policy.h"
 #include "app/faults.h"
@@ -25,6 +28,7 @@
 #include "app/self_test.h"
 #include "app/state_machine.h"
 #include "app/state_store.h"
+#include "app/watchdog.h"
 #include "bsp/bq_ic.h"
 #include "bsp/button.h"
 #include "bsp/buzzer.h"
@@ -51,17 +55,15 @@
 #define APP_LP_BLOCK_TEST           (1u << 2)   /* 自检未完成/失败 */
 #define APP_LP_BLOCK_STATE          (1u << 3)   /* 状态机非 NORM */
 #define APP_LP_BLOCK_BQ             (1u << 4)   /* BQ 不新鲜 */
-#define APP_LP_BLOCK_LSE            (1u << 5)
+#define APP_LP_BLOCK_TIMEBASE       (1u << 5)   /* RTC 时基（LP_RTC_USE_LSE 选中源）不可用 */
 #define APP_LP_BLOCK_POWER          (1u << 6)   /* 电源模式非 NORM */
 #define APP_LP_BLOCK_POLICY         (1u << 7)   /* CHARGE/DISCHARGE/CAL 或 CAL pending */
 
 static struct
 {
     /* 时基（TIM2 中断写） */
-    volatile uint32_t tick_250hz_count;
     volatile uint32_t uptime_s;
     uint32_t uptime_base_s;
-    volatile uint8_t tick_running;
 
     /* 调度标志（中断置位，主循环消费） */
     volatile uint8_t flag_bq_read_request;
@@ -80,13 +82,8 @@ static struct
 
     /* 运行时/调试可见状态 */
     uint32_t diag_log_ms;
-    uint32_t loop_count;
-    uint32_t gesture_count;
-    uint8_t last_gesture;
     uint32_t last_activity_ms;      /* 自动 LP 的活动计时基准 */
-    uint32_t last_wake_count;       /* 识别 PowerMode_Loop 从 LP 返回 */
-    uint32_t auto_lp_request_count; /* 自动 LP 请求次数（诊断） */
-    uint8_t auto_lp_block;          /* 自动 LP 阻止原因位图（诊断） */
+    uint8_t auto_lp_block;          /* 自动 LP 阻止原因位图（[DIAG] 使用） */
 
     /* 降级模式（80 MHz 切换失败）灯闪 */
     uint32_t degraded_blink_ms;
@@ -116,14 +113,6 @@ void App_TickStart(void)
     HAL_NVIC_ClearPendingIRQ(TIM2_IRQn);
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
     (void)HAL_TIM_Base_Start_IT(&htim2);
-    s_app.tick_running = 1u;
-}
-
-void App_TickStop(void)
-{
-    (void)HAL_TIM_Base_Stop_IT(&htim2);
-    HAL_NVIC_DisableIRQ(TIM2_IRQn);
-    s_app.tick_running = 0u;
 }
 
 uint32_t App_GetUptimeSeconds(void)
@@ -140,7 +129,6 @@ static void App_OnTick250Hz(void)
 {
     uint8_t sample;
 
-    s_app.tick_250hz_count++;
 
     /* COMP2：32 个连续一致样本才更新方向（128 ms ≈ 5τ，τ≈24 ms）。 */
     sample = (HAL_COMP_GetOutputLevel(&hcomp2) == COMP_OUTPUT_LEVEL_HIGH) ? 1u : 0u;
@@ -280,12 +268,6 @@ static void App_BqAdcEventTask(void)
 static void App_HandleSelfTestCompletion(void)
 {
     uint8_t event = SelfTest_TakeEvent();
-
-    /* 自检结果可动态恢复/再次失败，电源模式侧每圈同步最新位图。 */
-    if (SelfTest_IsDone() != 0u)
-    {
-        PowerMode_SetSelfTestResult(SelfTest_GetFailMask(), BlackBox_HasError());
-    }
 
     if (event == SELFTEST_EVENT_NONE)
     {
@@ -434,12 +416,45 @@ static void App_DegradedLoop(void)
 
 /* ---------------- 对外入口 ---------------- */
 
+void App_Boot(void)
+{
+    lp_boot_t boot;
+
+    ResetCause_Init();
+
+    /* 复位后先在 App 层把 PA1 拉高（关 PACK_SC/HSE 前端）并确保 5 V 关，
+     * 避免 MX_GPIO_Init 默认低电平在 LP 复位 boot 期间产生前端/5 V 毛刺。
+     * 完整 NORM boot 会在 PowerMode_Init 里按需要重新拉低 PA1 启动 HSE。 */
+    HAL_GPIO_WritePin(HSE_DIS_GPIO_Port, HSE_DIS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SUP_5V_EN_GPIO_Port, SUP_5V_EN_Pin, GPIO_PIN_RESET);
+
+    (void)RtcTime_Init();
+    boot = LpCycle_ClassifyBoot();
+
+    if ((boot == LP_BOOT_START) || (boot == LP_BOOT_RESUME))
+    {
+        /* IWDG 轻量 LP 路径；正常情况下只会在下一次复位后返回（不返回）。 */
+        LpCycle_Run(boot);
+    }
+
+    App_Init();
+
+    if (boot == LP_BOOT_FAULT)
+    {
+        PowerMode_ForceDisableAutoLp();
+        LpSession_Invalidate();
+    }
+}
+
 void App_Init(void)
 {
-    s_app.tick_250hz_count = 0u;
+    /* MX_IWDG_Init() (CubeMX) starts IWDG with its generated /4 prescaler,
+     * which is only ~0.5 s at LSI and would expire during App_Init.  Reconfigure
+     * to the ~8 s dead-man immediately, before any blocking init work. */
+    Watchdog_InitNorm();
+
     s_app.uptime_s = 0u;
     s_app.uptime_base_s = 0u;
-    s_app.tick_running = 0u;
     s_app.flag_bq_read_request = 0u;
     s_app.flag_diag_request = 0u;
     s_app.flag_blackbox_request = 0u;
@@ -450,24 +465,18 @@ void App_Init(void)
     s_app.comparator_last_sample = 0u;
     s_app.comparator_match_count = 0u;
     s_app.diag_log_ms = 0u;
-    s_app.loop_count = 0u;
-    s_app.gesture_count = 0u;
-    s_app.last_gesture = (uint8_t)GESTURE_NONE;
     s_app.last_activity_ms = 0u;
-    s_app.last_wake_count = 0u;
-    s_app.auto_lp_request_count = 0u;
     s_app.auto_lp_block = 0u;
     s_app.degraded_blink_ms = 0u;
     s_app.degraded_blink_on = 0u;
 
-    ResetCause_Init();
     Fault_Init();
-    PowerMode_Init();          /* 16 MHz → 80 MHz；LSE/RTC 初始化 */
+    PowerMode_Init();          /* 16 MHz → 80 MHz；核对 RTC 源/LSE 健康 */
+    Watchdog_Feed();
 
     BlackBox_Init();
     StateStore_Init();
     s_app.uptime_base_s = BlackBox_GetUptimeBase();
-    PowerMode_LogBootRtcState();   /* 备份寄存器里的最后 LP 阶段 -> 黑匣子 */
 
     if (PowerMode_IsDegraded() != 0u)
     {
@@ -475,6 +484,11 @@ void App_Init(void)
         HAL_GPIO_WritePin(SUP_5V_EN_GPIO_Port, SUP_5V_EN_Pin, GPIO_PIN_RESET);
         return;
     }
+
+    /* LP 以 RTC 为绝对时间参考（LP_RTC_USE_LSE 选 LSE，默认 LSI 调试），
+     * IWDG 复位作为周期 tick。时基未就绪时 auto-LP 由
+     * PowerMode_LpTimebaseReady() 阻止。 */
+    Watchdog_Feed();
 
     HAL_GPIO_WritePin(SUP_5V_EN_GPIO_Port, SUP_5V_EN_Pin, GPIO_PIN_SET);
     HAL_Delay(APP_5V_STARTUP_DELAY_MS);
@@ -484,7 +498,9 @@ void App_Init(void)
                    (unsigned)ResetCause_GetLatched());
 
     BQ_Init();
+    Watchdog_Feed();
     SocEst_Init();
+    Watchdog_Feed();
     /* Ws2812_HwInit 按 80 MHz 重设 USART2SEL=PCLK1 并在 UE=0 时写 BRR。 */
     Ws2812_Init();
     LedStatus_Init();
@@ -503,19 +519,21 @@ void App_Init(void)
     s_app.diag_log_ms = HAL_GetTick();
     App_TickTimerInit();
     App_TickStart();           /* ★ 时基最后启动 */
+    Watchdog_Feed();
 
     s_app.last_activity_ms = HAL_GetTick();
-    s_app.last_wake_count = PowerMode_GetWakeCount();
+    LpCycle_ApplyWake();
 }
 
 void App_Loop(void)
 {
     uint32_t now_ms;
-    uint32_t wake_count;
     uint8_t had_activity = 0u;
     button_event_t button_ev;
     gesture_event_t gesture_ev;
     bq_snapshot_t bq_snap;
+
+    Watchdog_Feed();
 
     if (PowerMode_IsDegraded() != 0u)
     {
@@ -523,20 +541,11 @@ void App_Loop(void)
         return;
     }
 
-    /* 1) LP 请求（调试器写 s_power.request_lp=1）——阻塞到唤醒返回。 */
+    /* 1) 自动/调试器 LP 请求：写 BKP START token 后软件复位，本函数不再
+     * 返回 LP；真正唤醒由下一次完整 boot 的 LpCycle_ApplyWake() 处理。 */
     PowerMode_Loop();
 
-    /* LP 可能阻塞很久：必须在返回后重新取时基。 */
     now_ms = HAL_GetTick();
-
-    /* 从 LP 返回：重新开始 5 s 空闲计时。 */
-    wake_count = PowerMode_GetWakeCount();
-    if (wake_count != s_app.last_wake_count)
-    {
-        s_app.last_wake_count = wake_count;
-        s_app.last_activity_ms = now_ms;
-        ChargePolicy_OnLpWake(now_ms);
-    }
 
     /* 按键/手势：任何事件都算活动；按下期间不自动进 LP。 */
     Button_Poll(now_ms);
@@ -549,8 +558,6 @@ void App_Loop(void)
     while (Gesture_GetEvent(&gesture_ev) != 0u)
     {
         had_activity = 1u;
-        s_app.gesture_count++;
-        s_app.last_gesture = (uint8_t)gesture_ev;
         if (gesture_ev == GESTURE_PAIR_HOLD3)
         {
             ChargePolicy_OnPairHold3(now_ms);
@@ -617,9 +624,9 @@ void App_Loop(void)
         {
             block |= APP_LP_BLOCK_BQ;
         }
-        if ((Fault_GetAll() & FAULT_BIT_LSE) != 0u)
+        if (PowerMode_LpTimebaseReady() == 0u)
         {
-            block |= APP_LP_BLOCK_LSE;
+            block |= APP_LP_BLOCK_TIMEBASE;
         }
         if (PowerMode_GetState() != POWER_STATE_NORM)
         {
@@ -636,7 +643,6 @@ void App_Loop(void)
             ((now_ms - s_app.last_activity_ms) >= APP_IDLE_LP_MS))
         {
             PowerMode_RequestLp();
-            s_app.auto_lp_request_count++;
             s_app.last_activity_ms = now_ms;
         }
     }
@@ -655,8 +661,6 @@ void App_Loop(void)
 
     App_Log_Poll();
     App_Log_FlushSmall((ChargePolicy_IsCalibration() != 0u) ? 32u : 4u);
-
-    s_app.loop_count++;
 }
 
 /* ---------------- 中断 / weak 回调 ---------------- */

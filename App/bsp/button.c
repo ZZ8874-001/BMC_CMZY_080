@@ -17,6 +17,7 @@
 static struct
 {
     volatile uint8_t exti_flag;
+    volatile uint8_t smba_alert_flag;
 
     uint8_t raw_level;          /* 1 = 按下（PB5 低） */
     uint8_t stable_level;
@@ -60,6 +61,57 @@ static void Button_Push(button_event_type_t type, uint8_t pressed,
     s_button.tail = next;
 }
 
+void Button_WakeInit(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
+
+    gpio.Pin = WAKE_EXTI5_Pin;
+    gpio.Mode = GPIO_MODE_IT_FALLING;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(WAKE_EXTI5_GPIO_Port, &gpio);
+
+    /* HAL_GPIO_Init() 负责 GPIO/EXTI 复用；这里再显式确认一次 PB5 的
+     * SYSCFG 映射、下降沿和 IMR，避免生成代码没有打开 EXTI 时静默失效。 */
+    SYSCFG->EXTICR[1] = (SYSCFG->EXTICR[1] &
+                         ~(0x0Fu << 4)) |
+                        SYSCFG_EXTICR2_EXTI5_PB;
+    EXTI->RTSR1 &= (uint32_t)~EXTI_RTSR1_RT5;
+    EXTI->FTSR1 |= EXTI_FTSR1_FT5;
+    EXTI->IMR1 |= EXTI_IMR1_IM5;
+    EXTI->PR1 = EXTI_PR1_PIF5;
+
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0u, 0u);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+uint8_t Button_TakeExtiFlag(void)
+{
+    uint8_t f = s_button.exti_flag;
+
+    s_button.exti_flag = 0u;
+    return f;
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(WAKE_EXTI5_Pin);
+}
+
+/* PB5 EXTI5 的唯一回调 owner。ISR 只置标志，不做消抖/入队；LP 轻量路径
+ * 直接读 s_button.exti_flag/PB5 电平，NORM 由 Button_Poll 消费。 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == WAKE_EXTI5_Pin)
+    {
+        s_button.exti_flag = 1u;
+    }
+}
+
 void Button_Init(void)
 {
     uint32_t now_ms = HAL_GetTick();
@@ -78,22 +130,66 @@ void Button_Init(void)
     s_button.overflow = 0u;
 }
 
-void Button_NotifyExtiFromIsr(void)
+void Button_NotifySmbaFromIsr(void)
 {
-    s_button.exti_flag = 1u;
+    s_button.smba_alert_flag = 1u;
 }
 
-void Button_PrepareForLp(void)
+void Button_SmbaEnable(void)
 {
-    s_button.exti_flag = 0u;
-    s_button.raw_level = 0u;
-    s_button.stable_level = 0u;
-    s_button.pressed = 0u;
-    s_button.have_sample = 0u;
-    s_button.raw_change_ms = HAL_GetTick();
-    s_button.press_start_ms = 0u;
-    s_button.head = 0u;
-    s_button.tail = 0u;
+    GPIO_InitTypeDef gpio = {0};
+
+    /* 先保留 EXTI5 回退，再把 PB5 切到 AF4。若 AF 模式下 EXTI 仍能采样
+     * 引脚，按键仍可唤醒；若不能，IWDG 复位会兜底。 */
+    Button_WakeInit();
+
+    if (hi2c1.State == HAL_I2C_STATE_RESET)
+    {
+        hi2c1.Init.Timing = BQ_I2C_TIMINGR_HSI16_100K;
+        (void)HAL_I2C_Init(&hi2c1);
+    }
+
+    gpio.Pin = WAKE_EXTI5_Pin;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(WAKE_EXTI5_GPIO_Port, &gpio);
+
+    /* RM0394 的 I2C STOP 唤醒条件要求 I2CCLK=HSI16；测试窗口把 I2C1
+     * 内核时钟切到 HSI16（同为 16 MHz），PE 先关再改选择。 */
+    __HAL_I2C_DISABLE(&hi2c1);
+    MODIFY_REG(RCC->CCIPR, RCC_CCIPR_I2C1SEL_Msk, RCC_CCIPR_I2C1SEL_1);
+    __HAL_I2C_ENABLE(&hi2c1);
+
+    I2C1->CR1 = (I2C1->CR1 & ~(I2C_CR1_DNF_Msk | I2C_CR1_NOSTRETCH)) |
+                I2C_CR1_SMBHEN | I2C_CR1_ALERTEN | I2C_CR1_ERRIE |
+                I2C_CR1_WUPEN;
+    I2C1->ICR = I2C_ICR_ALERTCF;
+    s_button.smba_alert_flag = 0u;
+
+    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 1u, 0u);
+    HAL_NVIC_ClearPendingIRQ(I2C1_ER_IRQn);
+    HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
+}
+
+void Button_SmbaDisable(void)
+{
+    I2C1->CR1 &= ~(I2C_CR1_SMBHEN | I2C_CR1_ALERTEN | I2C_CR1_ERRIE |
+                   I2C_CR1_WUPEN);
+    I2C1->ICR = I2C_ICR_ALERTCF;
+    HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
+    HAL_NVIC_ClearPendingIRQ(I2C1_ER_IRQn);
+    s_button.smba_alert_flag = 0u;
+    Button_WakeInit();
+}
+
+uint8_t Button_SmbaTakeAlert(void)
+{
+    uint8_t f = s_button.smba_alert_flag;
+
+    s_button.smba_alert_flag = 0u;
+    return f;
 }
 
 void Button_OnWake(uint8_t wake_button, uint8_t pressed_now, uint32_t now_ms)
@@ -190,9 +286,4 @@ uint8_t Button_GetEvent(button_event_t *out)
 uint8_t Button_IsPressed(void)
 {
     return s_button.pressed;
-}
-
-uint32_t Button_GetPressStartMs(void)
-{
-    return s_button.press_start_ms;
 }

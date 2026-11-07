@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    self_test.h
- * @brief   上电自检：LSE、BQ 链路/首帧数据、COMP2 运行、黑匣子区。
+ * @brief   上电自检：RTC LP 时基（LSE/LSI 由宏选择）、BQ 链路/首帧数据、COMP2 运行、黑匣子区。
  *
  * 非阻塞状态机，由主循环轮询；完成后给出通过/失败位图。
  ******************************************************************************
@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-#define SELFTEST_FAIL_LSE        (1u << 0)
+#define SELFTEST_FAIL_TIMEBASE   (1u << 0)   /* RTC LP 时基不可用 */
 #define SELFTEST_FAIL_BQ_LINK    (1u << 1)
 #define SELFTEST_FAIL_BQ_DATA    (1u << 2)
 #define SELFTEST_FAIL_COMP       (1u << 3)

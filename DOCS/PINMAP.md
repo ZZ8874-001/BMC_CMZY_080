@@ -21,20 +21,19 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
   由 250 Hz tick 采样、32 样本（约 128 ms）一致性消抖。
 - 硬件已画、固件已接的点（L0）：5 V 由 PB0 门控（`App_Init()` 拉高，LP 拉低）、
   BQ 由 PB1 boot 脉冲唤醒并走 I2C1 CRC+DMA、TIM1 CH1N 由 `buzzer.c` 以 2–5 kHz 可调频率驱动、
-  LSE/RTC 由 CubeMX 初始化（LP 用 WUT 20 s 自动唤醒）、PA8 为 EXTI **事件**模式（仅唤醒 STOP1）、
-  PB5 为下降沿中断（按下唤醒）。仍存的硬件风险：I2C 只有 MCU 内部上拉（无外部上拉）。
+  RTC 由 CubeMX 初始化，时钟源按 `LP_RTC_USE_LSE` 选择（默认 LSI，LSE 硬件修复后改 1）；LP 周期由 IWDG 超时复位驱动、RTC 只作绝对时间参考；PA8 为 EXTI **事件**模式（不能唤醒 STOP1，只在轻量 LP boot 按电平检查）、PB5 为下降沿中断（生产唤醒，由 `Button_WakeInit()` 配置 EXTI5）。仍存的硬件风险：I2C 只有 MCU 内部上拉（无外部上拉）。
 
 ## 1. MCU 引脚总表（UFQFPN32）
 
 | 封装引脚 | 端口 | .ioc 信号 / 标签 | 原理图网络 | 连接器件与功能 | 配置 / 固件备注 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | VDD | — | `SUP_3V3D` | 3.3 V 数字电源 | U22 HT7533 由 `VBAT_12V` 产生；C95–C101 去耦 |
-| 2 | PC14-OSC32_IN | `RCC_OSC32_IN` | X1 32.768 kHz + C14 5 pF | LSE 晶振输入 | 生成的 `SystemClock_Config()` 打开 LSE，`MX_RTC_Init()` 配置 RTC（异步 127 / 同步 255 → ck_spre 1 Hz）；LP 进入时布防 RTC WUT 20 s 作为自动唤醒源 |
+| 2 | PC14-OSC32_IN | `RCC_OSC32_IN` | X1 32.768 kHz + C14 5 pF | LSE 晶振输入 | 当前板 LSE 硬件不起振，`LP_RTC_USE_LSE=0`（默认）时 RTC 走 LSI，不启动 LSE；切到 `=1` 时 `RtcTime_MspClockSource()` 有界启动 LSE，失败回退 LSI 但禁用 LP。`MX_RTC_Init()` 配 RTC（异步 127 / 同步 255 → 1 Hz）；无 WUT，RTC 只作 epoch 参考 |
 | 3 | PC15-OSC32_OUT | `RCC_OSC32_OUT` | X1 + C15 5 pF | LSE 晶振输出 | 同上 |
 | 4 | NRST | — | `RST` | 复位：R12 10 kΩ 上拉 3.3 V，C16 100 nF 到 REF_GND，KEY1 按键到 REF_GND | 低有效复位；内部上拉 |
 | 5 | VDDA/VREF+ | — | `SUP_3V3D` 经 L9 | 模拟电源/参考 | L9 磁珠；VREFBUF 关闭，COMP2 参考即 VDDA |
 | 6 | PA0 | `HSE-External-Clock-Source-for-LittleOrca` | `HSE_12M` | OSC1 12 MHz 输出 → R14 22 Ω → PA0 | HSE **bypass**；PLL 输入；不是 GPIO。复位后 MCU 先跑 HSI16，`App_Init()` 拉低 PA1 后由 `PowerMode_ClkSwitchToHsePll()` 切到 HSE+PLL 80 MHz |
-| 7 | PA1 | `GPIO_Output` / `HSE_DIS` | `HSE_DIS` + `CHGSC_DIS`（同一网络） | Q5 栅极（OSC1 tri-state 使能）+ Q6/Q7 栅极（PACK_SC 前置） | 推挽输出，`MX_GPIO_Init` 后为低；`PowerMode_ClkSwitchToHsePll()` 显式拉低，LP 中（已切 MSI、关 PLL/HSE 之后）拉高，唤醒后重配置 HSE 前再拉低。低 = Q5 导通（OSC1 使能）+ Q6/Q7 导通（PACK_SC 有效）；高 = Q5 关 + PACK_SC 关。硬件复位期间 PA1 高阻、R16 4k7 上拉为高，但启动时钟已改 HSI16，因此不再影响开机（见 §5）。**运行中（HSE/PLL 为源时）拉高会关 PACK_SC 并使 PLL 失锁，只允许在切换序列中操作** |
+| 7 | PA1 | `GPIO_Output` / `HSE_DIS` | `HSE_DIS` + `CHGSC_DIS`（同一网络） | Q5 栅极（OSC1 tri-state 使能）+ Q6/Q7 栅极（PACK_SC 前置） | 推挽输出，`MX_GPIO_Init` 后为低；`PowerMode_ClkSwitchToHsePll()` 显式拉低，LP 中（STOP1 前、关 PLL/HSE 后）拉高，复位式唤醒后的完整 boot 重配置 HSE 前再拉低。低 = Q5 导通（OSC1 使能）+ Q6/Q7 导通（PACK_SC 有效）；高 = Q5 关 + PACK_SC 关。硬件复位期间 PA1 高阻、R16 4k7 上拉为高，但启动时钟已改 HSI16，因此不再影响开机（见 §5）。**运行中（HSE/PLL 为源时）拉高会关 PACK_SC 并使 PLL 失锁，只允许在切换序列中操作** |
 | 8 | PA2 | `USART2_TX` / `RGB_USART2_TX` | `RGB_TX` | U20 `GL5050RGB01H-T` DIN（5 V 可寻址 RGB） | AF7 USART2。IOC 初始配置（半双工/开漏/115200）在运行时被 `ws2812_uart.c` 覆写：**deinit/reinit、USART2SEL=PCLK1（80 MHz）、BaudRate=3809523、UE=0 时写 BRR=21（3.8095 MBd）**、TXINV、清 HDSEL、PA2 推挽，按 WS2812 时序发 1 灯 12 B（GRB）；**USART2 中断发送（prio1），不使用 DMA**（DMA1_Ch7 留给 I2C1_RX）。冷启动 NORM 和 LP 唤醒 NORM 都重配。硬件风险：5 V 灯 VIH≈3.5 V 高于 3.3 V 输出，需上板实测 |
 | 9 | PA3 | `COMP2_INP` / `COMP_BTTN` | `SC_BTTN` | PACK_SC 分压，取自电池负极 BTT_N | 模拟输入；COMP2 同相输入。约 `2.50 V + 0.266 × V(BTT_N)`；`App_Init()` 启动比较器，250 Hz tick 采样 + 32 样本消抖 |
 | 10 | PA4 | `COMP2_INM` / `COMP_PACK` | `SC_PACK` | PACK_SC 分压，取自输出负极 PACK_N_0V | 模拟输入；COMP2 反相输入。约 `2.50 V + 0.266 × V(PACK_N)`。DAC1_OUT1 为内部模式（`DAC_OUT1_Int`），不驱动 PA4、不接 COMP2（INM=IO4），且未启动 |
@@ -45,7 +44,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 15 | PB1 | `GPIO_Output` / `BQ_BOOT` | `BQ_BOOT` | Q4 AO3400A 栅极；漏极 = TS1(`TSEXT_H`)，源极 = REF_GND；R10 100 kΩ 下拉 | 推挽输出，`MX_GPIO_Init` 后为低。高 = 把 TS1 拉低；低 = 释放 TS1，靠**外部上拉**越过 BQ 的 boot 门限（V0.80 板上必须外加 TS1 上拉）。BQ 上电后处于 SHIP 模式 |
 | 16 | VSS | — | `REF_GND` | 数字地 | 与 EP(33)、BQ VSS 同网络 |
 | 17 | VDD | — | `SUP_3V3D` | 3.3 V 数字电源 | 同 pin 1 |
-| 18 | PA8 | `GPXTI8` / `BQ_ALT_EXTI8` | `BQ_ALT` | BQ76920 `ALERT`（pin 20） | 输入，CubeMX 生成为 **EXTI 事件模式、上升沿**（`GPIO_MODE_EVT_RISING`）：不产生中断、没有 EXTI 挂起位，只作为 STOP1 的唤醒源；LP 唤醒后若无 RTC/PB5 标志，即归因为 BQ ALERT。ALERT 为高有效输出（带弱下拉），是 SYS_STAT 所有位的 OR；对应状态位写 1 清除后 ALERT 才撤销 |
+| 18 | PA8 | `GPXTI8` / `BQ_ALT_EXTI8` | `BQ_ALT` | BQ76920 `ALERT`（pin 20） | 输入，CubeMX 生成为 **EXTI 事件模式、上升沿**（`GPIO_MODE_EVT_RISING`）：不产生中断、没有 EXTI 挂起位，**不能唤醒 WFI/STOP1**。每次轻量 LP boot 在 BQ prepare 清掉 CC_READY/XREADY 后按电平检查；为高则完整唤醒并归因为 BQ ALERT，最坏延迟一个 IWDG 周期。ALERT 为高有效输出（带弱下拉），是 SYS_STAT 所有位的 OR；对应状态位写 1 清除后 ALERT 才撤销 |
 | 19 | PA9 | `I2C1_SCL` / `BQ_IIC1_SCL` | `BQ_SCL` | RN4 22 Ω → BQ76920 SCL（pin 5） | AF4 开漏；固件在 `HAL_I2C_Init` **之前**写 `hi2c1.Init.Timing=0x1424A4FF`（PRESC 1 / SCLDEL 2 / SDADEL 4 / SCLH 164 / SCLL 255 → **95 kHz**，tHIGH=4.125 µs）；HAL 会清掉保留位，硬件 TIMINGR 读回 `0x1024A4FF` 属正常。IOC 生成的 ~103.6 kHz / tHIGH 3.93 µs 不满足 BQ 的 tHIGH≥4.0 µs。MSP 为 `GPIO_PULLUP`（内部上拉约 40 kΩ），**板上无外部 I2C 上拉**（见第 6 节）。I2C1_TX 用 DMA1_Ch6（生成句柄 `hdma_i2c1_tx`） |
 | 20 | PA10 | `I2C1_SDA` / `BQ_IIC1_SDA` | `BQ_SDA` | RN4 22 Ω → BQ76920 SDA（pin 4） | AF4 开漏；同上。I2C1_RX 用生成的 **DMA1_Ch7**（`hdma_i2c1_rx`，Req3）；全部 DMA 只用 DMA1 |
 | 21 | PA11 | `CAN1_RX` | `CAN1_RX` | RN4 22 Ω → TJA1044 RXD（pin 4） | AF9；约 833 kbit/s（Prescaler 16、BS1=4TQ、BS2=1TQ，采样点 5/6） |
@@ -54,8 +53,8 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 24 | PA14 | `SYS_JTCK-SWCLK` | `SWCLK` | CN5 SWD 口 | SWCLK |
 | 25 | PA15 | — | — | 未连接（原理图打 X） | — |
 | 26 | PB3 | `GPIO_Output` / `IND_ROHT` | `IND_ROHT` | R11 510 Ω → LED1 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。**高 = 点亮**（高有效）；由 `led_status.c` 驱动：NORM 常灭、故障时 5 Hz 快闪、LP 灭 |
-| 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 平时灭；LP 每次 WUT 嗅探由 `power_mode.c` 打 `lp_sniff_led_ms`（默认 50 ms）高脉冲，作为“WUT/嗅探还活着”的心跳 |
-| 28 | PB5 | `GPXTI5` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 本身没有外部上拉**（原理图中的 10 kΩ 上拉不在 PB5 网络） | 输入，EXTI **下降沿中断**。`.ioc` 明确配置 `GPXTI5`、`GPIO_MODE_IT_FALLING`、`GPIO_PULLUP` 和 EXTI9_5 NVIC prio0，由生成的 `MX_GPIO_Init` 一次性配置；App 不再每次进 LP 重配。**必须启用 MCU 内部上拉**，否则 PB5 悬空，LP 中按键无法产生可靠下降沿。按下即触发。`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `app/power_mode.c`，只置唤醒标志 |
+| 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 平时灭；复位式 LP 每次 IWDG 轻量 boot 由 `lp_cycle.c` 打 `LP_HEARTBEAT_MS`（默认 10 ms）高脉冲，作为“IWDG 周期还活着”的心跳（生产测电流可置 0） |
+| 28 | PB5 | `GPIO_Input` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 本身没有外部上拉**（原理图中的 10 kΩ 上拉不在 PB5 网络） | `.ioc` 为 `GPIO_Input` + `GPIO_PULLUP`，生成的 `MX_GPIO_Init` 只配置电平/上拉；**EXTI5 下降沿由 `bsp/button.c` 的 `Button_WakeInit()` 在轻量 LP boot 中独占配置**（SYSCFG PB、FTSR、IMR、EXTI9_5 NVIC prio0）。NORM 用 4 ms 轮询；LP 用 EXTI5 唤醒。`EXTI9_5_IRQHandler`/`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `bsp/button.c`，只置 `exti_flag`。SMBA 实测时 PB5 临时切 AF4，EXTI5 保留为回退 |
 | 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道 |
 | 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1 |
 | 31 | PH3-BOOT0 | — | `BOOT0` | R15 10 kΩ 到 REF_GND | 从 Flash 启动；无 BOOT 按键 |
@@ -65,7 +64,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 ## 2. 未使用/保留的引脚
 
 - **PA5、PA6、PA15**：原理图打 X，NC。
-- **PC14/PC15**：32.768 kHz 晶振已装（X1 + 5 pF）。生成的 `SystemClock_Config()` 打开 LSE，`MX_RTC_Init()` 配置 RTC；LP 进入时布防 RTC WUT（20 s）作为保底唤醒源。
+- **PC14/PC15**：32.768 kHz 晶振已装（X1 + 5 pF），但当前板 LSE 不起振。默认 `LP_RTC_USE_LSE=0` 时 RTC 走 LSI、不启动 LSE；`=1` 时才尝试 LSE，失败回退 LSI 但禁用 LP。无 RTC WUT。
 - **DAC1**：CubeMX 配置了 CH1 为内部模式（`DAC_OUT1_Int`，`DAC_ConnectOnChipPeripheral=ENABLE`，不占引脚），
   代码 `MX_DAC1_Init()` 只初始化、从未 `HAL_DAC_Start()`；COMP2 的反相输入选的是 PA4（`COMP_INPUT_MINUS_IO4`），
   不是 DAC，因此 DAC 当前完全不参与比较器，也不影响 PA4。
@@ -142,14 +141,14 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 ### 3.4 软件使用要点
 
 1. **必须启动**：`MX_COMP2_Init()` 只做 `HAL_COMP_Init(&hcomp2)`；`App_Init()` 末尾补了
-   `HAL_COMP_Start(&hcomp2)`，LP 唤醒后的 `PowerMode_RestorePeripherals()` 也会重启它。删除这一步会让
+   `HAL_COMP_Start(&hcomp2)`，完整 boot（含 LP 唤醒复位）都会重启它；轻量 LP boot 的充电检查临时启动后立即停止。删除这一步会让
    `HAL_COMP_GetOutputLevel()` 永远读到无效/0。
 2. **读数**：`HAL_COMP_GetOutputLevel(&hcomp2)`（内部读 `COMP_CSR_VALUE`，bit 30）。
    COMP2 没有输出引脚、没有 TIM 触发、没有 EXTI；L0 在 250 Hz TIM2 tick 中轮询。
 3. **消抖**：无迟滞 + 24 ms 模拟滤波，软件连续 32 次（250 Hz 下约 128 ms ≈ 5τ）一致才提交方向；
    电流接近 0 时保持上一个稳定状态（状态机用 BQ 新鲜度区分 standby）。
 4. **PA1 运行中必须为低、LP 中为高**：`HSE_DIS/CHGSC_DIS` 为高会关掉 PACK_SC 前置，两个 SC 节点被拉到约 3.3 V，
-   比较器结果无意义；同时 Q5 关停 12 MHz HSE。L0 只在进入 LP（已切 MSI、关 PLL/HSE 后）拉高 PA1，唤醒时先拉低再重配 HSE。
+   比较器结果无意义；同时 Q5 关停 12 MHz HSE。轻量 LP boot 在 STOP1 前拉高 PA1；唤醒走复位，完整 boot 由 `PowerMode_ClkSwitchToHsePll()` 重新拉低再切 HSE/PLL。充电检查窗口会短暂拉低 PA1，检查完立即恢复高。
 5. **BQ 电流符号相反**：按 SRP/SRN 引脚定义（SRP 靠 VSS 的负端、SRN 正端），放电时 `SRN > SRP`，
    CC 读数应为**正**、充电为**负**；即 **COMP2 高（充电）↔ CC 为负**。首次联动时用已知充电/放电方向实测确认符号后再定映射。
 6. **DAC1 是内部模式**：`DAC_OUT1_Int`，没有外部引脚，也不在 COMP2 的 INM 路径（INM = IO4），启动它不会影响 PA4；
@@ -243,15 +242,14 @@ REGSRC 必须接 VBAT_12V（V0.80 漏接），否则 REGOUT 与 CHG/DSG 栅极�
 - PB1 = 低 → Q4 关，TS1 由上拉/NTC 决定，BQ 可自动从 SHIP boot。
 - PB3/PB4 = 低 → LED1/LED2 灭（高有效）。
 - COMP2 未启动；DAC1 未启动；TIM1 未启动；TIM2 已初始化但未启动；I2C/CAN/USART 外设已初始化；
-  EXTI9_5 已使能，`EXTI9_5_IRQHandler` 只派发 PB5。
+  PB5 只有 `GPIO_Input` + 内部上拉，EXTI5/NVIC 由轻量 LP boot 的 `Button_WakeInit()` 配置。
 
 `App_Init()` 之后（NORM）：
 
 - 时钟 HSI16 → HSE bypass + PLL 80 MHz（失败重试 3 次 → `FAULT_CLK` 降级）；TIM2 覆写为 250 Hz 并启动。
 - PB0 = 高（5 V 开，20 ms 软启动余量）；PB1 先 2 ms 高脉冲（强制 BQ 退出 SHIP）后保持低。
 - BQ 走 I2C1（95 kHz、CRC、DMA）配置；COMP2 启动；TIM1 由蜂鸣器模块按需启停；PB3/PB4 由灯效驱动。
-- LP 中：PA1 = 高、PB0 = 低、SYSCLK = MSI 4 MHz、PLL/HSE 关、TIM2/I2C/USART/DMA 全部停止；
-  只有 RTC（LSE + WUT）和 PA1/PB0 保持。唤醒后按相反顺序恢复。
+- 轻量 LP boot 中：PA1 = 高、PB0 = 低、HSE/PLL 关，最后进 STOP1（SYSCLK 停止，退出时钟 `STOPWUCK=1`=HSI16），TIM2/I2C/USART/DMA 不运行；RTC 常开只作 epoch，IWDG/LSI 负责周期复位，PB5 EXTI5 是唯一生产唤醒中断（PA8 只按电平检查）。真实唤醒写 WAKE 令牌并软件复位到完整 `App_Init()`。
 
 硬件复位期间（`MX_GPIO_Init` 之前）：PA1 为高阻，R16 4k7 把 `HSE_DIS` 拉高、Q5 关；但
 `SystemClock_Config()` 现在只启动 HSI16，HSE 的使能由 App 在 PA1 已驱动为低之后执行，因此
@@ -282,10 +280,7 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
    BQ 内部 10 kΩ TS1 上拉在 SHIP 下不工作，V0.80 板必须外加 TS1 上拉（10 kΩ 到 SUP_3V3D/VC1 或可切换
    高边偏置）；用 PB1 高（拉低）→ 低（释放）产生上升沿。boot 后等 ≥10 ms，首次电芯数据约 250 ms；
    boot 完成后 PB1 保持低，否则 NTC 被短路。
-6. **EXTI 分工**：PA8（BQ ALERT）是**事件模式**（上升沿），不产生中断、没有挂起位，只唤醒 STOP1；
-   PB5（WAKE）是**下降沿中断**，按下即触发。EXTI9_5 的 `EXTI9_5_IRQHandler` 只派发 PB5；
-   `HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `app/power_mode.c`，只置唤醒标志。LP 唤醒后若
-   RTC 标志和 PB5 标志都没有，就归因为 BQ ALERT。不要把 PA8 改回中断模式（会引入未消费的中断/挂起位）。
+6. **EXTI 分工**：PA8（BQ ALERT）是**事件模式**（上升沿），不产生中断、没有挂起位，**不能唤醒 WFI/STOP1**，只在每次轻量 LP boot 按电平检查；PB5（WAKE）是**下降沿中断**，由 `Button_WakeInit()` 在轻量 LP boot 配置 EXTI5/NVIC。EXTI9_5 的 `EXTI9_5_IRQHandler` 只派发 PB5；`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `App/bsp/button.c`，只置标志。不要把 PA8 改回中断模式（会引入未消费的中断/挂起位）。
 7. **USART2 与 RGB 灯**：用户已确认 U20 为 WS2812 类。`ws2812_uart.c` 在运行时 deinit/reinit USART2：
    USART2SEL=PCLK1、BaudRate=3809523、UE=0 时写 BRR=21（3.8095 MBd）、TXINV、推挽；冷启动 NORM 和
    LP 唤醒 NORM 都重配。RGB 帧用 **USART2 中断发送**（prio1，不使用 DMA；DMA1_Ch7 留给 I2C1_RX），
@@ -295,8 +290,7 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
    `HAL_TIMEx_PWMN_Start()` + MOE 启停；IOC 的 ARR=65535 只是占位。LP 前停 PWM 并把 PA7 拉低。
 9. **CAN 终端**：TJA1044 的 STB 接 GND（正常模式），板上只看到共模电感 L13、TVS D3，**未见 120 Ω 终端电阻**；
    确认整车线束两端终端由其他节点提供，否则通信反射/误码。
-10. **LSE/RTC**：32.768 kHz 晶振已装；`.ioc` 已含 RTC，生成的 `SystemClock_Config()` 打开 LSE，
-    `MX_RTC_Init()` 配置 1 Hz 时基。LP 进入时布防 RTC WUT 1 s 嗅探（自由运行、自动重装）；布防失败会放弃进入 LP（防止无唤醒源）；30 min 储存监测在 LP 内完成。
+10. **LSE/RTC**：32.768 kHz 晶振已装但当前板 LSE 不起振。`.ioc` 显式选 RTC=LSI；生成的 `HAL_RTC_MspInit` 中 RTC 选择行由 `RtcTime_MspClockSource()` 按 `LP_RTC_USE_LSE` 决定（CubeMX 重新生成后必须重打这一行，并保持 `SystemClock_Config()` HSI-only）。默认 LSI 模式不启动 LSE；LSE 模式失败回退 LSI 但禁用 LP。RTC 只作绝对时间，30 min 监测由 IWDG 复位后的轻量 boot 完成。
 11. **Flash 容量**：链接脚本的应用区已改为 **96 K**（实际 STM32L432KBU6 为 128 K，页 48–63 保留给 NVM/黑匣子）；**CubeMX 重生成会恢复成 256 K，必须手动改回**，
     否则大镜像会链接通过但烧录失败。应用区限制为 96K（`_image_end <= 0x08018000`）；页 48–49 为 SOC/SOH NVM、页 50–51 为 L1 StateStore，黑匣子占用 `0x0801A000–0x0801FFFF`。
 12. **DAC1**：当前为内部模式（`DAC_OUT1_Int`），不占 PA4、不接 COMP2（INM=IO4）；不要改成外部引脚输出
@@ -304,10 +298,7 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
 13. **LED 极性**：PB3/PB4 经 510 Ω 驱动 LED 阳极，LED 阴极到 REF_GND → **高电平点亮**；`MX_GPIO_Init` 后为低 = 灭。
 14. **比较器精度**：无迟滞、模拟 τ≈24 ms、差模仅 0.266×，1 A 级别接近失调；
     精确电流/充放电判据优先用 BQ 的 SRP/SRN 库仑计，COMP2 只作粗方向/冗余判断。
-15. **LP 唤醒路径**：进入 STOP1 前固件先写 BQ `SYS_CTRL1=0x00`（关 ADC/TEMP，LP 期间无电压/电流/温度检测）、
-    写 `CC_EN=0` 并清 `SYS_STAT`（否则 CC_READY 每 250 ms 拉 ALERT 造成唤醒风暴）、
-    清 EXTI 挂起，再切 MSI/关 PLL/HSE、抬 PA1、关 PB0。唤醒源为 RTC 20 s（保底）、PB5 按下、PA8 ALERT（事件，归因）。
-    调试 LP 时须断开调试器，否则 STOP1 电流和唤醒行为不可信。
+15. **LP 唤醒路径**：复位式 LP 的轻量 boot 先用 `BQ_LpBootPrepare()` 写 `SYS_CTRL1=0x00`（关 ADC/TEMP）、清 CC_READY/XREADY，再按电平检查 PA8；然后关 5 V、抬 PA1、关 PLL/HSE，配置校准后的 IWDG timeout 并进 STOP1。IWDG 超时复位是周期 tick；PB5 EXTI5 是生产唤醒；充电器由 COMP2 电平检查；监测失败完整唤醒。调试 LP 时须断开调试器，否则 STOP1 电流和唤醒行为不可信。
 
 ## 7. 快速查阅：比较器链路
 

@@ -1,7 +1,7 @@
 
 # BMC_CMZY_080 电源模式与切换说明（L0 + M1 基础）
 
-依据（2026-11-04 M3 + BQ 保护配置 + L1 充放电/CAL 策略，`make -j2 all` 通过，`_image_end`=0x0800EB90）：
+依据（2026-11-07 复位式 LP 收束，默认 LSI + SMBA=0，`make -j2 all` 通过，text 68760 B，`_image_end`=0x08010D40）：
 
 - `App/app/power_mode.c`（时钟切换、LP 进入/唤醒、RTC/PB5 中断 owner）
 - `App/app/main_app.c`（App_Init / App_Loop / 250 Hz tick 编排）
@@ -11,47 +11,56 @@
   `App/app/self_test.c`、`App/app/reset_cause.c`
 - `Core/Src/main.c`（生成初始化）、`BMC_CMZY_080.ioc`
 
-> **M2b-1 自动 LP + 充电唤醒；M2b-2 30 min HSI16 储存监测；M3 SOC/SOH 适配**：NORM 无充放电、无按键、自检通过且 BQ 新鲜时，5 s 空闲自动 `PowerMode_RequestLp()`；自动 LP 的阻止原因位图在 `s_app.auto_lp_block`（调试器连接不再阻止自动 LP）。LP 为 **HSI16 + 2 s RTC 嗅探**（WUTR=1；WUT 自由运行，WUTE/WUTIE 保持，自动重装），每次嗅探读 `SYS_CTRL1/SYS_STAT/SYS_CTRL2`，`LOAD_PRESENT=1` 时在 LP 内临时拉低 PA1、启 COMP2 复核：COMP2 高=充电，完整唤醒并置 `POWER_WAKE_CHARGER`；COMP2 低=负载，继续睡。每 900 tick（30 min）**不退出 LP**，在同一 HSI16 下临时开 BQ ADC/TEMP+CC 采一轮三节/BAT/TS1/CC，写一条周期黑匣子记录后恢复 LP 寄存器态；只有监测/恢复失败才完整唤醒（`POWER_WAKE_MONITOR`）。**FET 由策略层接管**：`BQ_DEFAULT_FET_MASK` 当前是 `BQ_FET_MASK_ALL`，但 `ChargePolicy_Init()` 请求 0，IDLE/自动 LP 保持双管关；充电器插入自动 CHARGE、`PAIR_HOLD3` 切换 DISCHARGE，二者才请求 `0x03`。LP 使用 `s_power.lp_fet_mask`（默认 0）。充电唤醒恢复 NORM/5 V 后由策略层等 BQ fresh 再进 CHARGE。注意 `SYS_CTRL2` 位定义：bit0=CHG_ON，bit1=DSG_ON。
+> **当前实现（2026-11-07 收束，代码为准）**：LP 是 **IWDG 超时复位式**。NORM 空闲 5 s 后 `PowerMode_RequestLp()` 写 `START` 令牌并 `NVIC_SystemReset()`；下一次 boot 走 `App_Boot()` 的轻量 `lp_cycle` 路径（不跑 `App_Init`）读 RTC epoch，做 BQ 状态/充电器/PB5/PA8 检查，跨过 30 min 点则做 `BQ_LpMonitorRun()` 并写一条黑匣子 periodic 记录，然后按 RTC 剩余时间配置校准后的 IWDG timeout（基础 30 s）并进 STOP1。IWDG 超时复位；下一次 boot 由 `LpCycle_ClassifyBoot()` 校验 `STOPPED` 令牌与 RTC 间隔后继续。真正唤醒（PB5/充电/ALERT/监测失败）写 `WAKE` 令牌 + 软件复位进入完整 `App_Init()`，再由 `LpCycle_ApplyWake()` 注入唤醒原因/策略。
+>
+> - **时基宏**：`LP_RTC_USE_LSE=0`（默认，当前硬件 LSE 不起振）= RTC/LP 参考走 **LSI**，不启动 LSE、不置 `FAULT_LSE`；LSI 同时驱动 IWDG，30 min 只是相对时间，绝对时间会漂。`LP_RTC_USE_LSE=1` = RTC 走 LSE；LSE 起振失败时 `RtcTime_MspClockSource()` 回退 LSI 保 boot，但 `PowerMode_LpTimebaseReady()` 仍要求 LSE，因此 **LP 被禁用**并置 LSE/TIMEBASE 故障，NORM/5 V 继续。切换宏后第一次 boot 若 RTCSEL 改变会触发一次 `BDRST`，清空 BKP 会话/日历，之后不得每个 boot 反复切换。
+> - **SMBA 备用**：`LP_SMBA_WAKE_TEST=0`（默认）时 PB5 只走 EXTI5；置 1 时第一个 LP 周期临时使用 I2C1_SMBA host alert，仍有 EXTI5 回退，记录 `pb5_mode`/`smba_result` 后自动恢复 EXTI5。该构建仅台架使用。
+> - **LP 期间外设**：5 V 关、PA1 高（停 OSC1/PACK_SC）、HSE/PLL 关、SYSCLK 由 STOP1 停止；`STOPWUCK=1` 指定 HSI16 为退出时钟；RTC 常开只作绝对时间；PB4 每次轻量 boot 打 `LP_HEARTBEAT_MS=10 ms` 高脉冲（生产测电流可改 0）；LPTIM1 和 RTC WUT 均不参与 LP。
+> - **BQ**：轻量路径用 `BQ_LpBootPrepare()`/`BQ_LpMonitorRun()` 的有界阻塞 I2C；30 min 监测临时开 ADC/TEMP+CC，不改 FET；会话期间 BQ 保持 `SYS_CTRL1=0x00`、`SYS_CTRL2` 由 LP FET mask 决定（默认 0x00）。NORM 的 500 ms 轮询、ADC 恢复和 SOC/SOH 不参与 LP tick。
+> - **BKP 会话**：BKP1..10 = CRC 保护的 `lp_session_t`（LP03 布局），BKP20..23 保留 HardFault 现场。没有每 tick/每唤醒的调试计数；最小诊断只保留 `s_power.boot_reset_cause`、`wake_cause`、`wake_count` 和 session `seq`。
+> - **复位分类优先级**：HardFault/NMI → 时基门控 → 软件 `START`/`WAKE` 令牌 → 合法 `WATCHDOG + STOPPED + RTC 间隔`（RESUME）→ PIN/BOR 使其失效 → 其余 WATCHDOG 视为 FAULT → NORMAL。该板会把软件/IWDG 复位额外报告为 PIN，因此合法会话必须先于 PIN/BOR 判断。
+>
+> **历史（仅作记录，不代表当前行为）**：2026-11-06 之前曾使用 RTC WUT 2 s、LPTIM1/LSI 2 s 和 4 s RTC 兜底等 STOP1 内周期中断方案；这些方案在 STOP1 唤醒路径上不稳定，相关 `timebase.c`、`lp_test_mode`、WUT 重布防、BKP stage 诊断和 SRAM 面包屑均已从当前代码删除。旧版本本节及正文中的 WUT/LPTIM/2 s 嗅探描述均属该历史阶段。
 
 ## 1. 外设状态总表
 
 
 | 外设 / 板级器件       | 上电（生成代码跑完）                                             | NORM 常态                                                                                                                                                                                              | LP 保持态                                                                                                                                                  |
 | ----------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| SYSCLK                | HSI16，Scale2，2WS                                               | HSE bypass 12 MHz → PLL ×80 MHz，Scale1，4WS                                                                                                                                                         | 停（STOP1）；2 s 嗅探唤醒瞬间 HSI16                                                                                                                        |
-| HSI16 / MSI           | HSI16 开，MSI 关                                                 | HSI16 开，MSI 关                                                                                                                                                                                       | 进入前设 STOPWUCK=HSI16；每次嗅探在 HSI16 下运行 I2C；MSI 不使用                                                                                           |
-| HSE / PLL / OSC1      | 关；`MX_GPIO_Init` 已把 PA1 拉低                                 | 开；PA1=0（OSC1 使能 + PACK_SC 前端使能）                                                                                                                                                              | 关：先切 HSI16、关 PLL、关 HSE，再抬 PA1（OSC1 tri-state）；仅 `LOAD_PRESENT=1` 的 COMP2 复核期间短暂拉低 PA1                                              |
-| LSE / RTC             | LSE 开、RTC 时基就绪（异步127/同步255 → 1 Hz）                  | 运行；WUT 未布防，RTC_WKUP NVIC 关                                                                                                                                                                     | **常开**：WUT 2 s 嗅探；COMP2 只在 `LOAD_PRESENT=1` 时短暂启动；充电/按键/ALERT 才回 NORM；30 min 监测在 HSI16 内完成，不唤醒                              |
-| SysTick               | 1 ms HAL 时基                                                    | 1 ms                                                                                                                                                                                                   | `HAL_SuspendTick()`；每次 RTC 唤醒在 HSI16 下 `HAL_InitTick` 修复                                                                                          |
-| TIM2                  | 占位配置（PSC0/ARRmax/OC CH1），NVIC 已使能 prio0，**未启动**    | 覆写 PSC319/ARR999 → **250 Hz**，prio2，已启动                                                                                                                                                        | 停止、NVIC 关                                                                                                                                              |
-| TIM1                  | 初始化未启动                                                     | 蜂鸣器音型按需 `HAL_TIMEx_PWMN_Start` + MOE                                                                                                                                                            | 停止；PA7 改 GPIO 推挽输出并拉低（Q8 可靠关断）                                                                                                            |
-| I2C1                  | 初始化（生成 ~103.6 kHz）；`hdma_i2c1_tx`/`hdma_i2c1_rx` 已 Init | 95 kHz：`Init.Timing` 在 `HAL_I2C_Init` **之前**写 0x1424A4FF（硬件读回 0x1024A4FF 是 HAL 清保留位的正常结果）；TX DMA1_Ch6、RX **DMA1_Ch7**；每 500 ms 跑 8 个事务                                    | DeInit；SDA/SCL 空闲高；BQ 保持 LP 寄存器态                                                                                                                |
-| USART1                | 初始化 115200（生成值）                                          | 覆写 BRR=694（115200）；日志 TX DMA1_Ch4，1 KB 环形缓冲                                                                                                                                                | DeInit；PB6 空闲高；U18 断电（5 V 关）                                                                                                                     |
-| USART2                | 初始化（半双工/开漏/115200，生成值）                             | deinit/reinit：USART2SEL=PCLK1（80 MHz）、`BaudRate=3809523` 先于 `HAL_UART_Init`；再 UE=0 写 BRR=21（**3.8095 MBd**）+ TXINV + 清 HDSEL + PA2 推挽；RGB 帧用 **USART2 中断发送**（prio1，不使用 DMA） | DeInit；PA2 空闲低；U20 断电                                                                                                                               |
-| COMP2                 | 初始化未启动                                                     | 启动；250 Hz 采样 + 32 样本（128 ms）消抖 → 充/放方向                                                                                                                                                 | 默认停止；`LOAD_PRESENT=1` 时 PA1 短时拉低 → `HAL_COMP_Start` → 30 ms → 读电平 → `HAL_COMP_Stop` → PA1 高                                             |
-| DAC1                  | 初始化（内部模式、未启动）                                       | 不参与（永远不启动、不接 COMP2）                                                                                                                                                                       | 停                                                                                                                                                         |
-| CAN1                  | 初始化（无 NVIC、无业务）                                        | 初始化态；TJA1044 由 5 V 供电但不收发                                                                                                                                                                  | TJA1044 断电（5 V 关）                                                                                                                                     |
-| PVD                   | 未开                                                             | 开：阈值 2.8 V、prio4，跌落 → sticky `FAULT_POWER`                                                                                                                                                    | 关（省电）                                                                                                                                                 |
-| EXTI PA8（BQ ALERT）  | 事件模式、上升沿（无中断、无挂起位）                             | 不产生中断；由 500 ms 轮询 SYS_STAT 消化                                                                                                                                                               | **唤醒源**（事件唤醒；无标志 → 归因 BQ ALERT）                                                                                                            |
-| EXTI PB5（WAKE 按键） | `GPIO_PULLUP`，中断、下降沿、prio0，由 CubeMX `MX_GPIO_Init` 配置 | 只置 `flag_button`（主循环消费）                                                                                                                                                                       | **唤醒源**（按下即唤醒）；板级 PB5 无外部上拉，内部上拉由 `.ioc` 的 `PB5.GPIO_PuPd=GPIO_PULLUP` 保证                                           |
-| GPIO PA1              | 低（OSC1 + PACK_SC 使能）                                        | 低                                                                                                                                                                                                     | 高（OSC1 tri-state、PACK_SC 前端关）                                                                                                                       |
-| GPIO PB0              | 低（5 V 关）                                                     | 高（5 V 开，软启动 ≥20 ms）                                                                                                                                                                           | 低（5 V 关）                                                                                                                                               |
-| GPIO PB1              | 低；App 做 2 ms 高脉冲再回低                                     | 低（BQ 已 boot；高会短路 NTC）                                                                                                                                                                         | 低                                                                                                                                                         |
-| GPIO PB3/PB4          | 低（LED 灭）                                                     | 状态机灯效（NORM 常亮 PB4 等）                                                                                                                                                                         | PB3 灭；PB4 每次 WUT tick 在 PB5/PA8 检查**之前**打 50 ms 高脉冲（`s_power.lp_sniff_led_ms`，0=关），作为嗅探心跳。因此“有脉冲后 5 V 恢复”可能是 ALERT 完整唤醒；“完全无脉冲”才说明没有处理到 WUT tick（或未进入 LP） |
-| GPIO PA7              | AF1 占位                                                         | AF1 PWM（2.0/2.5/3.0/4.0/5.0 kHz 音型）                                                                                                                                                                | GPIO 输出低                                                                                                                                                |
-| BQ7692003PWR          | SHIP（POR 默认）；App boot 脉冲 + 配置                           | NORMAL：SYS_CTRL1=0x18（ADC_EN\|TEMP_SEL）、SYS_CTRL2=0x40（CC_EN，FET 默认全关）、PROTECT1=0x89 / PROTECT2=0x57 / PROTECT3=0x40（3S NMC：OV 4.25 V/1 s、UV 2.80 V/4 s、OCD 56 mV/320 ms、SCD 67 mV/100 µs，RSNS=1）；OV/UV_TRIP 按 ADC gain/offset 计算并回读；FET 由 `s_bq.request_fet_mask` 控制；配置完成后先 `BQ_ST_SETTLE` 300 ms，随后每 500 ms 读 SYS_STAT/VC1/VC2/VC5/VC3/VC4/BAT/TS1/CC；电压帧须通过 1.0–5.0 V/节、3.0–15.0 V 包压、包压与三节和 ≤300 mV 校验才置 `valid/fresh` | NORMAL，SYS_CTRL1=0x00（**ADC/TEMP 关**）、SYS_CTRL2=`s_power.lp_fet_mask`（默认 0x00 全关）；无电压/电流/温度检测，OV/UV 停、SCD/OCD 仍有效；ALERT 可唤醒 |
-| 5 V 轨负载            | 关                                                               | 开：TJA1044、U20 RGB、蜂鸣器、U18 +5 V                                                                                                                                                                 | 关（全部断电）                                                                                                                                             |
-| SWD 调试口            | 可用                                                             | 可用                                                                                                                                                                                                   | 默认 `POWER_LP_KEEP_SWD=0`：**未连接调试器**时清 `DBG_STOP`（最低功耗）；检测到 `CoreDebug.DHCSR.C_DEBUGEN=1`（调试器仍连接）时自动保留 `DBG_STOP`，避免 STOP1 唤醒被调试器 halt/失去同步掩盖。台架测 LP 电流必须物理断开 SWD。`make POWER_LP_KEEP_SWD=1` 构建允许运行期 `s_power.lp_keep_swd` 手动选择 |
-| Flash 黑匣子          | 头扫描（找最大有效 seq）                                         | 30 min/条 + LP 进入/唤醒转换记录                                                                                                                                                                       | **每 30 min 监测写 1 条**；2 s 嗅探不写 Flash                                                                                                              |
+| SYSCLK | HSI16，Scale2，2WS（`SystemClock_Config()` 为 HSI-only 补丁） | HSE bypass 12 MHz → PLL 80 MHz，Scale1，4WS | STOP1 停振；每次 IWDG 轻量 boot 以 HSI16 重启 |
+| HSI16 / MSI | HSI16 开；MSI 不用 | HSI16 开；MSI 不用 | `STOPWUCK=1` 指定 HSI16 为 STOP 退出时钟；轻量 boot 全程 HSI16 |
+| HSE / PLL / OSC1 | 关；`MX_GPIO_Init` 把 PA1 拉低 | 开；PA1=0（OSC1 + PACK_SC 使能） | 关；PA1 高。唤醒走复位，由完整 boot 重新切 HSE/PLL |
+| LSE / RTC | **默认 `LP_RTC_USE_LSE=0`：RTC 走 LSI**，不启动 LSE；`LP_RTC_USE_LSE=1` 时由 `RtcTime_MspClockSource()` 有界启动 LSE，失败回退 LSI 但禁用 LP | RTC 运行（异步 127/同步 255），只作绝对时间；WUT 未布防 | RTC 常开作 epoch 参考；无 WUT/无 RTC 周期唤醒；LP tick 是 IWDG 超时复位 |
+| SysTick | 1 ms HAL 时基 | 1 ms | STOP1 中不用；轻量 boot 在 HSI16 下 `HAL_InitTick` 后使用 |
+| TIM2 | 占位配置，未启动 | 覆写 PSC319/ARR999 → 250 Hz，prio2 | 轻量 boot 不初始化/不启动 |
+| TIM1 | 初始化未启动 | 蜂鸣器 PWM | 轻量 boot 不初始化；5 V 关 |
+| I2C1 | 生成初始化；`BQ_Init()` 重配 95 kHz + DMA | 95 kHz；TX DMA1_Ch6、RX DMA1_Ch7；500 ms 轮询 | 轻量 boot 用 `BQ_LpSniffInit()` 重建无 DMA 阻塞 I2C，结束后 DeInit；30 min 监测同路径 |
+| USART1 | 初始化 115200（生成值） | BRR=694（115200），日志 TX DMA1_Ch4 | 轻量 boot 不初始化；5 V 关 |
+| USART2 | 初始化（生成值） | 重配 3.8095 MBd，IT 发送驱动 WS2812 | 轻量 boot 不初始化；5 V 关 |
+| COMP2 | 初始化未启动 | 启动；250 Hz + 32 样本消抖 | 轻量 boot 的充电检查：PA1 短暂拉低 → `HAL_COMP_Start` → 30 ms → 读电平 → Stop → PA1 高 |
+| DAC1 | 初始化（内部模式、未启动） | 不参与 | 不参与 |
+| CAN1 | 初始化（无业务） | 初始化态 | 不初始化；TJA1044 断电 |
+| PVD | 未开 | 开：2.8 V、prio4 | 轻量 boot 不跑 `Fault_Init`，PVD 不配置 |
+| EXTI PA8（BQ ALERT） | 事件模式、上升沿，无 IRQ/挂起位 | 500 ms 轮询 SYS_STAT 消化 | **不能唤醒 WFI/STOP1**；每次轻量 boot 按电平检查，最坏延迟一个 IWDG 周期 |
+| EXTI PB5（WAKE 按键） | `.ioc` 为 `GPIO_Input` + 内部上拉；EXTI5 由 `Button_WakeInit()` 在轻量 boot 配置（下降沿，prio0） | 4 ms 轮询 | **生产唤醒源 EXTI5**：ISR 只置标志，LP 路径写 `WAKE` 令牌并软件复位；SMBA 测试由宏启用并保留 EXTI5 回退 |
+| GPIO PA1 | 低（OSC1 + PACK_SC） | 低 | 高（OSC1 tri-state、PACK_SC 关），仅充电检查窗口短暂拉低 |
+| GPIO PB0 | 低（5 V 关） | 高（5 V 开） | 低（5 V 关） |
+| GPIO PB1 | 低；App 做 2 ms 高脉冲再回低 | 低（BQ 已 boot；高会短路 NTC） | 低 |
+| GPIO PB3/PB4 | 低（LED 灭） | 状态灯效（NORM PB4 常亮） | PB3 灭；PB4 每次轻量 boot 打 `LP_HEARTBEAT_MS=10 ms` 高脉冲作为存活心跳，其余时间灭 |
+| GPIO PA7 | AF1 占位 | AF1 PWM | 轻量 boot 不初始化；5 V 关 |
+| BQ7692003PWR | SHIP；App boot 脉冲 + 配置 | NORMAL：`SYS_CTRL1=0x18`、`SYS_CTRL2=0x40|FET`、保护配置/回读、300 ms SETTLE、500 ms 轮询、ADC 异常受控恢复 | LP 会话：`SYS_CTRL1=0x00`（ADC/TEMP 关）、`SYS_CTRL2` 按 LP FET mask（默认 0）；无电压/电流/温度轮询，30 min 点临时开 ADC/TEMP+CC 采一轮并恢复 |
+| 5 V 轨负载 | 关 | 开：TJA1044、RGB、蜂鸣器、U18 +5 V | 关（全部断电） |
+| SWD 调试口 | 可用 | 可用 | 仅编译期 `POWER_LP_KEEP_SWD` 控制 STOP1 下 `DBG_STOP`（无运行期覆盖字段）；测 LP 电流应物理断开 SWD |
+| Flash 黑匣子 | 头扫描（最大有效 seq） | 30 min/条 + 唤醒事件 | **每次跨 30 min 的轻量 boot 写 1 条 periodic**；普通 IWDG tick 不写 Flash |
 
 ## 2. 上电 → NORM 流程
 
 ### 2.1 硬件复位与生成代码（main.c）
 
 1. 复位向量 → `HAL_Init()`（Flash 接口、SysTick 1 ms）。
-2. `SystemClock_Config()`：**HSI16** + LSE ON，PLL 关，Scale2，2WS。复位后不依赖 OSC1——PA1 复位期间高阻被 R16 4k7 拉高（OSC1 tri-state），MCU 照样在 HSI16 上跑。
-3. `MX_GPIO_Init()`：PA1/PB0/PB1/PB3/PB4 输出低；PA8 = EXTI 事件上升沿；PB5 = EXTI 中断下降沿；EXTI9_5 NVIC 使能（prio 0）。
-4. `MX_DMA_Init()` → `MX_CAN1_Init()`、`MX_COMP2_Init()`、`MX_DAC1_Init()`、`MX_I2C1_Init()`、`MX_USART1_UART_Init()`、`MX_USART2_UART_Init()`、`MX_TIM1_Init()`、`MX_RTC_Init()`（LSE 已开，RTC 就绪）、`MX_TIM2_Init()`（占位 + NVIC prio0 使能）。全部外设**只初始化不启动**；NVIC 此时已使能的有：EXTI9_5、TIM2、DMA1_Ch6、DMA1_Ch7。
+2. `SystemClock_Config()`：**HSI16-only**（PLL 关，Scale2，2WS），不等 LSE；这是每次 CubeMX 重新生成后必须重打的补丁。PA1 复位期间高阻、R16 4k7 上拉，但 boot 不依赖它。
+3. `MX_GPIO_Init()`：PA1/PB0/PB1/PB3/PB4 输出低；PA8 = EXTI 事件上升沿（无 IRQ）；PB5 = `GPIO_Input` + 内部上拉，**不生成 EXTI**（由 `Button_WakeInit()` 在轻量 LP boot 配置）。
+4. `MX_DMA_Init()` → `MX_CAN1_Init()`、`MX_COMP2_Init()`、`MX_DAC1_Init()`、`MX_I2C1_Init()`、`MX_USART1_UART_Init()`、`MX_USART2_UART_Init()`、`MX_TIM1_Init()`、`MX_RTC_Init()`（RTC 源由 `RtcTime_MspClockSource()` 按宏选择）、`MX_TIM2_Init()`（占位）、`MX_LPTIM1_Init()`（不使用）、`MX_IWDG_Init()`（USER CODE 启动 boot guard/256）。全部外设**只初始化不启动**；除生成代码外不主动开 NVIC。
 
 ### 2.2 App_Init()（App/app/main_app.c，顺序即依赖序，无时间预算）
 
@@ -61,7 +70,7 @@
 | 1    | 清零 `s_app`                              | 全部运行状态置初值                                                                                                                                                                                                                                                   |
 | 2    | `ResetCause_Init()`                       | RCC->CSR + BKP0R 魔数（hardfault 记录），消费后清 RMVF                                                                                                                                                                                                               |
 | 3    | `Fault_Init()` → `Fault_PvdEnable()`     | 故障图清零；PVD 2.8 V 布防（prio4）                                                                                                                                                                                                                                  |
-| 4    | `PowerMode_Init()`                        | LSE/RTC 状态核对（失败 → **可恢复 live `FAULT_LSE`**，LSERDY+RTCSEL=LSE 连续正常 100 ms 后由 `PowerMode_LseHealthTask()` 自动清除）；PB5 下降沿 + **内部上拉**幂等覆写（V0.80 的 PB5 没有外部上拉）；**时钟切换**（见下）                                                                                                                  |
+| 4    | `PowerMode_Init()`                        | RTC 源严格校验（LSI 模式不置 LSE 故障；LSE 模式失败置 live `FAULT_LSE`，LSERDY 连续 100 ms 后由 `PowerMode_LseHealthTask()` 清 live/sticky，但 RTCSEL 不热切换）；按 `PowerMode_LpTimebaseReady()` 置/清 `FAULT_BIT_TIMEBASE`；清遗留 WUT/LPTIM；**时钟切换**（见下）                                                                                                                  |
 | 5    | `BlackBox_Init()`                         | 扫描 1020 槽取最大有效 seq；`_image_end > 0x08018000` → sticky `FAULT_FLASH_LOG`；恢复 `uptime_base`                                                                                                                                                                |
 | 6    | 降级检查                                  | 时钟切换失败 → PB0 保持低、**直接 return**：只跑降级循环（PB3 以 250 ms 相位翻转 ≈2 Hz 闪烁），通信/BQ/tick 全部不启动                                                                                                                                             |
 | 7    | PB0 = 1 + `HAL_Delay(20)`                 | 5 V 软启动余量（CAN 收发器/RGB/蜂鸣器/U18 +5 V）                                                                                                                                                                                                                     |
@@ -81,21 +90,21 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 
 ### 2.3 上电自检（SelfTest）
 
-非阻塞：IDLE → WAIT_BQ（超时 3000 ms；包含 300 ms ADC settle 与首帧校验）→ DONE。检查项：LSERDY、BQ 状态 == RUN、BQ 数据新鲜（`fresh && valid`）、COMP2 == BUSY、黑匣子无错误。完成后主循环触发：通过 → 蜂鸣器 `BOOT_OK`（4 kHz × 2 短）+ `[TEST] pass`；失败 → `FAULT` 音型（2 kHz × 3 长）+ `[TEST] fail=0xXXXX`，灯切 FAULT 模式。`s_power.diag_self_test_fail`/`diag_blackbox_error` 保存失败位图。首个有效电芯数据约在 boot 脉冲后 300 ms 出现。
+非阻塞：IDLE → WAIT_BQ（超时 3000 ms；包含 300 ms ADC settle 与首帧校验）→ DONE。检查项：`PowerMode_LpTimebaseReady()`（RTC 源为宏选择且就绪，LSI 模式下不要求 LSE）、BQ 状态 == RUN、BQ 数据新鲜（`fresh && valid`）、COMP2 == BUSY、黑匣子无错误。完成后主循环触发：通过 → 蜂鸣器 `BOOT_OK`（4 kHz × 2 短）+ `[TEST] pass`；失败 → `FAULT` 音型（2 kHz × 3 长）+ `[TEST] fail=0xXXXX`，灯切 FAULT 模式。`s_power.diag_self_test_fail`/`diag_blackbox_error` 保存失败位图。首个有效电芯数据约在 boot 脉冲后 300 ms 出现。
 
 ## 3. NORM 常态运行
 
-- **时钟**：HSE bypass 12 MHz → PLL → 80 MHz，Scale1，4WS；LSE 32.768 kHz 供 RTC 1 Hz 时基；HSI16 保持开启。
+- **时钟**：HSE bypass 12 MHz → PLL → 80 MHz，Scale1，4WS；RTC 1 Hz 时基默认来自 LSI（`LP_RTC_USE_LSE=0`），切到 LSE 后来自 32.768 kHz；HSI16 保持开启。
 - **250 Hz TIM2 中断（ISR 内只读寄存器/置标志/数数）**：COMP2 采样 + 32 样本消抖提交充/放方向；LED 相位推进（PB3/PB4 + RGB dirty 标志）；500 ms → `flag_bq_read_request`；1 s → `uptime_s++` + `flag_diag_request`；30 min → `flag_blackbox_request`。
 - **主循环（每圈固定顺序）**：`PowerMode_Loop()`（消费调试器写的 LP 请求）→ 按键/手势 → BQ 读请求 + `BQ_Poll()`（事务状态机）→ `SocEst` → 自检轮询 → 1 s 诊断（BQ 新鲜度 >2 s → `FAULT_BQ_STALE`；每 10 s 一条 `[DIAG]`/`[POL]` 日志）→ `StateMachine_Update` → `ChargePolicy_Task` + `CalStream_Task` + 灯效 → 自动 LP 判断 → 黑匣子 30 min 记录 → `Buzzer_Poll()` → `LedStatus_Flush()` → `App_Log_Poll()` + `FlushSmall(4/32)`。
-- **BQ**：每 500 ms 一轮 10 个事务（读 SYS_STAT → 清 CC_READY/XREADY → 读 VC1/VC2/VC5/VC3/VC4/BAT/TS1/CC，每字节 CRC-8）；配置完成时写并回读保护阈值（见 §1 表），随后进入 `BQ_ST_SETTLE` 等 300 ms；通信故障 3 次重试 → sticky `FAULT_BQ_COMM` + 总线重建 + 重跑配置序列；事务 100 ms 看门狗。SCD/OCD 在每次状态读取时更新 live；OV/UV/XREADY 只在电压帧通过 `valid` 校验后更新；假 OV/UV 仅在稳定帧中三相电压安全时用一次 `SYS_STAT` 写清除。无效帧 `fresh=0`，不进入 SOC/黑匣子/状态机。CC 换算：`s_bq.current_ma = cc_raw × 844 / 150`（1 LSB=8.44 µV、分流 1.5 mΩ、250 ms 平均，带符号）。MOS 开关标志：`s_bq.request_fet_mask`（bit0=CHG，bit1=DSG，由 `ChargePolicy_Task` 唯一驱动）、`fet_mask_applied`；run script 完成后若不同，用一次性 DMA 写 `SYS_CTRL2=0x40|mask`（保留 CC_EN）。`BQ_DEFAULT_FET_MASK` 当前被手动设为 `BQ_FET_MASK_ALL`，但 `ChargePolicy_Init()` 会请求 0，IDLE/自动 LP 保持 0；CHARGE/DISCHARGE 才请求 `0x03`。配置脚本最后只写 `0x40`（CC on、FET off）；LP 用 `s_power.lp_fet_mask`（默认 0x00），`BQ_PrepareForLpMask()` 同时把请求影子同步为 LP mask，避免唤醒后重放旧请求。
+- **BQ**：每 500 ms 一轮 10 个事务（读 SYS_STAT → 清 CC_READY/XREADY → 读 VC1/VC2/VC5/VC3/VC4/BAT/TS1/CC，每字节 CRC-8）；配置完成时写并回读保护阈值（见 §1 表），随后进入 `BQ_ST_SETTLE` 等 300 ms；通信故障 3 次重试 → sticky `FAULT_BQ_COMM` + 总线重建 + 重跑配置序列；事务 100 ms 看门狗。SCD/OCD 在每次状态读取时更新 live；OV/UV/XREADY 只在电压帧通过 `valid` 校验后更新；假 OV/UV 仅在稳定帧中三相电压安全时用一次 `SYS_STAT` 写清除。无效帧 `fresh=0`，不进入 SOC/黑匣子/状态机。CC 换算：`s_bq.current_ma = cc_raw × 844 / 150`（1 LSB=8.44 µV、分流 1.5 mΩ、250 ms 平均，带符号）。MOS 开关标志：`s_bq.request_fet_mask`（bit0=CHG，bit1=DSG，由 `ChargePolicy_Task` 唯一驱动）、`fet_mask_applied`；run script 完成后若不同，用一次性 DMA 写 `SYS_CTRL2=0x40|mask`（保留 CC_EN）。`BQ_DEFAULT_FET_MASK` 当前被手动设为 `BQ_FET_MASK_ALL`，但 `ChargePolicy_Init()` 会请求 0，IDLE/自动 LP 保持 0；CHARGE/DISCHARGE 才请求 `0x03`。配置脚本最后只写 `0x40`（CC on、FET off）；复位式 LP 的轻量路径由 `BQ_LpBootPrepare()`/`BQ_LpMonitorRun()` 管理 BQ，`BQ_PrepareForLpMask()`/`s_power.lp_fet_mask` 只是旧的兼容 API，不再参与当前 LP 周期。
 - **状态机**：BOOT →（数据新鲜）→ NORM；关键故障（BQ_COMM/XREADY/OV/UV/SCD/OCD/POWER/CLK）→ FAULT（故障消失回 BOOT 重判）。流动分类：充电（COMP2 高）/放电（低）/静置（数据不新鲜）。
 - **灯效**：BOOT = PB4 1 Hz 慢闪 + RGB 蓝；NORM = PB4 常亮 + RGB（充电绿 48 / 放电蓝 48 / 静置白 12）；FAULT = PB3 5 Hz 快闪 + RGB 红。
 - **蜂鸣器**：音型表（BOOT_OK/FAULT/LP_ENTER/WAKE），主循环推进相位，TIM1 无中断。
 - **日志**：USART1 115200 非阻塞，1 KB 环形 + 64 B 暂存，TX DMA1_Ch4，100 ms DMA 看门狗。
 - **PVD**：3.3 V 轨 < 2.8 V → 中断 → sticky `FAULT_POWER`。
 - **黑匣子**：每 30 min 一条 24 B 记录（seq/uptime/3 节电压/总压/CC/TS1/种类/CRC16）；跨页首槽先擦除整页（~25 ms 取指停摆，约每 42.5 h 一次）。
-- **LP 请求**：主循环 5 s 空闲自动调用 `PowerMode_RequestLp()`；调试器仍可写 `s_power.request_lp = 1`。自动 LP 不会被调试器连接阻止；看 `s_app.auto_lp_block` 判断未进入的原因（bit0=充电，bit1=按键，bit2=自检未完成/失败，bit3=状态机非 NORM，bit4=BQ 不新鲜，bit5=LSE，bit6=电源模式非 NORM，bit7=策略 CHARGE/DISCHARGE/CAL 或 CAL pending）。**LSE 干扰恢复后 bit5 不应永久保持**：`PowerMode_LseHealthTask()` 在 NORM 每圈检查 LSERDY 和 RTCSEL=LSE，连续 100 ms 正常就清 live/sticky `FAULT_LSE`（`s_power.lse_lost_count/lse_recover_count` 记录次数）。若 LSE 在 STOP1 内部失振，当前 RTC WUT 仍会停到干扰撤去；要在此窗口继续 sniff，需要独立的 LSI/LPTIM 时基（见下节鲁棒性建议）。
+- **LP 请求**：主循环 5 s 空闲自动调用 `PowerMode_RequestLp()`；调试器仍可写 `s_power.request_lp = 1`。自动 LP 不会被调试器连接阻止；看 `s_app.auto_lp_block` 判断未进入的原因（bit0=充电，bit1=按键，bit2=自检未完成/失败，bit3=状态机非 NORM，bit4=BQ 不新鲜/恢复中，bit5=RTC LP 时基不可用，bit6=电源模式非 NORM，bit7=策略 CHARGE/DISCHARGE/CAL 或 CAL pending）。bit5 只看 `PowerMode_LpTimebaseReady()`：默认 LSI 模式不因 LSE 缺失置位；`LP_RTC_USE_LSE=1` 且 LSE 失败时才阻止 LP。
 
 ### 3.1 L1 充放电策略与 CAL
 
@@ -107,146 +116,144 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 - CAL 由调试器写 `s_policy.cal_fet_mask`（0x00..0x03）再写 `s_policy.cal_mode=1` 进入；写 `cal_mode=0` 退出。CAL 期间自动 LP 被 bit7 阻止，BQ 不 fresh/非 RUN/LP 唤醒/关键故障都会结束 CAL。
 - `[CAL]` 由 `cal_stream.c` 输出：BEGIN/HDR + 每个新 BQ 快照一行（约 2 Hz）+ END；黑匣子只写 `BB_EVENT_CAL_BEGIN/END`（0x12/0x13），不逐样本写 Flash。CAL 日志只用现有快照字段（mV、cc_raw、current_ma、ts1_raw、SocEst 的 ts1_mv/temp/SOC/SOH），不恢复 raw_cell/raw_pack。END 的 `reason`：1=user，2=fault，3=notready，4=lp。
 
-## 4. NORM → LP 切换序列（PowerMode_EnterLp）
+## 4. NORM → LP：写 START 令牌后复位
 
-前置：`s_power.state == NORM`。任何一步失败都**留在 NORM**（或降级），不会出现“无唤醒源”的 STOP。
+自动 LP 只在 `App_Loop()` 的固定门控全部满足、且 5 s 无活动时调用 `PowerMode_RequestLp()`。阻止位图 `s_app.auto_lp_block` 的位定义：
 
-
-| 步骤 | 动作                            | 说明 / 时序                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1    | 排空在飞通信                    | 等 `!Ws2812_IsBusy() && !App_Log_TxBusy() && BQ_IsIdle()`，最多 100 ms；超时也继续进入 LP（在飞事务由各外设的 LP 停机路径中止）                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 2    | BQ 准备（有界阻塞，每步 50 ms） | 写 SYS_CTRL1=0x00（**关 ADC/TEMP**，LP 期间无电压/电流/温度检测，BQ 60→40 µA）→ `BQ_PrepareForLpMask(s_power.lp_fet_mask)`（默认 **0x00 双管全关、CC_EN=0**）→ **等待 300 ms（最后一笔 CC 转换结束）** → 读 SYS_STAT → 写 `0xA0` 只清 CC_READY/XREADY（保护锁存保留，防 ALERT 唤醒风暴）。失败 → sticky `FAULT_BQ_COMM`、清 `request_lp`、回 NORM，并（若总线空闲）重跑 BQ 配置恢复 ADC/FET；**不得在半配置状态下进 LP**                                                                                                          |
-| 2b   | BQ ALERT/锁存检查               | BQ 准备后读 `BQ_GetSnapshot()` 与 PA8；把现场写入 **BKP19R**（bit31..24=0xA5，bit23..20=BQ 状态，bit19=verdict_active，bit18=recovery_episode，bit17=adc_recovery_failed，bit16=fresh，bit15..8=SYS_STAT，bit0=PA8 高）。若 **PA8 实际为高**，取消本次 LP、回 NORM、`BQ_ReInitAfterLp()` 恢复 ADC/FET，并写 stage65。**原因**：ADC 异常/受控重启/准备窗口内新锁存的假 OV/UV/SCD/OCD 不会被 `SYS_STAT=0xA0` 清掉，PA8 保持高；直接睡下会在首个 WUT 的 PA8 检查处完整唤醒，PB4 心跳分支还没执行，表现为“进过 LP 但没有 LED 脉冲”。SYS_STAT 保护锁存本身仍由状态机/故障处理消化，BKP19R 只用于诊断，不额外禁止 LP |
-| 3    | 黑匣子 LP 记录                  | `BlackBox_WriteTransition(BB_KIND_LP_ENTER)`（此时仍在 NORM，Flash 可写）                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| 4    | **布防 RTC WUT 2 s**            | prio1 + 清 NVIC pending + 清 EXTI PR20 + NVIC 使能 → `HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 1, ..._CK_SPRE_16BITS)`（HAL 周期为 WUTR+1，1=2 s；A/B 验证中，旧可唤醒固件也是此值）。**失败 → 放弃进 LP**：清 request_lp、回 NORM、置 **live（非 sticky）`FAULT_LSE`**、撤 WUT、关 NVIC；LSERDY+RTCSEL 稳定 100 ms 后自动清除并允许重新 auto-LP，避免一次 LSE 干扰导致永久不再进 LP。pre-STOP1 前另有 LSERDY/RTCSEL 检查，不健康则完整唤醒，绝不睡在无 tick 的 WUT 上。 |
-| 5    | 停外设、灭灯                    | `App_TickStop` → `App_Log_DeInitForLp` → `Ws2812_DeInitForLp` → `BQ_DeInitForLp` → `HAL_COMP_Stop` → `Buzzer_DeInitForLp`（PA7 拉低）→ `Fault_PvdDisable` → PB3/PB4 灭                                                                                                                                                                                                                                                                                                                                                            |
-| 6    | 清挂起唤醒源                    | 若 WUTF=0：清 WUTF + EXTI PR20 + RTC_WKUP NVIC pending；若 WUTF=1：保留这次有效 WUT，让第一次 WFI 立即返回。只清 PA8 的 PIF8，**不清 PIF5**（按键下降沿可能刚到达）                                                                                                                                                                                                                                                                                                                                                                      |
-| 7    | HSI16 就绪                      | HSI16 开 + 等 HSIRDY；STOPWUCK=HSI16（确定唤醒后时钟）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| 8    | SYSCLK → HSI16                 | 等 SWS==HSI；`SystemCoreClock=16 MHz`；降 Scale2（仍 4WS，合法）                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| 9    | 关 PLL、抬 PA1、关 HSE          | 先等 PLLRDY=0；**先抬 PA1 停 OSC1**，再清 HSEON/HSEBYP 并限时等 HSERDY=0（顺序反了 bypass 外部时钟会让 HSERDY 不落）                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| 10   | 关 PB0                          | 5 V 轨断电（PA1 已在步骤 9 处置高：OSC1 tri-state + PACK_SC 前端关）                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| 11   | 进入 STOP1（循环）              | `state=LP`、`lp_enter_count++`、`HAL_SuspendTick()`、`HAL_PWREx_EnterSTOP1Mode(PWR_STOPENTRY_WFI)`；**WUT 自由运行**（WUTE/WUTIE 保持为 1，计数器自动重装，不每个 tick 关/重布防），每次 2 s tick 执行 HSI16 I2C 嗅探；`LOAD_PRESENT=1` 时做 COMP2 复核，充电则完整唤醒；否则继续睡。900 tick（30 min）在 LP 内做 HSI16 储存监测并写黑匣子记录，成功后重置计数继续睡；监测/恢复失败才 `POWER_WAKE_MONITOR` 完整唤醒。按键/ALERT 仍立即完整唤醒。每次进 STOP1 前检查 `RTC->CR` 的 WUTE+WUTIE、EXTI line20 IMR/RTSR、RTC_WKUP NVIC 使能；缺 EXTI/NVIC 直接补位，缺 WUTE/WUTIE 才重布防（避免 WUTWF 等待窗口）；WUTF=0 时清 stale PR20/NVIC pending，WUTF=1 时保留有效 tick。重布防失败则放弃睡眠并完整唤醒。进入 STOP1 用与 HAL 等价的 LPMS/SLEEPDEEP/WFI 序列，并在 WFI 前把 PWR_CR1/SCB_SCR/PRIMASK/BASEPRI/NVIC ISER/ISPR/EXTI/RTC 写入 BKP4R..BKP8R；复位后可直接读这些备份寄存器判断是否真的以 STOP1 + 全中断使能进入睡眠。每次 WFI 返回并修好 SysTick 后，**只要有 `flag_rtc` 就先把 PB4 打高 50 ms，再检查 PB5/PA8**；这样即使 PA8 已高导致完整唤醒，也仍能看到一次心跳，避免把“PA8 先唤醒”误判为“WUT 没跑”。`HardFault_Handler` 不再死循环，而是 `ResetCause_RecordHardFaultAndReset()`：BKP0R 写 HARDFAULT，BKP9R..BKP12R 保存 CFSR/HFSR/MMFAR/BFAR；stage61 的 reset cause 会显示 HARDFAULT。 |
-
-**WUT 实测定性（2026-11-05）**：WUTR=1（2 s）在无 SWD、20 s+ 的运行中产生 **16/16 次 WUT 向量+callback+嗅探**（BKP2R/BKP3R=0xA5A50010，BKP0R 最后 stage34，BKP4R/5R/7R/8R 显示 LPMS=STOP1、SLEEPDEEP=1、PRIMASK=0、RTC_WKUP NVIC=1、EXTI20 IMR/RTSR=1、WUTE/WUTIE=1）；同一设置下 WUTR=0（1 s）在 20 s 内为 **0 次** WUT ISR。因此暂时固定 WUTR=1/2 s，1 s 配置需要另行验证。**注意**：16/16 那次运行是按住复位时插入调试器、再 boot 的；Ozone/SWD 从 boot 起就在，DBG_STOP 保持。运行到第 16 次嗅探后出现一次无 RTC/按键/PA8 标志的 unknown 完整唤醒（stage35，wake_mask=0），与调试器在 STOP1 期间唤醒/干扰 CPU 一致，不能当作生产唤醒源。后续同样从 boot 起带调试器的运行在复位前分别累计 **71 次和 89 次 WUT ISR+callback**（stage61 `cc_raw/ts1_raw` 对应，BKP1R=0x0F），BKP0R 最后 stage32、没有 WAKE 记录，确认 2 s 自由运行 WUT 可稳定运行数分钟。生产结论仍需 SWD 物理断开、从 boot 到唤醒全程不接调试器的运行。
-
-**WUT 关键约束**：STM32L4 只有在 `RTC_CR.WUTIE=1` 时才会被 WUT 从 STOP1 唤醒；`WUTE` 只使能计数器。因此 `HAL_RTCEx_WakeUpTimerEventCallback` 只能置 `s_power.flag_rtc`，**绝不能在回调里清 WUTIE**。此前每个 tick 都 `HAL_RTCEx_DeactivateWakeUpTimer` + `SetWakeUpTimer_IT` 重布防，若 WUT tick 恰好落在“重布防完成→WFI”窗口（1 Hz CK_SPRE 的首拍相位任意），回调清掉 WUTIE 后会在无唤醒源下进入 STOP1，表现为调试器断联且永不复位唤醒。另：1 Hz CK_SPRE 下 WUTWF 同步可超过 HAL 的 1 s 超时，也不要依赖每次重布防。
-
-## 5. HAL_Delay / HAL_GetTick 与时钟切换
-
-`HAL_Delay()` 依赖 SysTick 的 1 ms 中断和 `HAL_GetTick()`；**只改 SYSCLK/PLL 而不重新配置 SysTick，延时和所有 HAL 超时都会按旧频率计算**。本工程的延时点审计：
-
-| 延时点 | 运行时钟 | tick 状态 |
+| 位 | 宏 | 条件 |
 | --- | --- | --- |
-| `App_Init` 5 V 20 ms | 80 MHz | `PowerMode_Init` 的 `HAL_RCC_ClockConfig` 成功后 HAL 已更新 tick |
-| `PowerMode_ClkSwitchToHsePll` 30 ms | HSI16 | boot/LP 唤醒前均已 `HAL_InitTick`；失败重试见下方修复 |
-| 唤醒后 5 V 2 ms | 80 MHz | ClockConfig 成功后 tick=80 MHz |
-| LP 充电复核 30 ms ×2 | HSI16 | 每次 WFI 返回后先 `SystemCoreClock=16 MHz` + `HAL_InitTick` |
-| LP 储存监测 300 ms | HSI16 | 同上 |
-| LP PB4 嗅探心跳 50 ms | HSI16 | 同上 |
-| `BQ_PrepareForLpMask` 300 ms | 80 MHz（LP 进入）/HSI16（LP 监测停止） | 两个上下文 tick 都已同步 |
-| `BQ_VerifySettleStatus` 10 ms | 80 MHz（所有 CONFIG 路径） | tick=80 MHz |
-| HAL I2C 50 ms 超时 | 80 MHz 或 HSI16 | LP 内均在 WFI 返回后先修 tick |
-| HAL RTC WUT WUTWF 1 s 超时 | 80 MHz（LP 进入）或 HSI16（LP guard） | 对应上下文 tick 正确 |
-| HAL RCC OscConfig/ClockConfig 超时 | HSI16 | 入口 tick 正确；ClockConfig 失败见下方修复 |
+| 0 | `APP_LP_BLOCK_CHARGING` | COMP2 连续判定充电中 |
+| 1 | `APP_LP_BLOCK_BUTTON` | PB5 当前按下 |
+| 2 | `APP_LP_BLOCK_TEST` | 自检未完成或失败 |
+| 3 | `APP_LP_BLOCK_STATE` | 状态机不是 NORM |
+| 4 | `APP_LP_BLOCK_BQ` | BQ 不 fresh、ADC 恢复中或恢复已失败 |
+| 5 | `APP_LP_BLOCK_TIMEBASE` | `PowerMode_LpTimebaseReady()==0`（RTC 源/就绪不匹配） |
+| 6 | `APP_LP_BLOCK_POWER` | `PowerMode_GetState()!=POWER_STATE_NORM` |
+| 7 | `APP_LP_BLOCK_POLICY` | CHARGE/DISCHARGE/CAL 或 CAL pending |
 
-**已修复的边界问题**：`HAL_RCC_ClockConfig()` 可能已经把 `RCC_CFGR.SW` 切到 PLL，之后才因等待 SWS 超时返回 `HAL_TIMEOUT`，此时 HAL 还没更新 `SystemCoreClock`/SysTick。`PowerMode_ClkSwitchToHsePll()` 每次失败重试前和最终降级前调用 `PowerMode_ClkForceHsi16()`：强制 SYSCLK 回 HSI16、Scale2、`SystemCoreClock=16 MHz`、`HAL_InitTick()`，保证后续 `HAL_Delay`/降级灯闪烁/串口超时不会按错误 tick 运行。
+`s_power.lp_disable_auto=1`（IWDG 故障复位或调试器写入）会让 `PowerMode_RequestLp()` 直接拒绝；调试器仍可直接写 `s_power.request_lp=1`，但入口仍受时基门控。
 
-**WFI 规则**：STOP1 返回后到 `HAL_InitTick()` 之间不得调用 `HAL_Delay`、Flash 编程或依赖 `HAL_GetTick` 的 HAL；本工程只写 stage33/14 备份寄存器，随后立即 `SystemCoreClock=16 MHz` + `HAL_InitTick`。
+`PowerMode_Loop()` 消费 `request_lp` 并调用 `LpCycle_RequestStart()`：
 
-## 5. LP 保持态
+1. `PowerMode_LpTimebaseReady()==0` → 保持 NORM，下一轮再试；
+2. 等 `BQ_IsIdle()` 且 I2C1 不 BUSY，最多 100 ms（每 1 ms 喂 IWDG）；
+3. `RtcTime_Read()` 取 epoch；
+4. `LpSession_Load()`：无效/IDLE/FAULT 时清空会话，设 `next_mark_epoch = now + 1800 s`、LSI 初值 32 kHz、`last_pr=6`、`last_rlr=4095`、boot overhead 初值 300 ms；有效会话则保留 mark 并推进到未来；
+5. 关闭遗留 RTC WUT（旧固件可能留下，会写 BKP6 破坏会话）；
+6. `s_lp.seq++`、`LpSession_Save()` 写 BKP1..10，喂狗，`__DSB()`，`NVIC_SystemReset()`。
 
-- **运行中**：只有 LSE 32.768 kHz + RTC（WUT 2 s 嗅探；充电/按键/ALERT 才回 NORM；30 min 到点在 HSI16 内监测后继续睡）；PA8 EXTI 事件与 PB5 EXTI 中断作为唤醒源；SRAM 全部内容保持（`s_power`/`s_app`/`s_bq` 等可调试）。STOP1 中 SYSCLK 停。
-- **M2b-1 充电判定**：`LOAD_PRESENT=1` 且 `SYS_CTRL2.CHG_ON=0` 才有效。嗅探结束后临时 `PA1=0`、`HAL_COMP_Start`、等 30 ms、读 COMP2、`HAL_COMP_Stop`、`PA1=1`；COMP2 高置 `s_power.lp_charger_pending`，COMP2 低只增加 `load_reject_count` 并继续睡。检查耗时约 60 ms/次，仅 `LOAD_PRESENT=1` 时发生。
-- **PB5 唤醒可靠性**：PB5 的 `GPIO_MODE_IT_FALLING`、`GPIO_PULLUP` 和 EXTI9_5 NVIC 由 `.ioc` → `MX_GPIO_Init` 一次性配置，App 不再重复覆写。LP 循环每次进 STOP1 前同时检查 `EXTI->PR1` 的 PIF5、`s_power.flag_button` 和 PB5 电平，醒来后再检查三者；循环中只清 PA8 的 PIF8，**不再无条件清 PIF5**，避免按键下降沿正好落在嗅探/Flash 窗口时被软件丢掉。**`PowerMode_EnterLp()` 不再无条件清 `s_power.flag_button`**：`flag_button_ms` 记录 ISR 置位时刻，进入 LP 时只清 **2 s 以前**的旧标志（NORM 手势残留）；请求之后到真正 STOP1 之间（BQ 准备/黑匣子/停外设约几百 ms）的新按键必须保留，否则 ISR 已清 PIF5 时会丢掉这次唤醒，表现为“有时按键唤不醒”。
-- **LP 按键/进入阶段 Flash 诊断**：每次 LP 中检测到一次按键尝试（PIF5/flag_button/PB5 低），写一条 `BB_EVENT_LP_DIAG`（0x14）黑匣子记录；在进入 STOP1 前、STOP1 醒来后和嗅探循环顶部都会检查，因此按键唤醒直接退出 LP 时也会先写记录。**LP 进入过程**每次 LP 进入按阶段写诊断（每个 stage 只写一条，避免重复磨 Flash）：stage=0（进入前 RTC/LSE 现场）、4（即将布防 WUT）、40（WUT 布防成功）、41（WUT 布防失败，flags=HAL 返回码 1/2/3）、5（外设已停）、10（HSE 已关）、11（PB0 已拉低）、12（已进入 LP 循环）、13（首次进入循环体、按键检查之前）、30（首次 WFI 前，记录 RTC CR/ISR 和 WUT 通路）、31（即将 HAL_SuspendTick/WFI；flags bit0=debugger_attached、bit1=lp_keep_swd）、32（已挂起 SysTick，即将 WFI）、33（WFI 已返回）、34（SysTick/HAL tick 已恢复）、14（首次从 STOP1 醒来）；第一条 WUT 嗅探完成也写一条。**上电时另写一条 stage=60**：flags bit0=LSERDY、bit1=LSEON、bit2=RTCSEL=LSE、bit3=RTCEN、bit4=hrtc READY、bit5=WUTE、bit6=WUTIE、bit7=WUTF；`cc_raw` 低 16 位 = RTC_BKP0R[15:0]（低字节=上一次 LP 最后 stage，次低字节=该 stage flags；高 16 位为 0 是扩展示意），`ts1_raw` 低 16 位 = RTC_BKP1R[15:0]（`0x000E` = RTC_WKUP 向量入口、`0x000F` = HAL callback、`0` = 本次 LP 的 WUT 中断没有进入 CPU/NVIC），`cell3` 是 RTC_ISR 低 16 位。**另写一条 stage=61**：`cc_raw`=BKP2R[15:0]（RTC_WKUP 向量进入次数）、`ts1_raw`=BKP3R[15:0]（HAL callback 次数）、`cell3`=ResetCause_GetLatched()；写入成功后清零 BKP2R/BKP3R，供下一次上电重新累计。`PowerMode_EnterLp()` 进入时先清 BKP1R，stage12/13/30/14/31/32/33/34 同时把最后 stage 写入 RTC_BKP0R，`RTC_WKUP_IRQHandler` 入口写 BKP1R=0xA5A5000E 并累加 BKP2R，WUT callback 再写 0xA5A5000F 并累加 BKP3R；因此即使 stage14 的 Flash 写入失败，复位后的 stage60/61 仍能看到 CPU 是否真的执行过 STOP1 醒来点、WUT 中断是否进入、callback 是否执行。**BKP2R>0 而 BKP3R=0** 表示向量已进入但 HAL 因 WUTF=0 跳过 callback（优先查 PR20/WUTF 清除顺序）；**BKP2R=0** 表示中断从未到达 CPU/NVIC（查 WUTE/WUTIE、EXTI20、NVIC、WUT 周期、复位是否早于首个 tick）。**另写 stage=62**：`cc_raw=BKP13R`（PB5 ISR 次数）、`ts1_raw=BKP14R`（按钮完整唤醒次数）、`cell3=BKP15R`（最后一次 LP 进入前 PB5 通路 flags）；**不清零** BKP13R/14R/15R，NRST 后 Ozone 可直接读（本电源周期累计）。**另写 stage=63**：`cell1=BKP16R[15:0]`、`cc_raw=BKP16R[31:16]`，保存最后一次 PB5 ISR 的上下文；整机断电会丢备份寄存器，但 stage62/63 Flash 记录保留上一次 boot 读到的值。**另写 stage=64**：`cc_raw=BKP17R[15:0]`（累计进入 LP 次数）、`ts1_raw=BKP18R[15:0]`（最后一次 WUT 布防的 HAL 状态：低 8 位 0=OK/1=ERROR/2=BUSY/3=TIMEOUT，bit8=guard 重布防）。LP 进入时先清 stale WUT（WUTE/WUTIE、WUTF、EXTI20、NVIC），arm 失败重试一次；重试结果写入 BKP18R。**另写 stage=65**：`cell1=BKP19R[15:0]`、`cc_raw=BKP19R[31:16]`（最近一次 LP 进入前的 BQ/ALERT 现场，布局见步骤 2b）。**BKP19R** 在每次 LP 准备完成、检查 PA8/SYS_STAT 时更新；**PA8 实际为高**时本次 LP 取消（`s_power.lp_alert_abort_count++`），因此“ADC 异常后没有 PB4 心跳”可先用 BKP19R 区分：bit0=1 → BQ ALERT 仍为高，LP 被步骤 2b 主动取消；若 bit0=0 但 bit15..8 有 OV/UV 等锁存，则记录的是保护状态，LP 未被这一项阻止（由状态机/故障处理决定）；BKP19R 全 0/标记不是 0xA5 → 还没走到这次 LP 进入检查（见 `s_app.auto_lp_block`）。**另写 stage=66**：`cell1=BKP20R[15:0]`、`cc_raw=BKP20R[31:16]`；BKP20R 在 `BQ_PrepareForLpMask()` 返回非 0 时更新（bit31..24=0xA6，bit19..16=BQ 状态，bit22=recovering，bit21=adc_recovery_failed，bit20=fresh，bit15..8=prep）。若 BKP20R 标记为 0xA6 且 prep=-2（0xFE），说明 LP 请求撞上 ADC 恢复回合而被取消，BKP19 不会变化，需等下一次 5 s 自动 LP。prep=-2 时**不立即写 Flash**（BQ 恢复回合中的指令取指停顿会拉长 I2C/DMA 事务），只更新 BKP20R；下一次 boot 的 stage66 再把它写入黑匣子。BKP16R 布局：bit31..24=0xA5，bit23..16=`s_power.state`，bit15..8=`lp_stage`，bit0=PB5 低。若复位后最后一条是某个 stage，就表示 LP 进入卡在该阶段之后/之前。24 B 记录复用字段：`cell1=WUT count[15:0]`、`cell2=button IRQ count[15:0]`、`cell3=LP loop count[15:0]`、`pack=stage | flags<<8`、`cc=WUT count[31:16]`、`ts1=button IRQ count[31:16]`。按键/stage12/stage13/stage14/WUT 诊断 flags（PB5 通路）：bit0=EXTI IMR5、bit1=FTSR5 下降沿、bit2=PB5 内部上拉、bit3=SYSCFG EXTICR5 已路由到 PB5、bit4=PB5 当前低、bit5=PIF5 pending、bit6=EXTI9_5 NVIC 使能、bit7=flag_button。stage=0 flags：bit0=lse_ok、bit1=hrtc READY、bit2=LSERDY、bit3=FAULT_LSE、bit4=RTCSEL=LSE、bit5=hrtc.Lock、bit6..7=hrtc.State。stage=30 flags（WUT 通路）：bit0=WUTE、bit1=WUTIE、bit2=WUTF、bit3=LSERDY、bit4=EXTI line20 IMR、bit5=EXTI line20 RTSR、bit6=RTC_WKUP NVIC 使能、bit7=EXTI line20 pending；该记录字段：`cell1=RTC_CR[15:0]`、`cc=RTC_WUTR[15:0]`、`cell2=RTC_ISR[15:0]`、`ts1=PowerMode_LpRtcAux`、`cell3=RTC_PRER[15:0]`。`aux` bit0..2=RTC_CR.WUCKSEL、bit3=WUTWF、bit4=LSEON、bit5=RTCSEL=LSE、bit6=RTCEN、bit7=LSERDY。`s_bb_shadow` 保留最近 **12** 条，掉电/复位后可直接展开；`s_bb_shadow.diag_*` 仍是 RAM 实时副本（`diag_lp_loop_count/wut_count/button_irq_count/last_stage/pb5_level/exti_imr/exti_pending/last_wake_cause`），但复位/掉电会清零。内部上拉约 40 kΩ，必要时外加 10 kΩ 到 3.3 V。
-- **NORM→LP 进入窗口**：自动 LP 请求后，drain ≤100 ms → `BQ_PrepareForLpMask` 固定 300 ms（含 I2C/回读）→ LP_ENTER Flash 记录（约 1 ms，跨页擦除最坏约 25 ms）→ 布防 WUT → `PowerMode_StopPeripherals()` 灭灯 → HSI16/PLL off/HSE off/PB0 low → 第一次 WFI。**灭灯通常发生在请求后约 300–330 ms；从灭灯到真正 STOP1 约几 ms；总计约 310–350 ms，Flash 擦页/HSE 等待时最坏约 450 ms。** 在这段时间按 PB5：
-  - drain 后、BQ 准备前检测到按键：`PowerMode_LpAbortForButton(0)` 直接取消 LP，BQ/5 V/灯都不动；
-  - 300 ms BQ 准备期间按下：准备完成后检测到，`PowerMode_LpAbortForButton(1)` 恢复 BQ ADC/FET 配置（约 1 s）并留在 NORM，5 V/灯不会先灭；
-  - 之后到 WFI 前（Flash/WUT/停外设/时钟切换，约几 ms）：pre-STOP1 guard 捕获，完整唤醒，5 V/灯可能短暂灭一下；
-  - WFI 之后：PB5 EXTI 直接唤醒。
-  - 按键请求会合成进 Button 队列（`Button_OnWake`），不会因 ISR 已清 PIF5 而丢失手势。连续按间隔 <5 s 时设备仍在 NORM，自动 LP 计时被重置，这是“按了没反应”的常见原因，不是次数阈值。
-- **PB5 按键没有次数阈值**：`s_power.button_irq_count`、`s_bb_shadow.diag_button_irq_count`、BKP13R 都只是累计计数，没有“按 N 次后禁用”的逻辑；Button 队列 8、Gesture 三连击/长按也不会关闭 EXTI。实际影响唤醒的是状态/时序：
-  - 按键按下期间 `Button_IsPressed()!=0` 会阻止自动 LP；
-  - 每次按键活动都会重置 5 s 空闲计时，连续按（间隔 <5 s）时设备仍处于 NORM，不会重新进 LP，此时再按 PB5 当然不会“唤醒”；
-  - `PowerMode_EnterLp()` 会保留 2 s 内的 `flag_button`，pre-STOP1 guard 会把它当成一次立即唤醒请求；
-  - CHARGE/DISCHARGE/CAL 策略状态会阻止自动 LP；
-  - 若设备已经在 NORM，按 PB5 只产生按键/手势事件，不会产生 `PowerMode` 完整唤醒。
-- **PB5 诊断（跨复位）**：
-  - `BKP13R[15:0]`：PB5 EXTI ISR 进入次数；
-  - `BKP14R[15:0]`：按钮完整唤醒次数；
-  - `BKP15R[7:0]`：最后一次进 STOP1 前的 PB5 通路 flags（bit0=IMR5、bit1=FTSR5、bit2=内部上拉、bit3=SYSCFG 路由、bit4=PB5 低、bit5=PIF5、bit6=EXTI9_5 NVIC、bit7=flag_button）；
-  - `BKP16R`：最后一次 PB5 ISR 的上下文：bit31..24=0xA5 标志，bit23..16=`s_power.state`，bit15..8=`lp_stage`，bit0=ISR 时 PB5 电平低。BKP13R/14R/15R/16R 在复位后不清零，Ozone 可直接读；整机断电（无 VBAT）会丢失，stage62 Flash 记录保留上一次 boot 时的值。
-  - 进入 STOP1 前 `PowerMode_LpEnsureButtonPath()` 会核对 IMR5/FTSR5/上拉/SYSCFG/NVIC；异常时重配 PB5，并在 PIF5/flag 都为空且 PB5 高时清 stale EXTI9_5 NVIC pending；BKP15R 保留修复前的 flags。
-- **引脚**：PA1=1（OSC1 tri-state、PACK_SC 前端关——SC 节点被 330 kΩ 拉至 ~3.3 V）；PB0=0（5 V 关，TJA1044/RGB/蜂鸣器/U18 全部断电）；PB1=0；PB3=0（灭）；PB4 平时低，每次 WUT 嗅探由 `power_mode.c` 打 `s_power.lp_sniff_led_ms`（默认 50 ms）高脉冲（LED2 在 3V3 域，5 V 关仍可见）；PA7=0（Q8 关断）；PA2 空闲低、PB6 空闲高、SDA/SCL 空闲高（外设已 DeInit，引脚保持 AF 配置）；PA3/PA4 约 3.3 V（COMP 停，无意义）。PB4 心跳含义：**闪 = WUT/嗅探在跑；常灭 = 没有 WUT 唤醒或已不在 LP；常亮 = NORM 或嗅探卡死**。50 ms/2 s 的 LED 平均电流约 62 µA；生产测电流把 `lp_sniff_led_ms` 写 0。
-- **BQ76920**：仍由电池供电，处于 NORMAL：SYS_CTRL1=0x00（**ADC 与 TS1/NTC 偏置关闭**）、CC 关、FET 按 `s_power.lp_fet_mask`（默认 **0x00 双管全关**；调成 0x03 可保持导通）。**电压/电流/温度检测仅在 NORM 运行**；LP 期间 OV/UV 保护随 ADC 停用，但 SCD/OCD 比较器不可关、仍然有效——短路/过流仍会拉高 ALERT → 唤醒 MCU（唤醒后读 SYS_STAT 消化，配置序列恢复 SYS_CTRL1=0x18）。
-- **SWD**：`POWER_LP_KEEP_SWD=0` 构建（默认）在每次进 LP 前读取 `CoreDebug->DHCSR.C_DEBUGEN`：没有调试器时清 `DBGMCU_CR_DBG_STOP`（最低功耗）；连接调试器时自动保留 `DBG_STOP`，避免部分调试器在 STOP1 失去同步后把 CPU 保持在 halt/重复连接状态。台架测电流必须物理断开 SWD。`make POWER_LP_KEEP_SWD=1` 构建允许运行期字段选择保持调试时钟。完整唤醒后仅当字段为 0 时清 `DBGMCU_CR_DBG_STOP`。
-- **电流预算（待上板实测）**：MCU STOP1 + LSE/RTC ~4.4–5.3 µA（典型，DS11451）+ BQ NORMAL ADC/CC 均关 **40 µA 典型 / 60 µA 最大**（SLUSBK2I）+ 板级静态（PACK_SC 分压、上拉等）。相比改动前（ADC 开 = 60 µA 典型），LP 电流约降低 20 µA，且不再随 NTC 温度变化。
-- **uptime 语义**：250 Hz tick 已停 → LP 时长不计入 `uptime_s`（黑匣子文档已注明）。
+这个函数**不直接关 5 V**；复位后的新 boot 在生成初始化完成后由 `App_Boot()` 先把 PA1 拉高、5 V 关，再判 LP。这样避免在 NORM 中提前断电导致 HSE/BQ 半状态。
 
-## 6. LP → NORM 唤醒序列（PowerMode_EnterLp 的后半段）
+## 5. 轻量 LP boot 与 STOP1
 
-**唤醒原因判定**（进入前清 stale 挂起；WUTF=1 的有效 WUT 会保留到第一次 WFI）：
+### 5.1 App_Boot() 分流
 
+`main()`：`HAL_Init()` → `SystemClock_Config()`（HSI16，不等 LSE）→ 各 `MX_*_Init()` → `MX_IWDG_Init()`（USER CODE 调 `Watchdog_Init()`，/256 ≈32.8 s boot guard）→ `App_Boot()`。
 
-| 原因                 | 判据                                                                                                              | 计数                                                |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| RTC 2 s 嗅探         | `flag_rtc`（WUT IRQ 只置位，**不清 WUTIE**）；每个 tick 执行 `s_lp_sniff`，WUT 自动重装；不单独因计数完整唤醒     | `wake_rtc_count`                                    |
-| 充电器插入           | `LOAD_PRESENT=1` + LP 内 COMP2 复核为高 → `lp_charger_pending`                                                   | `wake_charger_count`                                |
-| 30 min 储存监测      | 900 个 2 s tick 后在 LP/HSI16 内采 BQ 并写黑匣子；成功不唤醒，失败才完整唤醒                                     | `s_lp_sniff.monitor_*`；失败时 `wake_monitor_count` |
-| PB5 按键按下         | `flag_button`（EXTI5 下降沿）                                                                                     | `wake_button_count`                                 |
-| BQ ALERT（PA8 事件） | `PR1.PIF8` 挂起，**或** PA8 引脚电平为高（事件模式无挂起位；进 STOP1 前已为高则读电平） | `wake_alert_count`                                  |
-| 未知唤醒             | WFI 返回但 RTC/按键/PA8 标志都没有；不再归因为 BQ ALERT，完整唤醒并写 stage35（PR1/ISR/unknown 计数） | `s_power.wake_unknown_count`；stage35 |
+`App_Boot()`：
 
-**恢复步骤**（`state=WAKING`）：
+1. `ResetCause_Init()` 锁存复位原因并消费 `RMVF`；
+2. PA1 高、PB0 低（关 PACK_SC/HSE 前端和 5 V）；
+3. `RtcTime_Init()`：按 `LP_RTC_USE_LSE` 选择 RTC 源，修复/校验 RTCEN，必要时播种 2001-01-01；
+4. `LpCycle_ClassifyBoot()`；
+5. `LP_BOOT_START`/`LP_BOOT_RESUME` → `LpCycle_Run(boot)`，正常不返回；
+6. 其它 → `App_Init()`；`LP_BOOT_FAULT` 在完整 boot 后再 `PowerMode_ForceDisableAutoLp()` + 会话失效。
 
-1. 读标志/挂起 → 组成 `wake_cause` → 清 PR1、清标志、`wake_count++`。
-2. `SystemCoreClock=16 MHz` + `HAL_InitTick(TICK_INT_PRIORITY)`——每次嗅探/完整唤醒都在 HSI16 下把 SysTick 修成 1 ms。
-3. 撤 RTC WUT：`HAL_RTCEx_DeactivateWakeUpTimer` + 清 WUTF + 清 EXTI PR20 + 关 RTC_WKUP NVIC。
-4. **先置 PB0=1、PB3 故障灯亮**，再重切 HSE/PLL 80 MHz：`PowerMode_ClkSwitchToHsePll()`（内部先 PA1=0 再 30 ms 起振余量；HSEON=0 → HSEBYP 可写）。失败 → 保持 5 V、stage18 备份标记、DEGRADED，由 degraded loop 闪 PB3；不恢复 BQ/WS2812/FET。
-5. 成功后再执行现有 PB0=1 + `HAL_Delay(2)`（5 V 软启动，冗余但无害）。
-6. 外设重建（顺序敏感）：`App_Log_ReInit` → `BQ_ReInitAfterLp`（HwInit + 重跑完整配置脚本，进入 `BQ_ST_SETTLE` 等 300 ms 后首帧才有效）→ `Ws2812_ReInit`（**重设 USART2SEL=PCLK1、BaudRate=3809523、UE=0 写 BRR=21**）→ `Buzzer_ReInit` → `HAL_COMP_Start` → `Fault_PvdEnable` → `App_TickStart`。
-7. 黑匣子 `BB_KIND_WAKE` 记录（含唤醒原因）→ `request_lp=0` → `state=NORM`，回到常态循环。
+### 5.2 LpCycle_Run() 顺序
 
-## 7. 调试要点
+1. 会话必须已加载、`PowerMode_LpTimebaseReady()` 必须为 1、RTC 可读，否则 `LpCycle_ForceFullWake(LP_WAKE_FAULT)`；
+2. `LP_BOOT_RESUME` 先跑 `LpCycle_Calibrate()`；连续 2 次间隔异常 → 完整唤醒（`LP_WAKE_FAULT`）；
+3. 会话置 `PREP`、清 FULL_WAKE/FAULT 标志并保存；
+4. `PowerMode_LpDbgStopApply()` 按编译期 `POWER_LP_KEEP_SWD` 设置 `DBGMCU_CR.DBG_STOP`；
+5. 5 V 关、PB3/PB4 灭、PA1 高、COMP2 停；DeInit USART1/USART2/CAN/DAC/TIM1/TIM2，停 LPTIM1；`Button_WakeInit()` 独占配置 PB5 EXTI5；
+6. 关闭遗留 WUT；PB5 已按下 → 直接完整唤醒；
+7. `LP_SMBA_WAKE_TEST=1` 时，若上一轮 SMBA 测试仍无结果则判失败；否则本轮置 `pb5_mode=1` 并在 BQ sniff 后启用 SMBA；
+8. BQ sniff：`BQ_LpSniffInit()` + `BQ_LpBootPrepare()`，失败重试一次；仍失败 → 完整唤醒（FAULT）；
+9. 若 `LOAD_PRESENT=1 && CHG_ON=0`，做充电器电平检查：PA1 短暂拉低 → `HAL_COMP_Start` → 30 ms → 读 COMP2 → Stop → PA1 高；高 = 充电器 → `LP_WAKE_CHARGER`；
+10. PA8 仍高 → `LP_WAKE_ALERT`；
+11. PB4 打 `LP_HEARTBEAT_MS=10 ms` 高脉冲（存活心跳；改 0 可省电）；
+12. 在 30 min 监测之前测 boot overhead；
+13. 若 `next_mark_epoch==0` 则设 `now+1800 s`；剩余时间 ≤`LP_MARK_TOLERANCE_MS=1000 ms` 或已过点 → `LpCycle_DoMark()`；
+14. 重读 RTC，计算 `target_ms`：若剩余 ≤30 s + overhead，则睡到 mark 前（`remaining - overhead`）；否则基础 30 s；再减 overhead，最小 `LP_MIN_SLEEP_MS=1 s`；
+15. `LpCycle_EnterStop(target_ms)`。
 
-- **进 LP**：正常由 `main_app` 在 5 s 空闲后调用 `PowerMode_RequestLp()`；调试器也可写 `s_power.request_lp = 1`，主循环下一圈消费。唤醒后 `request_lp` 已清零，想再进再写。
-- **观测字段**：`s_power.state / lp_stage / hse_off_timeout / lp_fet_mask / lp_monitor_ticks / lp_disable_auto / lp_enter_count / wake_count / wake_rtc_count / wake_button_count / wake_alert_count / wake_charger_count / wake_monitor_count / wake_unknown_count / button_irq_count / wake_cause / clock_fail_count / lp_prepare_fail_count / lp_alert_abort_count / wake_clock_fail_count / lse_ok / lse_lost_count / lse_recover_count / lse_healthy_since_ms`；`s_app.tick_250hz_count / uptime_s / loop_count / gesture_count / last_gesture / last_activity_ms / auto_lp_request_count / auto_lp_block`；`s_bq.state / voltage_settled / frame_valid / reject_reason / pack_residual_mv / raw_vc3 / raw_vc4 / frame_ok_count / frame_reject_count / reject_unsettled_count / reject_cell_count / reject_pack_count / reject_sum_count / last_reject_cell_mv[3] / last_reject_pack_mv / cc_raw / current_ma / request_fet_mask / fet_mask_applied`；`s_power.diag_self_test_fail / diag_self_test_passed / diag_blackbox_error / debugger_attached / lp_dbg_stop_active`；`StateStore_GetView()` 返回最近一次持久化视图；M3 起每 30 min NORM 存档由 `SocEst_CommitStateStore()` 提交。`s_soc_est.frame_valid / temp_valid / cal_valid / soc01 / soh01 / temp_dc / cell_mv[3] / pack_mv / current_ma / update_count / nvm_save_count / state_commit_count`；`[SOC]` 日志。**2 s 嗅探诊断**：`s_lp_sniff.total_count / ok_count / fail_count / init_fail_count / last_ms / last_ok / last_error / last_sys_ctrl1 / last_sys_stat / last_sys_ctrl2 / cc_ready_clear_count / cc_ready_clear_fail_count / last_load_present / load_present_count / charger_check_count / charger_detect_count / load_reject_count / charger_check_error_count / last_charger_level`；**30 min 监测诊断**：`monitor_count / monitor_ok_count / monitor_fail_count / monitor_archive_fail_count / monitor_last_error / monitor_last_cell_mv[3] / monitor_last_pack_mv / monitor_last_ts1_raw / monitor_last_cc_raw`。LP 中 CPU 在 WFI，live watch 不会刷新；要观察嗅探/监测，在 `PowerMode_LpSniffOnce()` 或 `PowerMode_LpStorageMonitorOnce()` 打断点，或先读 NORM 下的 `lp_dbg_stop_active`/计数器。
-- **`s_power.lp_stage` 阶段码**：0=进入前的 RTC/LSE 诊断已写，1=drain，2=BQ 准备完，3=黑匣子记录完，4=WUT 布防完，5=外设停止完，6=HSI16 就绪，7=SYSCLK 切到 HSI16，8=Scale2，9=PLL 关闭，10=HSE 关闭（限时等待 HSERDY，不再无限阻塞），11=PB0 拉低，12=进入 LP 循环，13=即将 STOP1，14=从 STOP1 唤醒，15=一次嗅探完成，16=完整唤醒，17=30 min HSI16 储存监测中，18=唤醒后 HSE/PLL 恢复失败（5 V/PB3 可见降级）。卡死时该值停留在最后完成的阶段；若 `hse_off_timeout=1`，说明 HSERDY 在限时内未落但仍继续进 LP。Flash 阶段诊断另用 stage=0/4/40/41/5/10/11/12/30/31/32/33/34/35/60..66，见上节。**stage65=LP 被 PA8/BQ ALERT 取消**（步骤 2b；PA8 实际为高），不是 WUT 失败；先看 BKP19R 的 PA8/SYS_STAT。**stage66=BQ_PrepareForLpMask 失败**（ADC 恢复回合等，下一次 boot 记录 BKP20R），本次 LP 根本没进入，先看 BKP20R 的 prep/BQ 状态，不能按“WUT/心跳故障”排查。
-- **电流/MOS 控制**：`[DIAG]` 的 `CC=` 为原始 CC，`I=` 为 `cc_raw×844/150`（mA，带符号，250 ms 平均）。FET 请求现在由 `ChargePolicy_Task()` 唯一驱动；不要直接写 `s_bq.request_fet_mask`（下一圈会被策略覆盖）。台架强制 FET 用 `s_policy.cal_fet_mask` + `s_policy.cal_mode=1`；正常策略下 IDLE=0、CHARGE/DISCHARGE=0x03。下一轮 500 ms run script 完成后同步 `SYS_CTRL2=0x40|mask`，`fet_mask_applied` 随之更新。LP 使用 `s_power.lp_fet_mask`（默认 0x00）；BQ 硬件保护（OV/UV/SCD/OCD）可能覆盖手动写。
-- **LP 电流测量**：默认 `POWER_LP_KEEP_SWD=0` 不保持调试口；测 µA 时保持 `s_power.lp_keep_swd=0` 并断开调试器。自动 LP 流程 = 复位 → 自检通过后 5 s → 观察 5 V/HSE 关断 → µA 表读数 → 插充电器/PB5 唤醒；30 min 到点在 LP 内监测，不产生 5 V/HSE 唤醒。若接了负载，`LOAD_PRESENT=1` 会每秒做一次 60 ms COMP2 复核，平均电流会高于空载。
-- **黑匣子核对**：普通进/出 LP 各有一条转换记录；充电唤醒额外一条 `BB_EVENT_WAKE_CHARGER`；30 min 监测在 LP 内直接写一条周期快照，成功不唤醒，1020 条覆盖 ≥15 天。LP 期间 uptime 不增加（TIM2 停），监测记录的 uptime 是进入 LP 前的值，可靠排序仍用 seq。
-- **RAM 影子（LP 救急诊断）**：`BlackBox_Init()` 上电时从 Flash 头记录向前加载最近 12 条到 `s_bb_shadow.rec[0..11]`（[0] 最新），每次成功写黑匣子时同步前插；`BlackBox_GetShadowCount()` / `BlackBox_ReadShadow(index,&rec)` 可读。LP 中调试器连不上时，复位后在 NORM 直接展开 `s_bb_shadow`：若最新一条是 `BB_KIND_LP_ENTER` 且之后没有 `BB_KIND_WAKE`，说明进入 LP 后没有发生唤醒；若出现 WAKE 但系统仍异常，则问题在完整唤醒路径。影子本身在普通 RAM，掉电丢失，但每次上电会从 Flash 重新加载。
-- **RGB/USART2 核对**：冷启动和 LP 唤醒后都应满足 `USART2->BRR == 21`、`RCC->CCIPR & RCC_CCIPR_USART2SEL == PCLK1`、`USART2->CR1 & UE == 1`；若 BRR 不是 21，说明 `Ws2812_HwInit` 的时钟/波特率重配没有执行或写 BRR 时 UE 仍为 1。
-- LP 中是否保持调试口由 `POWER_LP_KEEP_SWD` 构建开关决定（默认 0）：0 构建在未连接调试器时清 `DBGMCU_CR_DBG_STOP`（LP 电流最低）；检测到 `C_DEBUGEN=1` 时自动保留调试时钟，供 Ozone 台架观察，代价是 LP 电流升高。1 构建允许运行期 `s_power.lp_keep_swd` 手动选择。按键/LP 唤醒台架测试建议同时记录 `s_power.debugger_attached`：若为 1，先确认是否调试器 halt 造成假故障；测 LP 电流时断开 SWD。若想看按键唤醒后的 NORM 变量，在 NORM 下先写 `s_power.lp_disable_auto = 1`，这样唤醒后不会再被 5 s 自动 LP 吞掉。完整唤醒后仅在字段为 0 时清 `DBGMCU_CR_DBG_STOP`。
+### 5.3 LpCycle_EnterStop()
 
-## 8. M2b-2：30 min HSI16 储存监测（已实现）
+- `Watchdog_SetTimeoutMs(target_ms, lsi_hz, NULL)` 从校准后的 LSI 频率选最小分频并写 IWDG PR/RLR；
+- 读 RTC；最后检查 PB5/PA8，已发生则完整唤醒，不带着唤醒请求进 STOP；
+- 保存 `last_pr`、`last_rlr`、`last_arm_epoch/ms`，状态置 `STOPPED` 并写 BKP；
+- 保持 PWR/RTCAPB 的 APB 与 Sleep 时钟；GPIOA/GPIOB/SYSCFG Sleep 时钟保持（退出后要读 PB5/PA8）；SMBA 测试时额外保持 I2C1；
+- `HAL_SuspendTick()`、清 PendST；`RCC_CFGR.STOPWUCK=1`（退出到 HSI16）、`PWR_CR1.LPMS=STOP1`、`SCB.SCR.SLEEPDEEP=1`、`__DSB()`、`__WFI()`。
 
-每 900 个 2 s tick 执行一次，**不退出 LP、不开 5 V/HSE**：
+正常路径是 IWDG 超时**复位**：CPU 不执行 WFI 之后的代码，直接进入下一次 `App_Boot()`。若 PB5/ALERT 先把 CPU 唤醒，则 WFI 之后恢复 `SystemCoreClock=16 MHz`/`HAL_InitTick()`、喂狗，再检查 PB5/PA8：确认按键 → `LP_WAKE_BUTTON`，确认 ALERT → `LP_WAKE_ALERT`；其余未知唤醒 → `LP_WAKE_FAULT`。所有真实唤醒都是 `LpCycle_ForceFullWake()`：写 `PAUSED + FULL_WAKE` 令牌，软件复位到完整 `App_Init()`。
 
-1. `BQ_LpMonitorStart()`：临时写 `SYS_CTRL1=0x18`、`SYS_CTRL2=0x40|lp_fet_mask`，ADC/TEMP+CC 打开，FET 保持 LP mask；
-2. 等 300 ms 后 `BQ_LpMonitorRead()` 读三节/BAT/TS1/CC，按缓存的 ADC gain/offset 换算；
-3. `BQ_LpMonitorStop()` 用 `BQ_PrepareForLpMask()` 恢复 `SYS_CTRL1=0x00`、`SYS_CTRL2=lp_fet_mask`，等 300 ms 后清 CC_READY/XREADY；
-4. `BlackBox_WritePeriodicSnapshot()` 写一条 24 B 周期记录（不经过 NORM 的 BQ 快照）；
-5. 成功后 `total_count=0` 继续睡；任一步失败则 `POWER_WAKE_MONITOR` 完整唤醒，由 NORM 重配 BQ。
+## 6. LP → NORM：唤醒注入
 
-台架测试可先在 NORM 下把 `s_power.lp_monitor_ticks` 从默认 900 改成 10，再进 LP；不用等 30 min。改回 900（或复位）恢复正常周期。
+完整 boot 的 `App_Init()` 末尾调用 `LpCycle_ApplyWake()`：
 
-未做：LP 期间 uptime 不增加，黑匣子时间戳是进 LP 前的值，排序用 seq。
+- 读会话，无 FULL_WAKE 标志则直接返回；
+- `s_lp.wake_cause` 映射为 `POWER_WAKE_BUTTON/CHARGER/BQ_ALERT/MONITOR`，未知则回退 `POWER_WAKE_RTC`；
+- `PowerMode_NoteLpFullWake(cause)` 只更新 `s_power.wake_cause` 和 `wake_count`；
+- `Button_OnWake()`、`ChargePolicy_OnLpWake()`：按键唤醒回 IDLE，放电仍需 LP 短按后 2 s 内再 `PAIR_HOLD3`；充电唤醒由策略层等 BQ fresh 后进 CHARGE；
+- FAULT 唤醒强制 `PowerMode_ForceDisableAutoLp()`；
+- 非 MONITOR 唤醒写一条黑匣子 wake 记录（wake mask）；
+- 清 FULL_WAKE、状态置 PAUSED、`seq++` 保存。
 
-## 9. M3：SOC/SOH 适配（已接入，标定未完成）
+PB5 的 EXTI5 回调只置标志；`LpCycle_EnterStop()` 退出 WFI 后读取标志/引脚并决定唤醒原因。PA8 是 EXTI **事件**模式，不能唤醒 STOP1，只在每次轻量 boot 和进入 STOP 前按电平检查，最坏延迟一个 IWDG 周期。
 
-`App/detect/soc_est.c`：
+## 7. 30 min 监测与 LSI 校准
 
-1. `SocEst_Init()`：`BMS_CAL_Init()` → `SOH_Init()` → `BMS_NVM_Init()`（读回页 48/49 的学习结果）；
-2. 每个新的 BQ 快照（`last_update_ms` 变化，约 500 ms）：
-   - `v_mv = min(cell_mv[0..2])`，`i_ma = current_ma`；
-   - TS1 → 103AT 温度（`SOC_EST_TS1_PULL_MV/OHM`，默认 10 kΩ 上拉 3.3 V）；
-   - `BMS_CAL_Update(temp)` → `SOC_AhUpdate(v_mv, i_ma)` → `SOH_Update(v_mv, i_ma, temp)`；
-   - 坏帧（电芯 0/超范围、温度无效）不喂 SOC；温度无效时跳过 SOH，SOC 按 25°C 占位；
-3. `SocEst_Task()` 每圈跑 `BMS_NVM_Task()`，有学习结果时按 60 s 去抖写页 48/49；
-4. 30 min NORM 存档时 `SocEst_CommitStateStore()` 写页 50/51（保留其它 flags）；
-5. 进 LP 前 `SocEst_PrepareForLp()` 把未落盘 SOH 立即保存。
+### 7.1 30 min 点
 
-**标定限制**：`SOC_EST_CAL_VALID=0`；`bms_config.h` 的 OCV/R0/R1/tau 已换成 **三元锂（NMC）1500 mAh 典型占位值**（OCV 曲线沿用原库 NMC 3350 mAh 实测数据），不是本电芯实测表。`SocEst_IsValid()` 在标定完成前恒为 0，SOC 只供显示/记录，不能单独作为 5%/0% 硬保护依据。`SOC_EST_CURRENT_SIGN` 默认 +1（库约定放电为正）；若实测充/放方向相反改 -1。
+- `s_lp.next_mark_epoch` 跨复位保存在 BKP 会话中；新会话从 `now + 1800 s` 开始；
+- 每次轻量 boot 若剩余 ≤1 s 或已过点，调用 `LpCycle_DoMark()`：
+  1. `BQ_LpSniffInit()`；
+  2. `BQ_LpMonitorRun()`：临时开 ADC/TEMP+CC 采一轮电压/电流/温度，不改 FET；
+  3. `BQ_LpSniffDeInit()`，喂狗；
+  4. `BlackBox_Init()` 扫描头指针；
+  5. `BlackBox_WritePeriodicSnapshot(&snap, now.sec)` 写一条 24 B periodic 记录；
+  6. 喂狗，`next_mark_epoch += 1800` 直到大于当前 epoch，再读 RTC。
+- 任一步失败 → `LP_WAKE_MONITOR | LP_WAKE_FAULT` 完整唤醒，并禁止本 boot 自动 LP；监测/记录失败不会静默丢掉 30 min 点。
+- LP 内**不运行** SOC/SOH、`StateStore`、NORM 的 500 ms BQ 轮询或 ADC 恢复状态机；这些只在 NORM 运行。
 
-**观测**：`s_soc_est.frame_valid / temp_valid / cal_valid / soc01 / soh01 / temp_dc / cell_mv[3] / pack_mv / current_ma / update_count / nvm_save_count / state_commit_count`，以及 `[SOC]` 日志。TS1 在 25°C/10 kΩ 上拉时约 1.65 V；温度无效先查 TS1 上拉位置/阻值和 NTC。
+### 7.2 IWDG 校准
+
+`LpCycle_Calibrate()` 只在 `LP_BOOT_RESUME` 上运行：
+
+1. 用上一次的 `last_pr/last_rlr` 和当前 `lsi_hz_q16` 计算预期 timeout；
+2. 预期 <5 s 的短段跳过（RTC 秒级分辨率误差过大）；
+3. `elapsed = RtcTime_DiffMs(now, last_arm)`；必须落在预期的 75%..125%，否则 `anomaly_count++`；
+4. `span = elapsed - boot_overhead_ms`；`sample = IWDG_ticks / span`，只接受 26..34 kHz；
+5. `lsi_hz_q16` 做 7/8 旧值 + 1/8 新值的 EMA；
+6. `boot_overhead_ms` 在每次轻量 boot 的 sniff/心跳之后、30 min 监测之前用 RTC 差分测，并做 EMA；
+7. `anomaly_count >= 2` → 完整唤醒（`LP_WAKE_FAULT`），避免在时钟异常时盲睡。
+
+因此 30 min 点是“RTC 绝对时间目标 + 校准后的 IWDG 睡眠段”：IWDG 只负责把它叫醒，RTC 决定还差多少时间，下一次 IWDG timeout 按剩余时间缩短以踩准下一个 30 min 点。LSI 模式下 RTC 和 IWDG 同源，这套校准让相对周期自洽，但绝对时间仍会随 LSI 漂移。
+
+## 8. LSE / LSI 切换
+
+| 宏 | 默认 | 行为 |
+| --- | --- | --- |
+| `LP_RTC_USE_LSE` | `0` | RTC/MSP 时钟源走 LSI；不启动 LSE、不等 LSERDY、不置 LSE 故障；LP 正常 |
+| | `1` | `RtcTime_MspClockSource()` 有界启动 LSE；成功 → RTC=LSE，LP 正常；失败 → RTC 回退 LSI 保 boot，但 `PowerMode_LpTimebaseReady()` 失败，**LP 禁用**并置 `FAULT_LSE`/`FAULT_BIT_TIMEBASE`，NORM/5 V/BQ 继续 |
+| `LP_SMBA_WAKE_TEST` | `0` | PB5 只走 EXTI5（生产） |
+| | `1` | 仅台架：第一个 LP 周期用 I2C1_SMBA host alert，EXTI5 回退；记录 `pb5_mode`/`smba_result` 后自动恢复 EXTI5 |
+
+构建时可直接用 make 变量（`app.mk` 转发为 `-D`）：
+
+```sh
+make clean && make -j2 all                       # LSI + SMBA off（默认）
+make clean && make -j2 all LP_RTC_USE_LSE=1      # LSE 模式（等硬件修好再用）
+make clean && make -j2 all LP_SMBA_WAKE_TEST=1   # 台架 SMBA 实测
+```
+
+也可以直接改 `App/board.h` 的默认值；不指定 make 变量时以 board.h 为准，指定时命令行 `-D` 优先。两者不要给相反值。改宏后必须 `make clean`（否则目标文件不会重编）。RTCSEL 改变会触发一次 HAL 备份域复位：BKP 会话、日历和 HardFault 现场清空一次，之后保持。**不要**在运行中热切换 RTCSEL，也不要每 boot 切换，否则每次复位都会清会话。
+
+## 9. 调试要点
+
+- `s_power`：`state`、`request_lp`、`wake_cause`、`boot_reset_cause`、`lse_ok`、`degraded`、`wake_count`、`lp_disable_auto`；没有旧的 HSE/PLL 分阶段诊断、每类唤醒计数或运行期 SWD 覆盖字段。
+- `s_lp`（`lp_session.c` 私有）：`state`、`seq`、`next_mark_epoch`、`last_pr/last_rlr`、`last_arm_epoch/ms`、`lsi_hz_q16`、`boot_overhead_ms`、`anomaly_count`、`wake_cause`、`flags`、`pb5_mode`、`smba_result`。
+- `s_app.auto_lp_block`：自动 LP 未进入的原因位图（见 §4）。
+- LP 中 SWD 调试：默认 `POWER_LP_KEEP_SWD=0` 关 `DBG_STOP`，STOP1 下调试器会失去同步且可能本身改变唤醒行为；测 LP 电流必须物理断开 SWD。需要观察时用 `make clean && make -j2 all POWER_LP_KEEP_SWD=1`。
+- PB4：每次轻量 LP boot 闪 10 ms。看到约 30 s 周期短闪 = IWDG 周期在跑；完全不闪 = 没进 LP/复位后卡住；常亮 = NORM/降级。
+- 历史 CSV（`dbglog/*.csv`、`Ozone_Watched_Data_1_*.csv`）只记录当时的 watch 集，不代表当前字段；当前以 `s_power`/`s_lp`/`s_app.auto_lp_block` 为准。

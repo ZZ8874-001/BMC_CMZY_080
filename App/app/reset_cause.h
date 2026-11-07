@@ -15,11 +15,13 @@
 #define RESET_CAUSE_OTHER       (1u << 3)
 #define RESET_CAUSE_PIN         (1u << 4)
 #define RESET_CAUSE_BOR         (1u << 5)
+#define RESET_CAUSE_NMI         (1u << 6)
 
 void ResetCause_Init(void);
 uint8_t ResetCause_GetLatched(void);
 
 /* Cortex-M 异常处理程序调用：写备份寄存器后立即系统复位。 */
 void ResetCause_RecordHardFaultAndReset(void) __attribute__((noreturn));
+void ResetCause_RecordNmiAndReset(void) __attribute__((noreturn));
 
 #endif /* APP_RESET_CAUSE_H */

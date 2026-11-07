@@ -24,8 +24,10 @@
 
 #include "board.h"
 #include "app/faults.h"
+#include "bsp/button.h"
 
 #include <stddef.h>
+#include <string.h>
 
 
 /* ---------------- 寄存器地址/位定义见 bq_ic.h ---------------- */
@@ -80,14 +82,14 @@
 #define BQ_ADC_CONVERSION_MS             250u  /* BQ ADC 帧周期，采样最小间隔 */
 #define BQ_ADC_RESAMPLE_MS               300u  /* OOR 后重采样间隔（250 + 余量） */
 #define BQ_ADC_RESTART_OFF_HOLD_MS       300u
-#define BQ_ADC_RESTART_MAX_ATTEMPTS      4u
-#define BQ_ADC_VERDICT_MS                1500u /* 每轮重启后等待有效发布的窗口 */
-#define BQ_ADC_GOOD_FRAMES_CLEAR         5u    /* 连续有效发布帧数 → 清故障/额度 */
+#define BQ_ADC_RESTART_MAX_ATTEMPTS      2u
+#define BQ_ADC_VERDICT_MS                500u /* 每轮重启后等待有效发布的窗口 */
+#define BQ_ADC_GOOD_FRAMES_CLEAR         4u    /* 连续有效发布帧数 → 清故障/额度 */
 #define BQ_FRAME_CONFIRM_RAW_LSB         4u    /* 首次发布：每寄存器 ±4 raw LSB */
 #define BQ_STRICT_MAX_MISMATCHES         3u    /* 连续不严格一致后回退粗确认 */
 #define BQ_FRAME_CONFIRM_CELL_DELTA_MV   250u  /* 普通拒绝后的粗确认 */
 #define BQ_FRAME_CONFIRM_PACK_DELTA_MV   300u
-#define BQ_OOR_STREAK_RESTART            4u
+#define BQ_OOR_STREAK_RESTART            8u
 #define BQ_VC34_MAX_RAW                  128u
 
 /* ---------------- 事务描述 ---------------- */
@@ -2417,6 +2419,216 @@ int BQ_LpMonitorStop(uint8_t fet_mask)
     return BQ_PrepareForLpMask(fet_mask);
 }
 
+/* ---------------- 复位安全 LP 路径（IWDG 轻量 boot） ---------------- */
+
+static int Bq_LpReadCalibration(void)
+{
+    uint8_t g1 = 0u;
+    uint8_t g2 = 0u;
+    uint8_t off = 0u;
+
+    if ((Bq_BlockingRead1(BQ_REG_ADCGAIN1, &g1) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_ADCGAIN2, &g2) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_ADCOFFSET, &off) != 0))
+    {
+        return -1;
+    }
+
+    s_bq.adc_gain1_raw = g1;
+    s_bq.adc_gain2_raw = g2;
+    s_bq.adc_gain = (uint8_t)((((g1 >> 2) & 0x03u) << 3) |
+                              ((g2 >> 5) & 0x07u));
+    s_bq.adc_offset = (int8_t)off;
+    return 0;
+}
+
+int BQ_LpBootPrepare(bq_lp_status_t *out)
+{
+    uint8_t ctrl1 = 0u;
+    uint8_t ctrl2 = 0u;
+    uint8_t stat = 0u;
+
+    if (out == NULL)
+    {
+        return -1;
+    }
+    out->load_present = 0u;
+    out->chg_on = 0u;
+    out->adc_on = 0u;
+    out->cc_on = 0u;
+    out->fet_mask = 0u;
+
+    if (Bq_LpReadCalibration() != 0)
+    {
+        return -1;
+    }
+
+    if ((Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &ctrl1) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &ctrl2) != 0) ||
+        (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0))
+    {
+        return -1;
+    }
+
+    /* ADC/TEMP/CC 必须在 LP 中关闭；若上一次状态残留，等一个转换周期再
+     * 回读，避免最后一笔 ADC/CC 还在更新。不能比较整个 ctrl1：bit7
+     * LOAD_PRESENT 是只读状态，有负载时恒为 1，会把每个 sniff tick 都拖
+     * 进 300 ms 等待。 */
+    if (((ctrl1 & (BQ_SYS_CTRL1_ADC_EN | BQ_SYS_CTRL1_TEMP_SEL)) != 0u) ||
+        ((ctrl2 & (BQ_SYS_CTRL2_CC_EN | BQ_FET_MASK_ALL)) != 0u))
+    {
+        if ((Bq_BlockingWrite(BQ_REG_SYS_CTRL1, BQ_SYS_CTRL1_LP) != 0) ||
+            (Bq_BlockingWrite(BQ_REG_SYS_CTRL2, 0u) != 0))
+        {
+            return -1;
+        }
+        HAL_Delay(300u);
+        if ((Bq_BlockingRead1(BQ_REG_SYS_CTRL1, &ctrl1) != 0) ||
+            (Bq_BlockingRead1(BQ_REG_SYS_CTRL2, &ctrl2) != 0))
+        {
+            return -1;
+        }
+    }
+
+    /* 只清 CC_READY/XREADY；OV/UV/SCD/OCD 锁存保留。 */
+    if ((stat & (BQ_SYS_STAT_CC_READY | BQ_SYS_STAT_XREADY)) != 0u)
+    {
+        (void)Bq_BlockingWrite(BQ_REG_SYS_STAT,
+                               (uint8_t)(BQ_SYS_STAT_CC_READY |
+                                         BQ_SYS_STAT_XREADY));
+    }
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+
+    out->sys_ctrl1 = ctrl1;
+    out->sys_ctrl2 = ctrl2;
+    out->sys_stat = stat;
+    out->load_present = ((ctrl1 & BQ_SYS_CTRL1_LOAD_PRESENT) != 0u) ? 1u : 0u;
+    out->chg_on = ((ctrl2 & BQ_SYS_CTRL2_CHG_ON) != 0u) ? 1u : 0u;
+    out->adc_on = ((ctrl1 & BQ_SYS_CTRL1_ADC_EN) != 0u) ? 1u : 0u;
+    out->cc_on = ((ctrl2 & BQ_SYS_CTRL2_CC_EN) != 0u) ? 1u : 0u;
+    out->fet_mask = (uint8_t)(ctrl2 & BQ_FET_MASK_ALL);
+
+    return (((ctrl1 & BQ_SYS_CTRL1_ADC_EN) == 0u) &&
+            ((ctrl2 & (BQ_SYS_CTRL2_CC_EN | BQ_FET_MASK_ALL)) == 0u)) ?
+           0 : -1;
+}
+
+static uint8_t Bq_LpFrameClose(const bq_snapshot_t *a, const bq_snapshot_t *b)
+{
+    uint8_t i;
+
+    if ((a->valid == 0u) || (b->valid == 0u))
+    {
+        return 0u;
+    }
+    for (i = 0u; i < 3u; i++)
+    {
+        int32_t d = (int32_t)a->raw_cell[i] - (int32_t)b->raw_cell[i];
+        if ((d > 4) || (d < -4))
+        {
+            return 0u;
+        }
+    }
+    {
+        int32_t d = (int32_t)a->raw_pack - (int32_t)b->raw_pack;
+        if ((d > 4) || (d < -4))
+        {
+            return 0u;
+        }
+    }
+    return 1u;
+}
+
+static int Bq_LpForceOff(void)
+{
+    uint8_t stat = 0u;
+
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL1, BQ_SYS_CTRL1_LP) != 0)
+    {
+        return -1;
+    }
+    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2, 0u) != 0)
+    {
+        return -1;
+    }
+    HAL_Delay(300u);
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+    if ((stat & (BQ_SYS_STAT_CC_READY | BQ_SYS_STAT_XREADY)) != 0u)
+    {
+        (void)Bq_BlockingWrite(BQ_REG_SYS_STAT,
+                               (uint8_t)(BQ_SYS_STAT_CC_READY |
+                                         BQ_SYS_STAT_XREADY));
+    }
+    return 0;
+}
+
+int BQ_LpMonitorRun(bq_snapshot_t *out)
+{
+    bq_snapshot_t first;
+    bq_snapshot_t second;
+    uint8_t attempt;
+
+    if (out == NULL)
+    {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+
+    if (Bq_LpReadCalibration() != 0)
+    {
+        return -1;
+    }
+
+    for (attempt = 0u; attempt < 2u; attempt++)
+    {
+        if (Bq_LpForceOff() != 0)
+        {
+            return -1;
+        }
+        if (BQ_LpMonitorStart(0u) != 0)
+        {
+            (void)Bq_LpForceOff();
+            return -1;
+        }
+        HAL_Delay(BQ_ADC_SETTLE_MS);
+        if (BQ_LpMonitorRead(&first) != 0)
+        {
+            HAL_Delay(300u);
+            if (BQ_LpMonitorRead(&second) != 0)
+            {
+                continue;
+            }
+        }
+        else
+        {
+            HAL_Delay(300u);
+            if (BQ_LpMonitorRead(&second) != 0)
+            {
+                continue;
+            }
+        }
+
+        if (Bq_LpFrameClose(&first, &second) != 0u)
+        {
+            *out = second;
+            if (Bq_LpForceOff() != 0)
+            {
+                return -1;
+            }
+            return 0;
+        }
+    }
+
+    (void)Bq_LpForceOff();
+    return -1;
+}
+
 static int Bq_BlockingAllowed(void)
 {
     return ((BQ_IsIdle() != 0u) && (s_bq.state == BQ_ST_RUN)) ? 0 : -1;
@@ -2547,6 +2759,13 @@ void I2C1_EV_IRQHandler(void)
 
 void I2C1_ER_IRQHandler(void)
 {
+    /* SMBA 实测时 I2C1_ER 由 SMBHEN/ALERTEN/ERRIE 打开；ALERT 不是普通
+     * I2C 错误，先置按钮标志并清 ALERTCF，再交给 HAL 处理其余错误。 */
+    if ((I2C1->ISR & I2C_ISR_ALERT) != 0u)
+    {
+        I2C1->ICR = I2C_ICR_ALERTCF;
+        Button_NotifySmbaFromIsr();
+    }
     HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
