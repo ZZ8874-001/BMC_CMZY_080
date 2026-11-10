@@ -21,8 +21,7 @@ typedef enum
     PROTECTION_INIT = 0,
     PROTECTION_NORMAL,
     PROTECTION_RECOVERY,
-    PROTECTION_LATCHED,
-    PROTECTION_PARTIAL  /* 仅同批 VC5/BAT 异常；未获放电资格时 FET=0 */
+    PROTECTION_LATCHED
 } protection_state_t;
 
 /* 详细原因，供 s_protection/日志使用；不扩展 16-bit 故障 API。 */
@@ -41,7 +40,6 @@ typedef enum
 #define PROT_RSN_TEMP_INVALID       (1u << 12)
 #define PROT_RSN_CURRENT_SIGN       (1u << 13)
 #define PROT_RSN_SOC_CUTOFF         (1u << 14)  /* M3 预留 */
-#define PROT_RSN_PARTIAL             (1u << 15)  /* VC5/BAT 严格部分异常 */
 
 /* 一次性 UI/黑匣子事件。 */
 #define PROT_EVENT_TRIP             (1u << 0)
@@ -61,11 +59,6 @@ typedef enum
 #define PROT_OCP_CONFIRM_FRAMES     2u      /* 2 个“新发布帧”≈0.5–1 s */
 #define PROT_OCP_SIGN_HINT_MA       2000    /* 与 COMP2 交叉检查的最小电流 */
 #define PROT_OCP_IMPLAUSIBLE_MA     60000   /* 高于 SCD 44.7 A，视为 CC 异常帧 */
-#define PROT_PARTIAL_DSG_OCP_MA    2000    /* 仅部分电压异常的放电 CC 门限 */
-#define PROT_PARTIAL_FULL_MAX_MS   20000u  /* 距本次唤醒真实完整好帧 <20 s */
-#define PROT_PARTIAL_CC_MAX_MS     1000u   /* 独立 CC 超时立即关放电 */
-#define PROT_PARTIAL_BATCH_MAX_MS  1000u   /* BQ 同批质量证明超时 */
-#define PROT_PARTIAL_CC_STEP_MS    250u    /* 两次 CC 必须是不同转换 */
 
 /* ---------------- M2b NTC 温度 ---------------- */
 /* TS1 上拉两点校验通过后置 1；=0 时只计算/记录，不改允许掩码。 */
@@ -114,36 +107,7 @@ typedef struct
     uint8_t  temp_valid_last;
     int16_t  temp_dc_last;
     uint8_t  comp_charging_last;
-    uint8_t  partial_anomaly;
-    uint8_t  partial_discharge_allowed;
-    uint8_t  full_gate_passed_this_boot;
-    uint32_t full_gate_ms;
-    uint32_t full_gate_seq;
-    uint32_t partial_last_full_ms;
-    uint32_t partial_cc_last_seq;
-    uint8_t  partial_ocp_streak;
 } protection_snapshot_t;
-
-/* main_app 在每次 Protection_Task 前传递 BQ 同批质量和与电压发布解耦的 CC。
- * partial_scope_open 仅在严格分类为 PARTIAL_VC5_PACK 时置 1；其它类别清 0。
- * scoped_adc_stuck 保留诊断但不能豁免 ADC_STUCK（BQ 尚无可靠故障归因）。
- * NULL 或清零的结构撤销本次部分模式证据，绝不可由旧发布快照构造。 */
-typedef struct
-{
-    bq_batch_quality_t batch;
-    bq_cc_sample_t cc;
-    uint8_t partial_scope_open;
-    uint8_t scoped_adc_stuck;
-    uint8_t comp_direction_valid;
-    uint8_t comp_charging;
-    uint8_t full_gate_passed_this_boot;
-    uint32_t full_gate_ms;
-    uint32_t full_gate_seq;
-} protection_partial_evidence_t;
-
-void Protection_SetPartialEvidence(const protection_partial_evidence_t *evidence);
-uint8_t Protection_IsPartialAnomaly(void);
-uint8_t Protection_IsPartialDischargeAllowed(void);
 
 void Protection_Init(void);
 
@@ -156,7 +120,7 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
 /* 主循环服务；只在 BQ RUN/idle 时执行安全清锁存。 */
 void Protection_Service(uint32_t now_ms, const bq_snapshot_t *snap);
 
-/* FET 允许掩码：bit0=CHG，bit1=DSG。PARTIAL 期间最多只返回 DSG。 */
+/* FET 允许掩码：bit0=CHG，bit1=DSG。 */
 uint8_t Protection_GetAllowedFetMask(void);
 
 uint8_t Protection_IsLpBlocked(void);

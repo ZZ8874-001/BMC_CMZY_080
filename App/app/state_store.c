@@ -483,28 +483,9 @@ int StateStore_CommitArchiveSnapshot(const state_store_view_t *view,
     archive.last_mark_id = mark_id;
     archive.mark_quality = mark_quality;
     archive.estimate_flags = estimate_flags;
-    if (mark_quality == STATE_ARCHIVE_MARK_FULL)
-    {
-        archive.anomaly_count = 0u;
-        /* 真实 9 帧/LP 两帧本身不撤销已经启动的 2 min 报警，
-         * 不解锁超时保护：只能经显式验证恢复 API 清 PENDING。 */
-    }
-    else if (mark_quality == STATE_ARCHIVE_MARK_CRITICAL)
-    {
-        archive.anomaly_count = 4u;
-        archive.alarm_flags |= STATE_ARCHIVE_ALARM_PENDING;
-    }
-    else
-    {
-        if (archive.anomaly_count < 4u)
-        {
-            archive.anomaly_count++;
-        }
-        if (archive.anomaly_count >= 4u)
-        {
-            archive.alarm_flags |= STATE_ARCHIVE_ALARM_PENDING;
-        }
-    }
+    /* 报警/锁存/计数语义已随 bq_anomaly 框架删除；保留字段仅为格式兼容。 */
+    archive.anomaly_count = 0u;
+    archive.alarm_flags = 0u;
     return Ss_CommitWithArchive(&next, &archive);
 }
 
@@ -513,9 +494,11 @@ int StateStore_CommitArchiveMark(uint32_t mark_epoch, uint32_t mark_id,
 {
     state_store_archive_t archive;
 
-    /* LP 快标记只动 v2 计数元数据，不碰已有快照或 SOC 有效位。 */
+    /* LP 快标记只动 v2 元数据，不碰已有快照或 SOC 有效位。 */
     if ((mark_epoch == 0u) || (mark_id == 0u) ||
-        (mark_quality != STATE_ARCHIVE_MARK_FULL) || (estimate_flags != 0u))
+        ((mark_quality != STATE_ARCHIVE_MARK_FULL) &&
+         (mark_quality != STATE_ARCHIVE_MARK_DEGRADED)) ||
+        ((estimate_flags & (uint8_t)~STATE_ARCHIVE_Q_ALL) != 0u))
     {
         return -1;
     }
@@ -527,59 +510,8 @@ int StateStore_CommitArchiveMark(uint32_t mark_epoch, uint32_t mark_id,
     archive = s_state.view.archive;
     archive.last_mark_epoch = mark_epoch;
     archive.last_mark_id = mark_id;
-    archive.mark_quality = STATE_ARCHIVE_MARK_FULL;
-    archive.estimate_flags = 0u;
-    archive.anomaly_count = 0u;
-    return Ss_CommitWithArchive(&s_state.view, &archive);
-}
-
-int StateStore_SetArchiveAlarm(uint8_t set_flags)
-{
-    state_store_archive_t archive;
-
-    if ((set_flags == 0u) ||
-        (set_flags & (uint8_t)~(STATE_ARCHIVE_ALARM_PENDING |
-                               STATE_ARCHIVE_ALARM_LATCHED |
-                               STATE_ARCHIVE_SHUTDOWN_CONFIRMED)) != 0u)
-    {
-        return -1;
-    }
-    archive = s_state.view.archive;
-    archive.alarm_flags |= set_flags;
-    if (Ss_CommitWithArchive(&s_state.view, &archive) != 0)
-    {
-        /* 持久化失败时 RAM 仍必须禁止放电/LP；上层也要检查 -1 并
-         * 保持自身 fail-closed，断电后 Flash 无法保证该次新锁存。 */
-        s_state.view.archive.alarm_flags |= set_flags;
-        return -1;
-    }
-    return 0;
-}
-
-int StateStore_ConfirmArchiveRecovery(void)
-{
-    state_store_archive_t archive;
-
-    if ((s_state.valid == 0u) ||
-        ((s_state.view.archive.alarm_flags & STATE_ARCHIVE_ALARM_LATCHED) != 0u))
-    {
-        return -1;
-    }
-    archive = s_state.view.archive;
-    archive.anomaly_count = 0u;
-    archive.alarm_flags &= (uint8_t)~STATE_ARCHIVE_ALARM_PENDING;
-    return Ss_CommitWithArchive(&s_state.view, &archive);
-}
-
-int StateStore_SafeClearArchiveAlarm(void)
-{
-    state_store_archive_t archive;
-
-    if (s_state.valid == 0u)
-    {
-        return -1;
-    }
-    archive = s_state.view.archive;
+    archive.mark_quality = mark_quality;
+    archive.estimate_flags = estimate_flags;
     archive.anomaly_count = 0u;
     archive.alarm_flags = 0u;
     return Ss_CommitWithArchive(&s_state.view, &archive);

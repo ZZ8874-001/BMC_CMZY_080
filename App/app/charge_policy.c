@@ -24,7 +24,6 @@ static struct
     uint8_t requested_mask;
     uint8_t last_allow_mask;
     uint8_t user_discharge_enabled;
-    uint8_t archive_latched;
     uint8_t charger_present;
     uint8_t charger_low_active;
     uint32_t charger_low_since_ms;
@@ -64,17 +63,6 @@ static uint8_t ChargePolicy_CalReady(uint32_t now_ms)
                      (BQ_GetState() == BQ_ST_RUN) &&
                      (BQ_IsFresh(now_ms) != 0u) &&
                      (PowerMode_GetState() == POWER_STATE_NORM));
-}
-
-static uint8_t ChargePolicy_PartialDischargeReady(void)
-{
-    return (uint8_t)((StateMachine_GetState() == SM_STATE_BQ_ANOMALY) &&
-                     (SelfTest_IsDone() != 0u) &&
-                     (SelfTest_IsPassed() != 0u) &&
-                     (BQ_GetState() == BQ_ST_RUN) &&
-                     (PowerMode_GetState() == POWER_STATE_NORM) &&
-                     (Protection_IsPartialDischargeAllowed() != 0u) &&
-                     ((Protection_GetAllowedFetMask() & BQ_FET_MASK_DSG) != 0u));
 }
 
 static void ChargePolicy_RequestMask(uint8_t mask)
@@ -148,7 +136,6 @@ void ChargePolicy_Init(void)
     /* 保护层尚未 Init（读到 0）时，首次 Task 会立即收紧到 0，方向安全。 */
     s_policy.last_allow_mask = BQ_FET_MASK_ALL;
     s_policy.user_discharge_enabled = 0u;
-    s_policy.archive_latched = 0u;
     s_policy.charger_present = 0u;
     s_policy.charger_low_active = 0u;
     s_policy.charger_low_since_ms = 0u;
@@ -177,15 +164,13 @@ void ChargePolicy_Init(void)
 
 void ChargePolicy_OnPairHold3(uint32_t now_ms)
 {
-    if ((s_policy.archive_latched != 0u) ||
-        (s_policy.state == CHARGE_POLICY_FAULT) ||
+    if ((s_policy.state == CHARGE_POLICY_FAULT) ||
         (s_policy.state == CHARGE_POLICY_CAL) ||
         (s_policy.state == CHARGE_POLICY_CHARGE) ||
         (s_policy.cal_mode != 0u) ||
         (s_policy.cal_active != 0u) ||
         (s_policy.charger_present != 0u) ||
-        ((ChargePolicy_NormalReady(now_ms) == 0u) &&
-         (ChargePolicy_PartialDischargeReady() == 0u)))
+        (ChargePolicy_NormalReady(now_ms) == 0u))
     {
         s_policy.pair_reject_count++;
         return;
@@ -217,37 +202,11 @@ void ChargePolicy_OnLpWake(uint32_t now_ms)
     s_policy.lp_block = 0u;
 }
 
-void ChargePolicy_SetArchiveLatch(uint8_t latched)
-{
-    s_policy.archive_latched = (latched != 0u) ? 1u : 0u;
-    if (s_policy.archive_latched != 0u)
-    {
-        s_policy.user_discharge_enabled = 0u;
-        s_policy.cal_mode = 0u;
-        s_policy.cal_pending = 0u;
-        ChargePolicy_RequestMask(BQ_FET_MASK_NONE);
-        ChargePolicy_ApplyNow(BQ_FET_MASK_NONE);
-    }
-}
-
 void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging)
 {
     charge_policy_state_t old_state = s_policy.state;
     uint8_t charger_mask_changed = 0u;
     uint8_t allow_mask = Protection_GetAllowedFetMask();
-
-    if (s_policy.archive_latched != 0u)
-    {
-        s_policy.user_discharge_enabled = 0u;
-        s_policy.cal_mode = 0u;
-        s_policy.cal_active = 0u;
-        s_policy.cal_pending = 0u;
-        ChargePolicy_RequestMask(BQ_FET_MASK_NONE);
-        ChargePolicy_ApplyNow(BQ_FET_MASK_NONE);
-        ChargePolicy_SetState(CHARGE_POLICY_FAULT, now_ms, 0u);
-        s_policy.lp_block = 1u;
-        return;
-    }
 
     /* 允许掩码变化（M2 起可能是部分掩码，如只禁 CHG）：立即按新掩码收紧
      * 当前请求；恢复方向由本轮正常 RequestMask 重新放宽，再等 BQ run script。
@@ -322,59 +281,6 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging)
         }
         ChargePolicy_SetState(CHARGE_POLICY_FAULT, now_ms, 0u);
         s_policy.lp_block = 1u;
-        return;
-    }
-
-    /* 充电器存在时不允许部分放电；不新增异常充电路径。 */
-    if ((StateMachine_GetState() == SM_STATE_BQ_ANOMALY) &&
-        (comp_charging != 0u))
-    {
-        s_policy.user_discharge_enabled = 0u;
-        ChargePolicy_RequestMask(BQ_FET_MASK_NONE);
-        if (s_policy.requested_mask == BQ_FET_MASK_NONE)
-        {
-            ChargePolicy_ApplyNow(BQ_FET_MASK_NONE);
-        }
-        ChargePolicy_SetState(CHARGE_POLICY_IDLE, now_ms, 0u);
-        s_policy.lp_block = 1u;
-        return;
-    }
-
-    /* 部分电压异常不进入充电或 CAL；只可在严格 CC/保护门控内请求 DSG。
-     * 用户重新按键开启仍走 OnPairHold3 的独立异常放行判断。 */
-    if (StateMachine_GetState() == SM_STATE_BQ_ANOMALY)
-    {
-        s_policy.cal_pending = 0u;
-        s_policy.user_discharge_enabled =
-            (s_policy.user_discharge_enabled != 0u) ? 1u : 0u;
-        if ((s_policy.cal_mode != 0u) || (s_policy.cal_active != 0u))
-        {
-            s_policy.cal_mode = 0u;
-            s_policy.cal_active = 0u;
-            s_policy.cal_end_reason = CHARGE_POLICY_CAL_END_NOTREADY;
-            s_policy.cal_abort_count++;
-        }
-        if ((s_policy.user_discharge_enabled != 0u) &&
-            (comp_charging == 0u) &&
-            (ChargePolicy_PartialDischargeReady() != 0u))
-        {
-            ChargePolicy_RequestMask(BQ_FET_MASK_DSG);
-            ChargePolicy_SetState(CHARGE_POLICY_DISCHARGE, now_ms, 0u);
-            s_policy.lp_block = 1u;
-        }
-        else
-        {
-            s_policy.user_discharge_enabled = 0u;
-            ChargePolicy_RequestMask(BQ_FET_MASK_NONE);
-            if ((old_state == CHARGE_POLICY_DISCHARGE) ||
-                (s_policy.requested_mask != BQ_FET_MASK_NONE) ||
-                (BQ_GetFetMaskApplied() != BQ_FET_MASK_NONE))
-            {
-                ChargePolicy_ApplyNow(BQ_FET_MASK_NONE);
-            }
-            ChargePolicy_SetState(CHARGE_POLICY_IDLE, now_ms, 0u);
-            s_policy.lp_block = 1u;
-        }
         return;
     }
 

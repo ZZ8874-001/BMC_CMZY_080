@@ -170,11 +170,6 @@
         "file": "c:\\Users\\Shuchen Tao\\Documents\\BMC_CMZY_080\\App\\app\\main_app.c"
     },
     {
-        "command": "arm-none-eabi-gcc -c -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DUSE_HAL_DRIVER -DSTM32L432xx -DPOWER_LP_KEEP_SWD=0 -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include -IApp -IApp/bsp -IApp/comm -IApp/app -IApp/detect -IApp/detect/bms -Og -Wall -fdata-sections -ffunction-sections -g -gdwarf-2 -MMD -MP -MF\"build/bq_anomaly.d\" -Wa,-a,-ad,-alms=build/bq_anomaly.lst App/app/bq_anomaly.c -o build/bq_anomaly.o",
-        "directory": "c:/Users/Shuchen Tao/Documents/BMC_CMZY_080",
-        "file": "c:\\Users\\Shuchen Tao\\Documents\\BMC_CMZY_080\\App\\app\\bq_anomaly.c"
-    },
-    {
         "command": "arm-none-eabi-gcc -c -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DUSE_HAL_DRIVER -DSTM32L432xx -DPOWER_LP_KEEP_SWD=0 -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include -IApp -IApp/bsp -IApp/comm -IApp/app -IApp/detect -IApp/detect/bms -Og -Wall -fdata-sections -ffunction-sections -g -gdwarf-2 -MMD -MP -MF\"build/power_mode.d\" -Wa,-a,-ad,-alms=build/power_mode.lst App/app/power_mode.c -o build/power_mode.o",
         "directory": "c:/Users/Shuchen Tao/Documents/BMC_CMZY_080",
         "file": "c:\\Users\\Shuchen Tao\\Documents\\BMC_CMZY_080\\App\\app\\power_mode.c"

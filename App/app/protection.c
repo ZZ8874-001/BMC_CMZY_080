@@ -16,8 +16,6 @@
 
 #include "board.h"
 #include "app/faults.h"
-#include "app/power_mode.h"
-#include "app/self_test.h"
 
 #define PROT_CLEAR_CURRENT_MA       500
 #define PROT_CLEAR_HOLD_MS          2000u
@@ -54,17 +52,6 @@ typedef struct
     uint8_t sign_mismatch_streak;
     uint32_t sign_mismatch_count;
 
-    /* 部分电压异常：每轮传入 BQ 同批及独立 CC 证据；不复用旧 snap 的 CC。 */
-    protection_partial_evidence_t partial_evidence;
-    uint8_t partial_anomaly;
-    uint8_t partial_discharge_allowed;
-    uint8_t full_gate_passed_this_boot;
-    uint32_t partial_last_full_ms;
-    uint32_t partial_last_full_seq;
-    uint32_t partial_cc_last_seq;
-    uint32_t partial_cc_last_ms;
-    uint8_t partial_ocp_streak;
-
     /* M2b 温度 */
     uint8_t comp_charging_last;
     uint8_t temp_valid_last;
@@ -81,192 +68,6 @@ typedef struct
 static protection_ctx_t s_protection;
 
 static uint8_t Protection_TempAllowMask(void);
-
-static uint8_t Protection_PartialBatchClassified(uint32_t now_ms)
-{
-    const bq_batch_quality_t *batch = &s_protection.partial_evidence.batch;
-    uint16_t needed = (uint16_t)(BQ_FIELD_VC1 | BQ_FIELD_VC2 |
-                                 BQ_FIELD_VC3 | BQ_FIELD_VC4 |
-                                 BQ_FIELD_CC | BQ_FIELD_SYS_STAT |
-                                 BQ_FIELD_CTRL1 | BQ_FIELD_CTRL2 |
-                                 BQ_FIELD_PROTECTION);
-
-    if ((s_protection.partial_evidence.partial_scope_open == 0u) ||
-        (batch->quality != (uint8_t)BQ_BATCH_PARTIAL_VC5_PACK) ||
-        (batch->complete == 0u) || (batch->partial_confirm_count < 2u) ||
-        ((batch->crc_ok_mask & needed) != needed) ||
-        ((batch->field_ok_mask & needed) != needed) ||
-        ((batch->field_ok_mask & (BQ_FIELD_VC5 | BQ_FIELD_BAT)) ==
-         (BQ_FIELD_VC5 | BQ_FIELD_BAT)) ||
-        ((now_ms - batch->batch_ms) > PROT_PARTIAL_BATCH_MAX_MS))
-    {
-        return 0u;
-    }
-    return 1u;
-}
-
-static uint8_t Protection_CurrentFullTrusted(uint32_t now_ms,
-                                             const bq_snapshot_t *snap)
-{
-    const bq_batch_quality_t *batch = &s_protection.partial_evidence.batch;
-    uint16_t needed = (uint16_t)(BQ_FIELD_ALL);
-
-    if ((snap == NULL) ||
-        (batch->quality != (uint8_t)BQ_BATCH_FULL_REAL_OK) ||
-        (batch->complete == 0u) || (batch->published_seq == 0u) ||
-        (batch->published_ms != batch->batch_ms) ||
-        (batch->published_ms != snap->last_update_ms) ||
-        ((now_ms - batch->batch_ms) > APP_BQ_STALE_MS) ||
-        ((batch->crc_ok_mask & needed) != needed) ||
-        ((batch->field_ok_mask & needed) != needed))
-    {
-        return 0u;
-    }
-    return 1u;
-}
-
-static uint8_t Protection_PartialBatchTrusted(uint32_t now_ms)
-{
-    const bq_batch_quality_t *batch = &s_protection.partial_evidence.batch;
-    uint16_t needed = (uint16_t)(BQ_FIELD_VC1 | BQ_FIELD_VC2 |
-                                 BQ_FIELD_VC3 | BQ_FIELD_VC4 |
-                                 BQ_FIELD_CC | BQ_FIELD_SYS_STAT |
-                                 BQ_FIELD_CTRL1 | BQ_FIELD_CTRL2 |
-                                 BQ_FIELD_PROTECTION);
-    uint16_t faults;
-
-    if ((s_protection.partial_evidence.partial_scope_open == 0u) ||
-        (s_protection.full_gate_passed_this_boot == 0u) ||
-        (batch->quality != (uint8_t)BQ_BATCH_PARTIAL_VC5_PACK) ||
-        (batch->complete == 0u) || (batch->partial_confirm_count < 2u) ||
-        ((batch->crc_ok_mask & needed) != needed) ||
-        ((batch->field_ok_mask & needed) != needed) ||
-        ((batch->field_ok_mask & (BQ_FIELD_VC5 | BQ_FIELD_BAT)) ==
-         (BQ_FIELD_VC5 | BQ_FIELD_BAT)) ||
-        ((now_ms - batch->batch_ms) > PROT_PARTIAL_BATCH_MAX_MS) ||
-        (BQ_GetState() != BQ_ST_RUN) || (BQ_IsRecovering() != 0u) ||
-        (BQ_IsCcFresh(now_ms) == 0u))
-    {
-        return 0u;
-    }
-
-    /* BQ ADC_STUCK 没有可靠的故障归因；绝不接受 evidence 中的豁免位。 */
-    faults = Fault_GetAll();
-    if ((faults & (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY |
-                   FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |
-                   FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |
-                   FAULT_BIT_BQ_ADC_STUCK | FAULT_BIT_POWER |
-                   FAULT_BIT_CLK | FAULT_BIT_TEMP |
-                   FAULT_BIT_FLASH_STATE | FAULT_BIT_PROTECTION)) != 0u)
-    {
-        return 0u;
-    }
-    if ((batch->sys_stat & (BQ_SYS_STAT_PROT_MASK | BQ_SYS_STAT_XREADY)) != 0u)
-    {
-        return 0u;
-    }
-
-    return 1u;
-}
-
-static uint8_t Protection_PartialCcTrusted(uint32_t now_ms)
-{
-    const bq_batch_quality_t *batch = &s_protection.partial_evidence.batch;
-    const bq_cc_sample_t *cc = &s_protection.partial_evidence.cc;
-
-    if ((cc->valid == 0u) || (cc->sample_seq == 0u) ||
-        (cc->batch_seq != batch->batch_seq) ||
-        ((now_ms - cc->sample_ms) > PROT_PARTIAL_CC_MAX_MS) ||
-        (BQ_IsCcFresh(now_ms) == 0u))
-    {
-        return 0u;
-    }
-    return 1u;
-}
-
-static uint8_t Protection_PartialDischargeSafe(uint32_t now_ms,
-                                                uint8_t comp_charging)
-{
-    const bq_batch_quality_t *batch = &s_protection.partial_evidence.batch;
-    const bq_cc_sample_t *cc = &s_protection.partial_evidence.cc;
-
-    if ((comp_charging != 0u) ||
-        (s_protection.partial_evidence.comp_direction_valid == 0u) ||
-        (s_protection.partial_evidence.comp_charging != 0u) ||
-        (s_protection.full_gate_passed_this_boot == 0u) ||
-        (SelfTest_IsDone() == 0u) || (SelfTest_IsPassed() == 0u) ||
-        (PowerMode_GetState() != POWER_STATE_NORM) ||
-        ((now_ms - s_protection.partial_last_full_ms) >=
-         PROT_PARTIAL_FULL_MAX_MS) ||
-        (Protection_PartialBatchTrusted(now_ms) == 0u) ||
-        (Protection_PartialCcTrusted(now_ms) == 0u) ||
-        (s_protection.state == PROTECTION_LATCHED) ||
-        (s_protection.clear_failed != 0u) ||
-        (s_protection.ocp_dsg_latched != 0u) ||
-        ((Protection_TempAllowMask() & BQ_FET_MASK_DSG) == 0u))
-    {
-        return 0u;
-    }
-
-    /* OCP 使用同批 BQ CC 原始新转换，不读 snap.current_ma。CC 不是冗余传感器，
-     * 2 A 门限仅是软件限流逻辑，不构成失真电芯或硬件保护的安全证明。 */
-    if ((cc->current_ma > PROT_OCP_IMPLAUSIBLE_MA) ||
-        (cc->current_ma < -PROT_OCP_IMPLAUSIBLE_MA))
-    {
-        return 0u;
-    }
-    (void)batch;
-    return 1u;
-}
-
-static void Protection_EvaluatePartialOcp(void)
-{
-    const bq_cc_sample_t *cc = &s_protection.partial_evidence.cc;
-    int32_t abs_ma;
-
-    if (cc->sample_seq == s_protection.partial_cc_last_seq)
-    {
-        return; /* 旧 CC 不得累计两次 */
-    }
-
-    abs_ma = cc->current_ma;
-    if (abs_ma < 0)
-    {
-        abs_ma = -abs_ma;
-    }
-    if (abs_ma >= PROT_PARTIAL_DSG_OCP_MA)
-    {
-        if ((s_protection.partial_ocp_streak == 0u) ||
-            ((cc->sample_ms - s_protection.partial_cc_last_ms) >=
-             PROT_PARTIAL_CC_STEP_MS))
-        {
-            if (s_protection.partial_ocp_streak < PROT_OCP_CONFIRM_FRAMES)
-            {
-                s_protection.partial_ocp_streak++;
-            }
-        }
-        else
-        {
-            s_protection.partial_ocp_streak = 1u;
-        }
-    }
-    else
-    {
-        s_protection.partial_ocp_streak = 0u;
-    }
-    s_protection.partial_cc_last_seq = cc->sample_seq;
-    s_protection.partial_cc_last_ms = cc->sample_ms;
-
-    if ((s_protection.partial_ocp_streak >= PROT_OCP_CONFIRM_FRAMES) &&
-        (s_protection.ocp_dsg_latched == 0u))
-    {
-        s_protection.ocp_dsg_latched = 1u;
-        s_protection.ocp_last_current_ma = cc->current_ma;
-        s_protection.ocp_trip_count++;
-        s_protection.clear_requested = 0u;
-        s_protection.event_flags |= PROT_EVENT_SW_DSG_OCP;
-    }
-}
 
 static uint8_t Protection_BqReady(void)
 {
@@ -570,45 +371,6 @@ static void Protection_UpdateTemperature(uint32_t now_ms, uint8_t temp_valid,
     }
 }
 
-void Protection_SetPartialEvidence(const protection_partial_evidence_t *evidence)
-{
-    if (evidence == NULL)
-    {
-        s_protection.partial_evidence.batch.quality = (uint8_t)BQ_BATCH_INVALID;
-        s_protection.partial_evidence.batch.complete = 0u;
-        s_protection.partial_evidence.cc.valid = 0u;
-        s_protection.partial_evidence.partial_scope_open = 0u;
-        s_protection.partial_evidence.scoped_adc_stuck = 0u;
-        s_protection.partial_evidence.comp_direction_valid = 0u;
-        s_protection.partial_evidence.comp_charging = 0u;
-        s_protection.partial_evidence.full_gate_passed_this_boot = 0u;
-        s_protection.partial_evidence.full_gate_ms = 0u;
-        s_protection.partial_evidence.full_gate_seq = 0u;
-        return;
-    }
-
-    s_protection.partial_evidence = *evidence;
-    if ((s_protection.partial_evidence.partial_scope_open == 0u) ||
-        (s_protection.partial_evidence.batch.quality !=
-         (uint8_t)BQ_BATCH_PARTIAL_VC5_PACK))
-    {
-        s_protection.partial_evidence.partial_scope_open = 0u;
-        s_protection.partial_ocp_streak = 0u;
-        s_protection.partial_cc_last_seq = 0u;
-        s_protection.partial_cc_last_ms = 0u;
-    }
-}
-
-uint8_t Protection_IsPartialAnomaly(void)
-{
-    return s_protection.partial_anomaly;
-}
-
-uint8_t Protection_IsPartialDischargeAllowed(void)
-{
-    return s_protection.partial_discharge_allowed;
-}
-
 void Protection_Init(void)
 {
     s_protection.state = PROTECTION_INIT;
@@ -638,25 +400,6 @@ void Protection_Init(void)
     s_protection.sign_mismatch_streak = 0u;
     s_protection.sign_mismatch_count = 0u;
 
-    s_protection.partial_evidence.batch.quality = (uint8_t)BQ_BATCH_INVALID;
-    s_protection.partial_evidence.batch.complete = 0u;
-    s_protection.partial_evidence.cc.valid = 0u;
-    s_protection.partial_evidence.partial_scope_open = 0u;
-    s_protection.partial_evidence.scoped_adc_stuck = 0u;
-    s_protection.partial_evidence.comp_direction_valid = 0u;
-    s_protection.partial_evidence.comp_charging = 0u;
-    s_protection.partial_evidence.full_gate_passed_this_boot = 0u;
-    s_protection.partial_evidence.full_gate_ms = 0u;
-    s_protection.partial_evidence.full_gate_seq = 0u;
-    s_protection.partial_anomaly = 0u;
-    s_protection.partial_discharge_allowed = 0u;
-    s_protection.full_gate_passed_this_boot = 0u;
-    s_protection.partial_last_full_ms = 0u;
-    s_protection.partial_last_full_seq = 0u;
-    s_protection.partial_cc_last_seq = 0u;
-    s_protection.partial_cc_last_ms = 0u;
-    s_protection.partial_ocp_streak = 0u;
-
     s_protection.comp_charging_last = 0u;
     s_protection.temp_valid_last = 0u;
     s_protection.temp_dc_last = 0;
@@ -685,7 +428,6 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
                                   PROT_CLEAR_ALLOWED_MASK);
     uint8_t boot_active = 0u;
     uint8_t ocp_latched;
-    uint8_t partial_safe;
     uint8_t allow = BQ_FET_MASK_NONE;
     protection_state_t next_state;
 
@@ -694,50 +436,6 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
 
     bq_ready = Protection_BqReady();
     data_ready = Protection_DataReady(now_ms, snap);
-
-    if ((s_protection.partial_evidence.full_gate_passed_this_boot != 0u) &&
-        (s_protection.partial_evidence.full_gate_seq != 0u) &&
-        (SelfTest_IsDone() != 0u) && (SelfTest_IsPassed() != 0u) &&
-        (PowerMode_GetState() == POWER_STATE_NORM) &&
-        ((Fault_GetAll() & (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY |
-                            FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |
-                            FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |
-                            FAULT_BIT_BQ_ADC_STUCK | FAULT_BIT_POWER |
-                            FAULT_BIT_CLK | FAULT_BIT_PROTECTION)) == 0u))
-    {
-        s_protection.full_gate_passed_this_boot = 1u;
-        s_protection.partial_last_full_ms =
-            s_protection.partial_evidence.full_gate_ms;
-        s_protection.partial_last_full_seq =
-            s_protection.partial_evidence.full_gate_seq;
-    }
-
-    /* 更新 full_gate_passed_this_boot 后再判定，本轮当前完整帧也可作为资格。 */
-    if ((s_protection.state == PROTECTION_NORMAL) &&
-        (s_protection.allow_mask == BQ_FET_MASK_ALL) &&
-        (bq_ready != 0u) && (data_ready != 0u) &&
-        (SelfTest_IsDone() != 0u) && (SelfTest_IsPassed() != 0u) &&
-        (PowerMode_GetState() == POWER_STATE_NORM) &&
-        ((Fault_GetAll() & (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY |
-                            FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |
-                            FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |
-                            FAULT_BIT_BQ_ADC_STUCK | FAULT_BIT_POWER |
-                            FAULT_BIT_CLK | FAULT_BIT_PROTECTION)) == 0u) &&
-        (snap != NULL) &&
-        ((snap->sys_stat & (BQ_SYS_STAT_PROT_MASK | BQ_SYS_STAT_XREADY)) == 0u) &&
-        (s_protection.clear_failed == 0u) &&
-        (s_protection.ocp_chg_latched == 0u) &&
-        (s_protection.ocp_dsg_latched == 0u) &&
-        (Protection_CurrentFullTrusted(now_ms, snap) != 0u) &&
-        (s_protection.partial_evidence.batch.published_seq !=
-         s_protection.partial_last_full_seq))
-    {
-        s_protection.full_gate_passed_this_boot = 1u;
-        s_protection.partial_last_full_ms =
-            s_protection.partial_evidence.batch.published_ms;
-        s_protection.partial_last_full_seq =
-            s_protection.partial_evidence.batch.published_seq;
-    }
 
     /* 首次拿到有效帧时补齐 boot 锁存：若 BQ 驱动的 pre_sys_stat 捕获或
      * 配置期间新锁存没有被 boot_prot_latch_mask 捕获，这里允许一次启动窗口
@@ -763,22 +461,6 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
         s_protection.ocp_last_snap_ms = snap->last_update_ms;
         Protection_EvaluateOcp(snap);
     }
-
-    s_protection.partial_anomaly = Protection_PartialBatchClassified(now_ms);
-    partial_safe = Protection_PartialDischargeSafe(now_ms, comp_charging);
-    if ((s_protection.partial_anomaly != 0u) && (partial_safe != 0u))
-    {
-        Protection_EvaluatePartialOcp();
-        if (s_protection.ocp_dsg_latched != 0u)
-        {
-            partial_safe = 0u;
-        }
-    }
-    else
-    {
-        s_protection.partial_ocp_streak = 0u;
-    }
-    s_protection.partial_discharge_allowed = partial_safe;
 
     ocp_latched = (uint8_t)((s_protection.ocp_chg_latched != 0u) ||
                             (s_protection.ocp_dsg_latched != 0u));
@@ -835,16 +517,7 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
     {
         reasons |= PROT_RSN_TEMP_INVALID;
     }
-    if ((s_protection.partial_anomaly != 0u) && (partial_safe == 0u))
-    {
-        reasons |= PROT_RSN_BQ_NOT_READY;
-    }
-    if (s_protection.partial_anomaly != 0u)
-    {
-        reasons |= PROT_RSN_PARTIAL;
-    }
-    if ((bq_ready == 0u) || ((data_ready == 0u) &&
-        (s_protection.partial_anomaly == 0u)) || (snap == NULL))
+    if ((bq_ready == 0u) || (data_ready == 0u) || (snap == NULL))
     {
         reasons |= PROT_RSN_BQ_NOT_READY;
     }
@@ -862,13 +535,6 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
         next_state = PROTECTION_LATCHED;
         allow = BQ_FET_MASK_NONE;
     }
-    else if (s_protection.partial_anomaly != 0u)
-    {
-        next_state = PROTECTION_PARTIAL;
-        allow = (partial_safe != 0u) ?
-                (uint8_t)(BQ_FET_MASK_DSG & Protection_TempAllowMask()) :
-                BQ_FET_MASK_NONE;
-    }
     else if ((bq_ready == 0u) || (data_ready == 0u) || (snap == NULL))
     {
         next_state = (s_protection.state == PROTECTION_INIT)
@@ -883,22 +549,12 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
 
     if ((next_state != s_protection.state) &&
         ((next_state == PROTECTION_RECOVERY) ||
-         (next_state == PROTECTION_PARTIAL) ||
          (next_state == PROTECTION_LATCHED)))
     {
-        if (next_state == PROTECTION_PARTIAL)
-        {
-            reasons |= PROT_RSN_PARTIAL;
-            /* 数据质量变化不是硬件保护跳闸，不能启动通用故障蜂鸣。 */
-        }
-        else
-        {
-            s_protection.event_flags |= (next_state == PROTECTION_LATCHED)
-                                        ? PROT_EVENT_LATCHED : PROT_EVENT_TRIP;
-        }
+        s_protection.event_flags |= (next_state == PROTECTION_LATCHED)
+                                    ? PROT_EVENT_LATCHED : PROT_EVENT_TRIP;
     }
-    if ((next_state == PROTECTION_NORMAL) ||
-        (next_state == PROTECTION_PARTIAL))
+    if (next_state == PROTECTION_NORMAL)
     {
         s_protection.safe_since_ms = 0u;
     }
@@ -1116,13 +772,6 @@ void Protection_GetSnapshot(protection_snapshot_t *out)
     out->temp_valid_last = s_protection.temp_valid_last;
     out->temp_dc_last = s_protection.temp_dc_last;
     out->comp_charging_last = s_protection.comp_charging_last;
-    out->partial_anomaly = s_protection.partial_anomaly;
-    out->partial_discharge_allowed = s_protection.partial_discharge_allowed;
-    out->full_gate_passed_this_boot = s_protection.full_gate_passed_this_boot;
-    out->full_gate_ms = s_protection.partial_last_full_ms;
-    out->full_gate_seq = s_protection.partial_last_full_seq;
-    out->partial_cc_last_seq = s_protection.partial_cc_last_seq;
-    out->partial_ocp_streak = s_protection.partial_ocp_streak;
 }
 
 void Protection_RequestLatchClear(void)

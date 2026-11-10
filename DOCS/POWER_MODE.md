@@ -1,11 +1,13 @@
 
 # BMC_CMZY_080 电源模式与切换说明（L0 + M1 基础）
 
-依据（当前工作树：复位式 LP、M2 保护监督层及 BQ 局部电压异常/归档分级；具体行为与参数以当前源码为准，旧镜像体积及构建记录不代表本次改动的验证结果）：
+> **2026-11-10 降级说明**：真实 VC5/包压不再参与控制/保护/SOC；cell3 取前两节均值、pack 取三节和，raw VC5/BAT 仅诊断。`bq_anomaly.c/.h` 与 partial/2 A OCP/9 帧/2 min/5 min 锁存已删除；均衡永久关闭。LP monitor 只校验 cell1/2，`-2` 电压异常返回码已删除；LP ALERT 唤醒只用 SCD/OCD/XREADY。下文相关旧描述视为历史。
+
+依据（当前工作树：复位式 LP、M2 保护监督层；具体行为与参数以当前源码为准，旧镜像体积及构建记录不代表本次改动的验证结果）：
 
 - `App/app/power_mode.c`（时钟切换、LP 进入/唤醒、RTC/PB5 中断 owner）
 - `App/app/main_app.c`（App_Init / App_Loop / 250 Hz tick 编排）
-- `App/app/bq_anomaly.c`、`App/app/protection.c`、`App/app/lp_cycle.c`（电压质量/报警编排、FET 监督、LP 监测）
+- `App/app/protection.c`、`App/app/lp_cycle.c`（FET 监督、LP 监测）
 - `App/bsp/bq_ic.c`、`App/bsp/ws2812_uart.c`、`App/bsp/buzzer.c`、`App/bsp/flash_store.c`
 - `App/comm/app_log.c`、`App/app/faults.c`、`App/app/black_box.c`、`App/app/state_machine.c`、
   `App/app/state_store.c`、`App/detect/soc_est.c`、`App/detect/bms/*`、`App/app/led_status.c`、

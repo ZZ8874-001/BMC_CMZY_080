@@ -12,8 +12,10 @@
 #include "board.h"
 
 /* 这些故障一旦出现即进入 FAULT 状态（BQ_STALE 不在此列，只影响灯效）。 */
+/* BQ OV/UV 不直接进入通用 FAULT；真实 cell1/2 越限由 protection 锁存后
+ * 置 FAULT_BIT_PROTECTION，再映射到 FAULT。这样过滤后的 VC5 假 UV 不会
+ * 让状态机/红灯/蜂鸣永久误报。 */
 #define SM_CRITICAL_FAULT_MASK  (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY | \
-                                 FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |       \
                                  FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |     \
                                  FAULT_BIT_BQ_ADC_STUCK |                  \
                                  FAULT_BIT_PROTECTION |                    \
@@ -26,7 +28,6 @@ static struct
     uint32_t update_count;
     uint32_t fault_enter_count;
     uint16_t last_fault_all;
-    uint8_t partial_anomaly;
 } s_sm;
 
 void StateMachine_Init(void)
@@ -36,12 +37,6 @@ void StateMachine_Init(void)
     s_sm.update_count = 0u;
     s_sm.fault_enter_count = 0u;
     s_sm.last_fault_all = 0u;
-    s_sm.partial_anomaly = 0u;
-}
-
-void StateMachine_SetPartialAnomaly(uint8_t confirmed)
-{
-    s_sm.partial_anomaly = (confirmed != 0u) ? 1u : 0u;
 }
 
 void StateMachine_Update(uint8_t bq_fresh, uint8_t comp_charging, uint16_t fault_all)
@@ -60,19 +55,9 @@ void StateMachine_Update(uint8_t bq_fresh, uint8_t comp_charging, uint16_t fault
         return;
     }
 
-    if (s_sm.partial_anomaly != 0u)
+    if (s_sm.state == SM_STATE_FAULT)
     {
-        /* 确认同批部分电压异常时单独标注，绝不伪装成正常完整好帧；
-         * 上方真实 OV/UV/SCD/OCD/通信/PVD 故障仍优先进入 FAULT。 */
-        s_sm.state = SM_STATE_BQ_ANOMALY;
-        s_sm.flow = SM_FLOW_STANDBY;
-        return;
-    }
-
-    if ((s_sm.state == SM_STATE_FAULT) ||
-        (s_sm.state == SM_STATE_BQ_ANOMALY))
-    {
-        /* 故障/异常消失：没有新鲜完整帧仍回 BOOT，禁止直接标 NORM。 */
+        /* 故障消失：没有新鲜完整帧仍回 BOOT，禁止直接标 NORM。 */
         s_sm.state = (bq_fresh != 0u) ? SM_STATE_NORM : SM_STATE_BOOT;
     }
     else if (s_sm.state == SM_STATE_BOOT)

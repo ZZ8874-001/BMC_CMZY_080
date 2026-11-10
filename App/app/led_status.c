@@ -22,8 +22,6 @@ static struct
     volatile uint32_t tick_count;
     volatile uint8_t phase_1hz;
     volatile uint8_t phase_5hz;
-    volatile uint8_t voltage_partial;
-    volatile uint8_t voltage_alarm;
     volatile uint8_t rgb_dirty;
     uint32_t rgb_send_count;
     uint8_t last_phase_1hz;
@@ -56,19 +54,6 @@ static void LedStatus_DrivePins(void)
         break;
     }
 
-    /* HOT is additive during BOOT/NORM, but a real fault owns PB3. */
-    if (s_led.mode != LED_MODE_FAULT)
-    {
-        if (s_led.voltage_alarm != 0u)
-        {
-            roht_on = s_led.phase_5hz;
-        }
-        else if (s_led.voltage_partial != 0u)
-        {
-            roht_on = s_led.phase_1hz;
-        }
-    }
-
     HAL_GPIO_WritePin(IND_NORM_GPIO_Port, IND_NORM_Pin,
                       (norm_on != 0u) ? GPIO_PIN_SET : GPIO_PIN_RESET);
     HAL_GPIO_WritePin(IND_ROHT_GPIO_Port, IND_ROHT_Pin,
@@ -82,8 +67,6 @@ void LedStatus_Init(void)
     s_led.tick_count = 0u;
     s_led.phase_1hz = 0u;
     s_led.phase_5hz = 0u;
-    s_led.voltage_partial = 0u;
-    s_led.voltage_alarm = 0u;
     s_led.rgb_dirty = 1u;
     s_led.rgb_send_count = 0u;
     s_led.last_phase_1hz = 0xFFu;
@@ -107,21 +90,6 @@ void LedStatus_SetMode(led_mode_t mode, led_flow_t flow)
     {
         s_led.mode = mode;
         s_led.flow = flow;
-        s_led.rgb_dirty = 1u;
-        LedStatus_DrivePins();
-    }
-}
-
-void LedStatus_SetVoltageAnomaly(uint8_t partial, uint8_t alarm)
-{
-    partial = (partial != 0u) ? 1u : 0u;
-    alarm = (alarm != 0u) ? 1u : 0u;
-
-    if ((s_led.voltage_partial != partial) ||
-        (s_led.voltage_alarm != alarm))
-    {
-        s_led.voltage_partial = partial;
-        s_led.voltage_alarm = alarm;
         s_led.rgb_dirty = 1u;
         LedStatus_DrivePins();
     }

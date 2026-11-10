@@ -14,11 +14,17 @@
 #define FAULT_PVD_LEVEL     PWR_PVDLEVEL_5
 #define FAULT_PVD_NVIC_PRIO 4u
 
+/* PVD 是单次下降沿中断；一次输出开启/负载跳变造成的瞬时跌落不应让
+ * POWER 故障永久锁死。1 s 内没有新的 PVD 边沿就自动清除 sticky POWER，
+ * 但仍保留 pvd_irq_count 供诊断。 */
+#define FAULT_POWER_RECOVER_MS  1000u
+
 static struct
 {
     volatile uint16_t live;
     volatile uint16_t sticky;
     volatile uint32_t pvd_irq_count;
+    volatile uint32_t pvd_last_ms;
     uint32_t set_sticky_count;
 } s_fault;
 
@@ -43,6 +49,7 @@ void Fault_Init(void)
     s_fault.live = 0u;
     s_fault.sticky = 0u;
     s_fault.pvd_irq_count = 0u;
+    s_fault.pvd_last_ms = 0u;
     s_fault.set_sticky_count = 0u;
 
     Fault_PvdEnable();
@@ -119,6 +126,34 @@ uint16_t Fault_GetAll(void)
     return all;
 }
 
+uint32_t Fault_GetPvdIrqCount(void)
+{
+    return s_fault.pvd_irq_count;
+}
+
+/* 主循环调用：瞬时 PVD 事件后 1 s 内无新边沿则释放 sticky POWER。
+ * 真实持续欠压通常会触发下一次复位；仍在运行说明 3.3 V 轨已恢复。 */
+void Fault_PowerRecoverTask(uint32_t now_ms)
+{
+    uint32_t primask;
+    uint32_t last;
+    uint8_t still;
+
+    if (s_fault.pvd_last_ms == 0u)
+    {
+        return;
+    }
+    primask = Fault_EnterCritical();
+    still = ((s_fault.sticky & FAULT_BIT_POWER) != 0u) ? 1u : 0u;
+    last = s_fault.pvd_last_ms;
+    Fault_ExitCritical(primask);
+
+    if ((still != 0u) && ((now_ms - last) >= FAULT_POWER_RECOVER_MS))
+    {
+        Fault_ClearSticky(FAULT_BIT_POWER);
+    }
+}
+
 /* PVD_PVM 中断：HAL 负责清 EXTI，回调里只置故障位。 */
 void PVD_PVM_IRQHandler(void)
 {
@@ -128,5 +163,6 @@ void PVD_PVM_IRQHandler(void)
 void HAL_PWR_PVDCallback(void)
 {
     s_fault.pvd_irq_count++;
+    s_fault.pvd_last_ms = HAL_GetTick();
     Fault_SetSticky(FAULT_BIT_POWER);
 }

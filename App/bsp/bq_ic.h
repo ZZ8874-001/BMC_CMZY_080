@@ -15,9 +15,7 @@
 
 /* ---------------- 寄存器地址 ---------------- */
 #define BQ_REG_SYS_STAT     0x00u
-#define BQ_REG_CELLBAL1     0x01u
-#define BQ_REG_CELLBAL2     0x02u
-#define BQ_REG_CELLBAL3     0x03u
+#define BQ_REG_CELLBAL1     0x01u   /* 必须始终为 0；本工程从不启用均衡 */
 #define BQ_REG_SYS_CTRL1    0x04u
 #define BQ_REG_SYS_CTRL2    0x05u
 #define BQ_REG_PROTECT1     0x06u
@@ -34,8 +32,9 @@
 
 /* 3S 固定接法（数据手册 Table 9-2）：
  *   CELL1 = VC1-VC0, CELL2 = VC2-VC1, CELL3 = VC5-VC4；
- *   VC4-VC3、VC3-VC2 在板上短接。飞线已完成，不再保留 4S/VC3 兼容分支。 */
-#define BQ_REG_CELL3         BQ_REG_VC5
+ *   VC4-VC3、VC3-VC2 在板上短接。飞线已完成，不再保留 4S/VC3 兼容分支。
+ * 注意：本板 VC5/CELL3 与 BAT/PACK 不可信，只作 raw 诊断；控制值由
+ * VC1/VC2 合成（cell3 = 两节均值，pack = 三节和）。 */
 #define BQ_REG_BAT          0x2Au
 #define BQ_REG_TS1          0x2Cu
 #define BQ_REG_CC           0x32u
@@ -79,12 +78,9 @@ typedef enum
 {
     BQ_FRAME_OK = 0,
     BQ_FRAME_REJECT_UNSETTLED = 1,
-    BQ_FRAME_REJECT_CELL_RANGE = 2,
-    BQ_FRAME_REJECT_PACK_RANGE = 3,
-    BQ_FRAME_REJECT_PACK_SUM = 4,
+    BQ_FRAME_REJECT_CELL_RANGE = 2,   /* 仅 VC1/VC2 数值越界 */
     BQ_FRAME_REJECT_NOT_CONFIGURED = 5,
-    BQ_FRAME_REJECT_VC34_SANITY = 6,
-    BQ_FRAME_REJECT_INCOMPLETE = 7 /* CRC/状态/保护配置不完整；不按 OOR 重启 */
+    BQ_FRAME_REJECT_INCOMPLETE = 7    /* CRC/状态/保护配置不完整；不按 OOR 重启 */
 } bq_frame_reject_t;
 
 typedef enum
@@ -94,31 +90,26 @@ typedef enum
     BQ_RESTART_REASON_LP_WAKE = 2,
     BQ_RESTART_REASON_REJECT_STREAK = 3,
     BQ_RESTART_REASON_XREADY = 4,
-    BQ_RESTART_REASON_COMM = 5,
-    BQ_RESTART_REASON_PARTIAL = 6 /* 仅关输出后、每次间隔 >=10 s 的 ADC 重试 */
+    BQ_RESTART_REASON_COMM = 5
 } bq_restart_reason_t;
 
 /* 每个 RUN 脚本完成时的同批读取证据；寄存器是顺序读取，不是 BQ 的原子 ADC 帧。
  * crc_ok_mask 表示本批每个寄存器均经独立 CRC 校验；field_ok_mask 进一步要求
- * 原始格式/量程、保护配置及控制位合理。任何 DMA/CRC 重试污染整批质量。
- * PARTIAL 要求连续两批间隔 >=250 ms、VC1/VC2 范围正常、VC3/4/状态/保护
- * 正常，且 VC5 或 BAT 有明确的单字段范围/格式错误。仅 BAT-sum 不一致无法
- * 判定坏的是 BAT 还是 VC5：归为 INVALID，不猜测故障通道。 */
+ * 必需字段的格式/量程、保护配置及控制位合理。VC5/BAT/VC3/VC4 是 optional
+ * 诊断字段：读数异常只影响 raw 诊断，绝不影响 VC1/VC2 发布。 */
 typedef enum
 {
     BQ_BATCH_INVALID = 0,
-    BQ_BATCH_FULL_CANDIDATE = 1, /* 合理但尚未完成原有双帧发布 */
-    BQ_BATCH_FULL_REAL_OK = 2,   /* 仅本批产生真实成功发布 */
-    BQ_BATCH_PARTIAL_CANDIDATE = 3, /* 首批符合窄条件，证据尚未二次确认 */
-    BQ_BATCH_PARTIAL_VC5_PACK = 4
+    BQ_BATCH_FULL_CANDIDATE = 1, /* 合理但尚未完成双帧发布 */
+    BQ_BATCH_FULL_REAL_OK = 2    /* 仅本批产生真实成功发布 */
 } bq_batch_class_t;
 
 #define BQ_FIELD_VC1        (1u << 0)
 #define BQ_FIELD_VC2        (1u << 1)
-#define BQ_FIELD_VC5        (1u << 2)
-#define BQ_FIELD_BAT        (1u << 3)
-#define BQ_FIELD_VC3        (1u << 4)
-#define BQ_FIELD_VC4        (1u << 5)
+#define BQ_FIELD_VC5        (1u << 2)  /* optional raw VC5 诊断 */
+#define BQ_FIELD_BAT        (1u << 3)  /* optional raw BAT 诊断 */
+#define BQ_FIELD_VC3        (1u << 4)  /* optional raw VC3 诊断 */
+#define BQ_FIELD_VC4        (1u << 5)  /* optional raw VC4 诊断 */
 #define BQ_FIELD_TS1        (1u << 6)
 #define BQ_FIELD_CC         (1u << 7)
 #define BQ_FIELD_SYS_STAT   (1u << 8)
@@ -126,8 +117,10 @@ typedef enum
 #define BQ_FIELD_CTRL2      (1u << 10)
 #define BQ_FIELD_PROTECTION (1u << 11) /* PROTECT1/2/3 必须都读回一致 */
 #define BQ_FIELD_ALL        ((1u << 12) - 1u)
-#define BQ_EST_CELL3        (1u << 0)
-#define BQ_EST_PACK         (1u << 1)
+/* 帧发布只依赖这些字段；VC5/BAT/VC3/VC4 不在此列。 */
+#define BQ_FIELD_REQUIRED   (BQ_FIELD_VC1 | BQ_FIELD_VC2 | BQ_FIELD_TS1 | \
+                             BQ_FIELD_CC | BQ_FIELD_SYS_STAT | BQ_FIELD_CTRL1 | \
+                             BQ_FIELD_CTRL2 | BQ_FIELD_PROTECTION)
 
 typedef struct
 {
@@ -135,30 +128,31 @@ typedef struct
     uint32_t batch_ms;           /* 该批读取结束的 HAL ms（非 RTC 时间） */
     uint32_t sample_start_ms;    /* 该批发起时刻；连续批次 >=250 ms */
     uint32_t published_seq;      /* 真正发布成功的累积序号，候选帧不增加 */
-    uint32_t published_ms;       /* 最后一次真实发布；不随部分批次变化 */
+    uint32_t published_ms;       /* 最后一次真实发布；不随候选批次变化 */
     uint16_t crc_ok_mask;        /* 本批实际经 CRC 的各寄存器 */
-    uint16_t field_ok_mask;      /* 本批 CRC + 合理性/配置校验 */
-    uint16_t raw_cell[3];       /* VC1/VC2/VC5，本批实际读值 */
-    uint16_t cell_mv[3];        /* 本批实测换算值（无效时仅供诊断） */
-    uint16_t raw_pack;
-    uint16_t pack_mv;
+    uint16_t field_ok_mask;      /* 本批 CRC + 必需字段合理性/配置校验 */
+    uint16_t raw_cell[3];        /* VC1/VC2/VC5 原始码；VC5 仅诊断 */
+    uint16_t cell_mv[3];         /* [0]=VC1 实测, [1]=VC2 实测, [2]=两节合成均值 */
+    uint16_t raw_pack;           /* BAT 原始码，仅诊断 */
+    uint16_t pack_mv;            /* 三节合成总压（控制值） */
     uint16_t raw_vc3;
     uint16_t raw_vc4;
-    uint16_t ts1_raw;         /* 同批 TS1（CRC+14-bit 格式），不验证 NTC 物理接线 */
-    uint16_t estimated_cell3_mv; /* 仅 estimated_mask 指明时供显示/记录 */
-    uint16_t estimated_pack_mv;  /* 非独立电压观测、绝不可用作保护 */
-    int16_t cc_raw;            /* 本批 BQ CC；不等于发布帧的 cc_raw */
-    int32_t current_ma;        /* 同批 CC 换算，非独立物理传感器 */
-    uint8_t sys_stat;         /* 本批两次状态读取的故障位并集 */
+    uint16_t ts1_raw;            /* 同批 TS1（CRC+14-bit 格式） */
+    uint16_t log_cell3_mv;       /* 真实 VC5：可信时记录实测，否则 0 */
+    uint16_t log_pack_mv;        /* 真实 BAT：可信时记录实测，否则 0 */
+    int16_t cc_raw;              /* 本批 BQ CC；不等于发布帧的 cc_raw */
+    int32_t current_ma;          /* 同批 CC 换算，非独立物理传感器 */
+    uint8_t sys_stat;            /* 本批过滤后的有效故障位并集 */
+    uint8_t raw_sys_stat;        /* 本批原始故障位并集，仅诊断 */
     uint8_t ctrl1;
     uint8_t ctrl2;
     uint8_t protect1;
     uint8_t protect2;
     uint8_t protect3;
-    uint8_t estimated_mask;   /* BQ_EST_*；没有估算时必为 0 */
-    uint8_t partial_confirm_count; /* 0/1/2，只有达到 2 才归类 PARTIAL */
-    uint8_t complete;         /* 最近一次完整 RUN 批次的完整性；正常下一次 DMA 期间保持，失败即清零 */
-    uint8_t quality;          /* bq_batch_class_t；绝不从 reject_reason 猜 */
+    uint8_t log_cell3_valid;     /* 真实 VC5 通过 1..5 V 合理性检查 */
+    uint8_t log_pack_valid;      /* 真实 BAT 通过范围 + 三节残差检查 */
+    uint8_t complete;            /* 必需字段完整；optional 诊断失败不影响 */
+    uint8_t quality;             /* bq_batch_class_t */
 } bq_batch_quality_t;
 
 typedef struct
@@ -173,12 +167,15 @@ typedef struct
 
 typedef struct
 {
-    uint16_t cell_mv[3];
-    uint16_t pack_mv;
+    uint16_t cell_mv[3];    /* [0]=VC1, [1]=VC2, [2]=合成均值 (c1+c2+1)/2 */
+    uint16_t pack_mv;       /* 合成总压 = c1 + c2 + c3_syn */
+    uint16_t log_cell3_mv;  /* 真实 VC5：可信时记录实测，否则 0 */
+    uint16_t log_pack_mv;   /* 真实 BAT：可信时记录实测，否则 0 */
     int16_t  cc_raw;
     int32_t  current_ma;    /* CC 换算电流，带符号（250 ms 平均，未板级校准） */
     uint16_t ts1_raw;
-    uint8_t  sys_stat;
+    uint8_t  sys_stat;      /* 过滤后的有效 SYS_STAT（假 OV/UV 已屏蔽） */
+    uint8_t  raw_sys_stat;  /* 原始 SYS_STAT，仅诊断 */
     uint8_t  protect1;
     uint8_t  protect2;
     uint8_t  protect3;
@@ -188,9 +185,15 @@ typedef struct
     int8_t   adc_offset;    /* mV */
     uint8_t  fresh;         /* 最近一帧是有效帧且 last_update_ms 在老化窗口内 */
     uint32_t last_update_ms;
-    uint8_t  valid;         /* 最近一次完整帧通过电压/包压校验 */
+    uint8_t  valid;         /* 最近一次完整帧通过 VC1/VC2 与配置校验 */
     uint8_t  reject_reason; /* bq_frame_reject_t；0=OK */
-    int16_t  pack_residual_mv; /* pack_mv - (cell0+cell1+cell2) */
+    uint8_t  log_cell3_valid; /* 真实 VC5 可信，可用于黑匣子/StateStore */
+    uint8_t  log_pack_valid;  /* 真实 BAT 可信，可用于黑匣子/StateStore */
+    uint16_t ov_trip_mv;      /* 实际写入 OV_TRIP 反算值 */
+    uint16_t uv_trip_mv;      /* 实际写入 UV_TRIP 反算值 */
+    uint16_t cell12_meas_mv[2]; /* 最近一次 VC1/VC2 实测，用于 OV/UV 归因 */
+    uint8_t  cell12_meas_valid; /* 上述值在 1..5 V */
+    uint8_t  cell12_measured_once;
 
     /* 调试/恢复诊断；发布值仍只用上面的 cell_mv/pack_mv。 */
     uint16_t raw_cell[3];
@@ -210,7 +213,7 @@ typedef struct
     uint8_t  recovery_episode;  /* 1=ADC 恢复回合进行中 */
     uint8_t  verdict_active;    /* 1=本轮 ADC 重启等待“有果” */
     uint32_t verdict_deadline_ms;
-    uint16_t good_publish_streak; /* 连续成功发布帧数，5 帧清除故障 */
+    uint16_t good_publish_streak; /* 连续成功发布帧数，4 帧清除故障 */
     uint16_t pending_raw_cell[3];
     uint16_t pending_raw_pack;
     uint32_t adc_restart_count;
@@ -222,6 +225,7 @@ typedef struct
     uint8_t  pre_ctrl2;
     uint8_t  pre_sys_stat;
     uint8_t  pre_cellbal1;
+    uint8_t  post_cellbal1;     /* 每次开 ADC/进 LP 后回读，必须为 0 */
     uint8_t  pre_snapshot_valid;
     uint8_t  post_ctrl1;
     uint8_t  post_ctrl2;
@@ -290,10 +294,9 @@ typedef struct
 } bq_lp_status_t;
 
 int BQ_LpBootPrepare(bq_lp_status_t *out);
-#define BQ_LP_MONITOR_VOLTAGE_ANOMALY (-2)
-/* 复位安全 LP：0=两批独立实测确认，-2=CRC 完整且局限 VC5/BAT
- * 的电压数据异常，-1=通信/CRC/VC1/VC2/VC3/VC4/状态/保护故障或未知；
- * -2 只用于归档/唤醒分级，不用估算电压恢复 FET/保护。 */
+/* 复位安全 LP：0=两批独立实测确认（cell1/2 实测，cell3/pack 合成），
+ * -1=通信/CRC/VC1/VC2/状态/保护故障或未知。VC5/BAT 只作 raw 诊断，
+ * 不再产生“电压异常”专用返回码。 */
 int BQ_LpMonitorRun(bq_snapshot_t *out);
 
 #define BQ_SYS_STAT_OCD         (1u << 0)
@@ -305,8 +308,10 @@ int BQ_LpMonitorRun(bq_snapshot_t *out);
 #define BQ_SYS_STAT_CC_READY    (1u << 7)
 #define BQ_SYS_STAT_PROT_MASK   (BQ_SYS_STAT_OCD | BQ_SYS_STAT_SCD | \
                                  BQ_SYS_STAT_OV | BQ_SYS_STAT_UV)
-/* 只有这些位是真正的保护/芯片故障唤醒；CC_READY/OVRD_ALERT 不是。 */
-#define BQ_SYS_STAT_ALERT_WAKE_MASK (BQ_SYS_STAT_PROT_MASK | \
+/* LP 唤醒只用不受 VC5/BAT 假锁存影响的位：SCD/OCD/XREADY。
+ * OV/UV 在 LP 中 ADC 关闭，无法区分真实 cell1/2 与 VC5 假触发；
+ * 真实 OV/UV 由 30 min monitor 测到 cell1/2 后按 fault wake 处理。 */
+#define BQ_SYS_STAT_ALERT_WAKE_MASK (BQ_SYS_STAT_SCD | BQ_SYS_STAT_OCD | \
                                      BQ_SYS_STAT_XREADY)
 
 /* 保护锁存查询/验证式清除：清除只允许 SCD/OCD，且要求 BQ idle/RUN。
@@ -315,8 +320,8 @@ uint8_t BQ_GetProtectionLatchMask(void);
 uint8_t BQ_GetBootProtectionLatchMask(void);
 int BQ_ClearProtectionVerified(uint8_t mask, uint8_t *sys_stat_after);
 
-/* M1b 预留 API：均衡/SHIP/保护/温度源。全部要求主循环、BQ_IsIdle()、RUN。 */
-int BQ_SetBalanceMask(uint8_t mask);
+/* 保护/温度源 API。全部要求主循环、BQ_IsIdle()、RUN。
+ * 均衡永久关闭：不再提供 BQ_SetBalanceMask()。 */
 int BQ_ShipMode(void);
 int BQ_ClearProtection(uint8_t sys_stat_mask);
 int BQ_WriteProtectionRaw(const uint8_t protect[3], uint8_t ov_trip,
@@ -343,11 +348,6 @@ void BQ_GetSnapshot(bq_snapshot_t *out);
 void BQ_GetBatchQuality(bq_batch_quality_t *out);
 void BQ_GetCcSample(bq_cc_sample_t *out);
 uint8_t BQ_IsCcFresh(uint32_t now_ms);
-
-/* 仅对严格 PARTIAL 且 FET 请求/影子均为 0，按 >=10 s 间隔触发受控重启。
- * 1=排队成功，0=不合条件/正在等待；真正通信/XREADY 故障继续走原路径。
- * 两次额度耗尽时允许按冷却重试，但不清故障诊断；四个真实发布帧才复位。 */
-uint8_t BQ_RequestPartialRetry(void);
 
 /* ADC 受控重启/恢复状态，主循环和自检只读使用。 */
 uint8_t BQ_IsRecovering(void);

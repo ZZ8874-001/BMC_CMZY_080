@@ -87,22 +87,6 @@ int StateStore_CommitArchiveSnapshot(const state_store_view_t *view,
                                      uint32_t mark_epoch, uint32_t mark_id,
                                      uint8_t mark_quality, uint8_t estimate_flags);
 
-/* 归档任务不能在 ISR 调用；报警/锁存的持久提交失败必须由调用者
- * 维持 RAM 禁放行，Flash 无法保证掉电后的这次新锁存。 */
-int StateStore_SetArchiveAlarm(uint8_t set_flags);
-/* ClearArchiveAlarm 已删除：报警位只能由 ConfirmArchiveRecovery 或
- * SafeClearArchiveAlarm 按照各自的安全前置条件清除。 */
-
-/* 上层确认连续 9 个新的实测好帧后、2 min 到期前调用：同一 Flash
- * 记录中清四连异常计数和 PENDING，不改变标记 ID，绝不清 LATCHED。
- * 锁存已置位时拒绝；返回 0/-1。 */
-int StateStore_ConfirmArchiveRecovery(void);
-
-/* 仅限人工安全解锁（独立核对实测好帧/保护/可信 CC/FET 回读后）：
- * 在一个 v2 记录中清所有报警、关断回读和四次计数，不改 mark ID。
- * 无持久化记录/写失败返回 -1，绝不能据此放行输出。 */
-int StateStore_SafeClearArchiveAlarm(void);
-
 /* 清除指定 flags 并提交当前记录；失败时内存中的 flags 也不改变。 */
 int StateStore_ClearLatch(uint16_t flags);
 

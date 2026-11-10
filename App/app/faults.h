@@ -28,6 +28,10 @@ void Fault_ClearSticky(uint16_t mask);
 uint16_t Fault_GetLive(void);
 uint16_t Fault_GetSticky(void);
 uint16_t Fault_GetAll(void);
+uint32_t Fault_GetPvdIrqCount(void);
+
+/* 主循环调用：瞬时 PVD 后自动释放 sticky POWER，避免一次边沿永久锁死。 */
+void Fault_PowerRecoverTask(uint32_t now_ms);
 
 /* 供电源模式使用：LP 中关闭 PVD 省电，唤醒后恢复。 */
 void Fault_PvdEnable(void);

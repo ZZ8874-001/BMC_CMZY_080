@@ -27,8 +27,9 @@
 
 /* BQ_STALE is intentionally excluded: it is the expected symptom of a
  * scoped partial sample. All other live/sticky faults remain authoritative. */
+/* BQ OV/UV 由 protection supervisor 处理；只要 protection 未锁存，
+ * 驱动过滤后的 VC5 假 UV 不应让自检永久失败。 */
 #define SELFTEST_REAL_FAULT_MASK (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY | \
-                                  FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV | \
                                   FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD | \
                                   FAULT_BIT_TEMP | FAULT_BIT_LSE | \
                                   FAULT_BIT_FLASH_LOG | FAULT_BIT_PROTECTION | \
@@ -59,8 +60,6 @@ static struct
     uint8_t done;
     uint8_t passed;
     uint8_t event;
-    uint8_t voltage_partial;
-    uint8_t voltage_defer;
     uint8_t full_frame_qualified;
     uint16_t fail_mask;
 } s_self_test;
@@ -68,17 +67,6 @@ static struct
 static uint8_t SelfTest_RealFaultActive(void)
 {
     return ((Fault_GetAll() & SELFTEST_REAL_FAULT_MASK) != 0u) ? 1u : 0u;
-}
-
-static uint8_t SelfTest_PartialBqOnly(uint16_t checks)
-{
-    /* The caller supplies this classification from complete-read evidence.
-     * Never use it to hide static checks or real hardware/protection faults. */
-    return ((s_self_test.voltage_partial != 0u) &&
-            ((checks & (uint16_t)~SELFTEST_BQ_MASK) == 0u) &&
-            ((checks & SELFTEST_BQ_MASK) != 0u) &&
-            (SelfTest_RealFaultActive() == 0u) &&
-            (BQ_GetAdcRecoveryFailed() == 0u)) ? 1u : 0u;
 }
 
 static uint16_t SelfTest_RunChecks(uint32_t now_ms)
@@ -93,6 +81,21 @@ static uint16_t SelfTest_RunChecks(uint32_t now_ms)
     if (BQ_GetState() != BQ_ST_RUN)
     {
         fail |= SELFTEST_FAIL_BQ_LINK;
+    }
+    else
+    {
+        bq_batch_quality_t batch;
+        bq_snapshot_t snap;
+
+        BQ_GetBatchQuality(&batch);
+        BQ_GetSnapshot(&snap);
+        if ((batch.quality == (uint8_t)BQ_BATCH_FULL_REAL_OK) &&
+            (batch.complete != 0u) && (batch.published_seq != 0u) &&
+            (batch.published_ms == batch.batch_ms) &&
+            (batch.published_ms == snap.last_update_ms))
+        {
+            s_self_test.full_frame_qualified = 1u;
+        }
     }
     if ((BQ_IsFresh(now_ms) == 0u) ||
         (s_self_test.full_frame_qualified == 0u))
@@ -163,8 +166,6 @@ void SelfTest_Init(void)
     s_self_test.done = 0u;
     s_self_test.passed = 0u;
     s_self_test.event = SELFTEST_EVENT_NONE;
-    s_self_test.voltage_partial = 0u;
-    s_self_test.voltage_defer = 0u;
     s_self_test.full_frame_qualified = 0u;
     s_self_test.fail_mask = 0u;
 }
@@ -177,8 +178,6 @@ void SelfTest_Request(void)
     s_self_test.event = SELFTEST_EVENT_NONE;
     s_self_test.fail_mask = 0u;
     s_self_test.completion_ms = 0u;
-    s_self_test.voltage_partial = 0u;
-    s_self_test.voltage_defer = 0u;
     s_self_test.full_frame_qualified = 0u;
     s_self_test.state = SELFTEST_STATE_WAIT_BQ;
     s_self_test.wait_start_ms = HAL_GetTick();
@@ -187,29 +186,6 @@ void SelfTest_Request(void)
     s_self_test.grace_accum_ms = 0u;
     s_self_test.grace_last_ms = 0u;
     s_self_test.recovery_hold_start_ms = 0u;
-}
-
-void SelfTest_SetVoltageAnomaly(uint8_t partial, uint8_t defer)
-{
-    s_self_test.voltage_partial = (partial != 0u) ? 1u : 0u;
-    s_self_test.voltage_defer = (defer != 0u) ? 1u : 0u;
-
-    /* defer=0 只允许由一笔真实新发布帧放行；调用者负责验证该证据。 */
-    if ((s_self_test.voltage_partial == 0u) &&
-        (s_self_test.voltage_defer == 0u) &&
-        (BQ_GetState() == BQ_ST_RUN) &&
-        (BQ_IsFresh(HAL_GetTick()) != 0u))
-    {
-        bq_batch_quality_t batch;
-
-        BQ_GetBatchQuality(&batch);
-        if ((batch.quality == (uint8_t)BQ_BATCH_FULL_REAL_OK) &&
-            (batch.complete != 0u) && (batch.published_seq != 0u) &&
-            (batch.published_ms == batch.batch_ms))
-        {
-            s_self_test.full_frame_qualified = 1u;
-        }
-    }
 }
 
 static void SelfTest_Monitor(uint32_t now_ms)
@@ -226,16 +202,6 @@ static void SelfTest_Monitor(uint32_t now_ms)
     s_self_test.last_monitor_ms = now_ms;
 
     checks = SelfTest_RunChecks(now_ms);
-
-    /* Known partial data is not a generic self-test failure. Keep an already
-     * qualified result stable, and keep a failed result from auto-recovering. */
-    if (SelfTest_PartialBqOnly(checks) != 0u)
-    {
-        s_self_test.bq_bad_start_ms = 0u;
-        s_self_test.bq_good_start_ms = 0u;
-        s_self_test.recovery_hold_start_ms = 0u;
-        return;
-    }
 
     /* ADC recovery exhaustion remains a real BQ failure. */
     if (BQ_GetAdcRecoveryFailed() != 0u)
@@ -365,16 +331,6 @@ void SelfTest_Poll(uint32_t now_ms)
         {
             SelfTest_Finish(checks, now_ms, SELFTEST_EVENT_PASS);
         }
-        else if ((s_self_test.voltage_partial != 0u) &&
-                 (s_self_test.voltage_defer != 0u) &&
-                 (SelfTest_PartialBqOnly(checks) != 0u))
-        {
-            /* Remain pending. The 60 s alarm belongs to the anomaly
-             * coordinator, so this path never emits generic SELFTEST FAIL. */
-            s_self_test.state = SELFTEST_STATE_WAIT_BQ_GRACE;
-            s_self_test.last_monitor_ms = now_ms;
-            s_self_test.grace_last_ms = now_ms;
-        }
         else
         {
             s_self_test.state = SELFTEST_STATE_WAIT_BQ_GRACE;
@@ -392,16 +348,6 @@ void SelfTest_Poll(uint32_t now_ms)
             SelfTest_Finish(checks, now_ms, SELFTEST_EVENT_PASS);
             break;
         }
-        if ((s_self_test.voltage_partial != 0u) &&
-            (s_self_test.voltage_defer != 0u) &&
-            (SelfTest_PartialBqOnly(checks) != 0u))
-        {
-            /* Do not accumulate either grace deadline while the scoped
-             * partial condition is explicitly deferred. */
-            s_self_test.grace_last_ms = now_ms;
-            break;
-        }
-
         if (BQ_IsRecovering() == 0u)
         {
             uint32_t delta = now_ms - s_self_test.grace_last_ms;

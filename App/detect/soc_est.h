@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    soc_est.h
- * @brief   li-ion-soc-soh-toolkit 适配层：BQ 快照 -> SOC/SOH -> StateStore/NVM。
+ * @brief   li-ion-soc-soh-toolkit 适配层：BQ 快照 -> SOC/SOH -> NVM。
  *
  * 约定：
  *   - 输入只使用三节中的最低节电压（库是 1S 模型）和 BQ CC 电流；
@@ -19,7 +19,6 @@
 
 #include "board.h"
 #include "bsp/bq_ic.h"
-#include "app/state_store.h"
 
 /* 标定完成前保持 0；NMC 表目前是典型值占位。 */
 #define SOC_EST_CAL_VALID            0u
@@ -36,8 +35,7 @@
 typedef enum
 {
     SOC_EST_QUALITY_NONE = 0,       /* 当前无可信新样本，SOC 仅保持旧值 */
-    SOC_EST_QUALITY_REAL = 1,       /* 已发布的三节 + BAT 全实测帧 */
-    SOC_EST_QUALITY_ESTIMATED = 2   /* 两节实测 + 独立新 CC，SOC 非安全输入 */
+    SOC_EST_QUALITY_REAL = 1        /* 已发布的三节 + BAT 合成/实测帧 */
 } soc_est_quality_t;
 
 typedef struct
@@ -46,7 +44,7 @@ typedef struct
     uint8_t  temp_valid;       /* TS1 温度换算有效（无新 TS1 则为 0） */
     uint8_t  cal_valid;        /* NMC 标定有效（当前固定 0） */
     soc_est_quality_t quality; /* 本次 SOC 更新所用电压的来源 */
-    uint8_t  soc_estimated;    /* 曾以部分数据更新；等待全真实静置 OCV 重同步 */
+    uint8_t  soc_estimated;    /* 历史估算标志；正常真实帧静置重同步后清零 */
     int32_t  soc01;            /* 0..10000 */
     int32_t  soh01;            /* 0..10000 */
     int16_t  temp_dc;          /* 0.1 °C */
@@ -66,12 +64,6 @@ void SocEst_Init(void);
 /* 主循环在 BQ_Poll 后调用；只消费 fresh/valid 的完整真实发布帧。 */
 void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms);
 
-/* 仅在 BQ 严格归类本批 PARTIAL 后调用；验证同批 VC1/VC2、配置/状态
- * 合格和独立新 CC 转换（CRC、时间、序号），不读旧 snapshot.current_ma。
- * 缺 CC 时改调用 SocEst_InvalidateInput()，不喂算法。 */
-void SocEst_OnPartialSample(const bq_batch_quality_t *batch,
-                            const bq_cc_sample_t *cc);
-
 /* 无法证明当前批次可信时清质量与温度有效位，保留显示 SOC 值而不学习。 */
 void SocEst_InvalidateInput(void);
 
@@ -80,18 +72,6 @@ void SocEst_Task(void);
 
 /* LP 进入前调用：有未落盘 SOH 学习结果则立即保存。 */
 void SocEst_PrepareForLp(void);
-
-/* 由同批次冻结的 SOC/温度与调用方提供的实测或清零电压构造归档 view。
- * 不把两节估算包压写成实测 pack_mv；仅当参数、来源和电压清零策略
- * 一致时返回 0，否则 -1。调用方再用 StateStore_CommitArchiveSnapshot()
- * 原子提交标记及 view；不得用更晚的最新 SOC 替换已认证候选。 */
-int SocEst_FillStateStoreView(const soc_est_snapshot_t *captured,
-                              const uint16_t measured_cell_mv[3],
-                              uint16_t measured_pack_mv, uint16_t archive_flags,
-                              state_store_view_t *out);
-
-/* 旧常规 30 min 存档路径；新归档应优先使用冻结快照的 FillStateStoreView。 */
-int SocEst_CommitStateStore(void);
 
 /* 换电/新电池后由 M5 调用：恢复标称容量并清学习计数。 */
 void SocEst_ResetForNewPack(void);

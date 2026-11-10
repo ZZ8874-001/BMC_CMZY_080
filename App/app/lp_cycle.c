@@ -204,7 +204,8 @@ static uint8_t LpCycle_IsAlertAsserted(void)
             GPIO_PIN_SET) ? 1u : 0u;
 }
 
-/* PA8 高只作为触发；真正唤醒只看 SYS_STAT 的 OV/UV/SCD/OCD/XREADY。
+/* PA8 高只作为触发；LP 唤醒只看 SCD/OCD/XREADY（OV/UV 在 LP 中
+ * 无法区分真实 cell1/2 与不可信 VC5，真实 OV/UV 由 30 min monitor 处理）。
  * CC_READY/XREADY/OVRD_ALERT 在这里清掉，并返回 0（不是真实保护唤醒）。
  * 返回 1=真实保护位，0=仅非保护位或已清，-1=I2C 读取失败。 */
 static int LpCycle_AlertConfirm(void)
@@ -264,7 +265,7 @@ static uint8_t LpCycle_BqSniffOnce(uint8_t *prot_mask)
     BQ_LpSniffDeInit();
 
     /* BQ_LpBootPrepare 返回的是清完 CC_READY/XREADY/OVRD_ALERT 之后的状态；
-     * 只有这些真实保护位才允许作为 LP 唤醒原因。 */
+     * 只有 SCD/OCD/XREADY 这些不受 VC5 假锁存影响的位才作为 LP 唤醒原因。 */
     if (prot_mask != NULL)
     {
         *prot_mask = (uint8_t)(status.sys_stat &
@@ -393,12 +394,6 @@ static void LpCycle_DoMark(rtc_epoch_t *now)
     }
     monitor = BQ_LpMonitorRun(&snap);
     BQ_LpSniffDeInit();
-    if (monitor == BQ_LP_MONITOR_VOLTAGE_ANOMALY)
-    {
-        /* 只有 BQ 明确证明完整 CRC 读取、无硬件保护且是电压数据异常，
-         * 才交给 NORM 的 60 s 九帧/降级归档；不置粘性 LP fault。 */
-        LpCycle_ForceFullWake(LP_WAKE_MONITOR);
-    }
     if (monitor != 0)
     {
         LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
@@ -427,20 +422,48 @@ static void LpCycle_DoMark(rtc_epoch_t *now)
             uptime_s = BlackBox_GetUptimeBase();
         }
         Watchdog_Feed();
-        if (BlackBox_WritePeriodicSnapshot(&snap, uptime_s) != 0)
         {
-            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
-        }
-        Watchdog_Feed();
+            bq_snapshot_t log = snap;
+            uint16_t bb_flags = 0u;
+            uint8_t estimate_flags = 0u;
+            uint8_t mark_quality;
 
-        /* 两处 Flash 不是原子事务：先记下黑匣子已经成功，若 StateStore
-         * 失败，完整 NORM 仅补交 StateStore，不得重复写同一 LP 快照。 */
-        if (LpCycle_NotePendingMarkArchived(mark_epoch) == 0u)
-        {
-            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+            /* 黑匣子记录真实 VC5/BAT 可信值；不可信则写 0 并置 missing。 */
+            log.cell_mv[2] = (snap.log_cell3_valid != 0u) ?
+                             snap.log_cell3_mv : 0u;
+            log.pack_mv = (snap.log_pack_valid != 0u) ?
+                          snap.log_pack_mv : 0u;
+            if (snap.log_cell3_valid == 0u)
+            {
+                bb_flags |= BB_PERIODIC_Q_PARTIAL |
+                            BB_PERIODIC_Q_CELL3_MISSING;
+                estimate_flags |= STATE_ARCHIVE_Q_CELL3_MISSING;
+            }
+            if (snap.log_pack_valid == 0u)
+            {
+                bb_flags |= BB_PERIODIC_Q_PARTIAL |
+                            BB_PERIODIC_Q_PACK_MISSING;
+                estimate_flags |= STATE_ARCHIVE_Q_PACK_MISSING;
+            }
+            mark_quality = (estimate_flags == 0u) ?
+                           STATE_ARCHIVE_MARK_FULL :
+                           STATE_ARCHIVE_MARK_DEGRADED;
+            if (BlackBox_WritePeriodicQualified(&log, uptime_s,
+                                                bb_flags) != 0)
+            {
+                LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+            }
+            Watchdog_Feed();
+
+            /* 两处 Flash 不是原子事务：先记下黑匣子已经成功，若 StateStore
+             * 失败，完整 NORM 仅补交 StateStore，不得重复写同一 LP 快照。 */
+            if (LpCycle_NotePendingMarkArchived(mark_epoch) == 0u)
+            {
+                LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+            }
+            commit = StateStore_CommitArchiveMark(mark_epoch, mark_epoch,
+                                                  mark_quality, estimate_flags);
         }
-        commit = StateStore_CommitArchiveMark(mark_epoch, mark_epoch,
-                                              STATE_ARCHIVE_MARK_FULL, 0u);
         Watchdog_Feed();
         if (commit < 0)
         {

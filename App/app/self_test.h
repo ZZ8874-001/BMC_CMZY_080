@@ -25,11 +25,6 @@
 
 void SelfTest_Init(void);
 void SelfTest_Request(void);
-/* 主循环每次 SelfTest_Poll 前调用。partial 仅能来自同批双次确认的
- * PARTIAL_VC5_PACK；defer=1 才延长启动 BQ 动态宽限。不能用旧快照或单次
- * reject 推断 partial。静态自检和真实保护/通信故障始终正常判失败。
- * 此接口不构造全量好帧，也不生成 60 s 异常报警（由主编排负责）。 */
-void SelfTest_SetVoltageAnomaly(uint8_t partial, uint8_t defer);
 void SelfTest_Poll(uint32_t now_ms);
 
 /* 首次完成的 HAL ms（Request 后重置）；仅在 IsDone!=0 时有效，

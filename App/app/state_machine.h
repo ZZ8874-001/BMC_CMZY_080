@@ -13,8 +13,7 @@ typedef enum
 {
     SM_STATE_BOOT = 0,  /* 等待首批有效 BQ 数据 */
     SM_STATE_NORM,
-    SM_STATE_FAULT,
-    SM_STATE_BQ_ANOMALY /* 严格部分电压异常，非真实硬件保护故障 */
+    SM_STATE_FAULT
 } sm_state_t;
 
 typedef enum
@@ -26,9 +25,6 @@ typedef enum
 } sm_flow_t;
 
 void StateMachine_Init(void);
-/* 必须在 StateMachine_Update 前每轮调用，离开严格部分异常时传 0。
- * 仅标注状态；即使状态为 BQ_ANOMALY，充电仍需原完整好帧和自检。 */
-void StateMachine_SetPartialAnomaly(uint8_t confirmed);
 void StateMachine_Update(uint8_t bq_fresh, uint8_t comp_charging, uint16_t fault_all);
 
 sm_state_t StateMachine_GetState(void);
