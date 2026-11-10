@@ -1,6 +1,6 @@
 # BMC_CMZY_080 系统状态、电源/时钟/外设与状态切换
 
-> **快照**：2026-11-07，当前工作树（含 `lp_cycle.c`、`lp_session.c`、`rtc_time.c` 等新增模块，不等同于 git HEAD）。
+> **范围**：当前工作树的复位式 LP、M2 保护监督与分级 BQ 电压异常/归档行为；以实际集成后的源码与宏为准，不将旧构建或上板记录视为本次修改的验证。
 >
 > **事实来源优先级**：
 > 1. 当前 `App/`、`Core/Src`、`Core/Inc` 的 C/H 源码（本文档的唯一行为依据）；
@@ -24,7 +24,7 @@
 电源/CPU 层：S0 复位、S1 HSI16 启动、S2 LP 轻量 boot、S3 LP STOP1、
              S4 完整 boot、S5 NORM、S6 DEGRADED、S7 异常复位
         ↓
-逻辑应用层：SM BOOT/NORM/FAULT、self-test、charge policy、BQ 子状态
+逻辑应用层：SM BOOT/NORM/BQ_ANOMALY/FAULT、self-test、charge policy、BQ 子状态
 ```
 
 - 第一节按**电源/启动状态**组织 H2；SM/self-test/charge policy/BQ 子状态放在 S5 NORM 的 `1.5.4 逻辑子状态`。
@@ -272,7 +272,7 @@ S1 是从 `main()` 进入 `App_Boot()` 的启动阶段；执行 `Watchdog_Init()
 | `PA1/HSE_DIS` | 高（默认）；`LpCycle_CheckCharger()` 时短暂低 | 高=OSC1/PACK_SC 前端关闭；充电检查临时低约 30 ms，随后恢复高。 |
 | `PB1/BQ_BOOT` | 低 | 轻量 boot 不启动 BQ 配置；`BQ_LpBootPrepare()` 只读/写控制寄存器。 |
 | `PB3/PB4` | 低 | LED 灭；PB4 每轮 10 ms 心跳。 |
-| BQ ADC/TEMP/CC/FET | 全部关闭 | `BQ_LpBootPrepare()` 若发现 ADC/TEMP/CC/FET 任一开启，会写 `SYS_CTRL1=0x00`、`SYS_CTRL2=0x00`，等待 300 ms 再读；只清 CC_READY/XREADY，保留保护锁存。 |
+| BQ ADC/TEMP/CC/FET | 全部关闭 | `BQ_LpBootPrepare()` 若发现 ADC/TEMP/CC/FET 任一开启，会写 `SYS_CTRL1=0x00`、`SYS_CTRL2=0x00`，等待 300 ms 后再读 SYS_STAT；清 `CC_READY/XREADY/OVRD_ALERT`，保留 OV/UV/SCD/OCD 保护锁存。 |
 | 备份域 | 保持 | LP session BKP1..BKP10、RTC 日历、BKP0 复位原因。 |
 | IWDG | /256 → 目标值 | `LpCycle_EnterStop()` 计算目标（默认 30 s，减去 boot overhead；最小 1 s），并记录 PR/RLR。 |
 | `DBGMCU` | `DBG_STOP` 由 `PowerMode_LpDbgStopApply()` 按 `POWER_LP_KEEP_SWD` 决定；`DBG_IWDG_STOP` 由 `Watchdog_Program()` 置位 | 默认构建 `POWER_LP_KEEP_SWD=0` 清除 `DBG_STOP`；调试器 halt 时 IWDG 会被冻结。 |
@@ -390,7 +390,7 @@ S3 是 `LpCycle_EnterStop()` 执行 `WFI` 后的 STOP1 窗口。CPU/总线停止
 | BQ76920 | 全部关闭 | ADC/TEMP/CC/FET off；保护锁存保留；无轮询。 |
 | MCU ADC/SPI/USB/WWDG/其它 | 未使用 | 项目未启用。 |
 
-> **S3 的唤醒源只有三类**：IWDG 超时复位（周期 tick）、PB5 EXTI5 下降沿（按键）、SMBA 测试期间的 I2C1 ALERT/错误中断。**PA8 BQ ALERT 不是 STOP1 唤醒源**；它只在轻量 boot 的进 STOP 前和提前唤醒后的软件检查中被读电平。RTC WUT 和 LPTIM1 均被显式关闭/屏蔽。
+> **S3 的唤醒源只有三类**：IWDG 超时复位（周期 tick）、PB5 EXTI5 下降沿（按键）、SMBA 测试期间的 I2C1 ALERT/错误中断。**PA8 BQ ALERT 不是 STOP1 唤醒源**；它只在轻量 boot 的进 STOP 前和提前唤醒后被读电平，且电平只作触发——随后读 SYS_STAT，清除 `CC_READY/XREADY/OVRD_ALERT`，只有 OV/UV/SCD/OCD/XREADY 才作为 `LP_WAKE_ALERT`。RTC WUT 和 LPTIM1 均被显式关闭/屏蔽。
 
 ## 1.5 S4：完整 boot（NORMAL / WAKE / FAULT）
 
@@ -481,7 +481,7 @@ S4 是 `LpCycle_ClassifyBoot()` 返回 `LP_BOOT_NORMAL`、`LP_BOOT_WAKE` 或 `LP
 
 ## 1.6 S5：NORM 运行态
 
-S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳定运行态。SM 可能在 `BOOT/NORM/FAULT` 之间变化，self-test/charge policy/BQ 也在变化，但 S5 的时钟/电源/外设基线不变。
+S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳定运行态。逻辑状态可在 `BOOT/NORM/BQ_ANOMALY/FAULT` 间变化，电压质量与 self-test/charge policy/BQ 子状态独立；S5 的时钟/电源/外设基线不因**仅电压异常**而变化。
 
 ### 1.6.1 时钟配置
 
@@ -521,8 +521,8 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | 5 V（PB0） | 高/开 | CAN/RGB/蜂鸣器/UART 供电。 |
 | `PA1/HSE_DIS` | 低 | OSC1/PACK_SC 使能。 |
 | `PB1/BQ_BOOT` | 低 | BQ 正常运行；不得再高。 |
-| PB3/PB4 | LED 驱动 | BOOT/NORM/FAULT 灯效。 |
-| BQ ADC/TEMP/CC/FET | 运行/按策略 | ADC/TEMP/CC 开启；FET 由 `ChargePolicy_Task` 请求；IDLE 请求 0。 |
+| PB3/PB4 | LED 驱动 | BOOT/NORM/部分电压异常/FAULT 灯效；严格部分异常额外闪 PB3/HOT，BOOT 蓝 RGB 与 HOT 可并行，只有真实关键 FAULT 切红 RGB。 |
+| BQ ADC/TEMP/CC/FET | RUN 中开启；FET 按策略/监督层 | 严格 `PARTIAL_VC5_PACK` 时 ADC/CC 持续开启：只有本次已过自检/原保护、曾有真实好帧且距好帧 <20 s、同批 VC1/VC2 与新 CC/COMP2/通信/保护证据持续可信，才允许有条件 DISCHARGE；两次不同 CC 转换 ≥2 A 锁存 OCP。CC/保护证据失效立即关输出，20 s 无新 FULL 关输出并报警。输出中 10 s 仅额外复判，严禁 ADC 重启；输出全关且仍是严格 PARTIAL 才每 ≥10 s 受控重启（ADC/CC/FET off 800 ms，再 CONFIG/300 ms settle/双帧确认）。估算 CELL3/BAT 只显示/标记存档，不代表真实电芯保护。 |
 | 备份域 | 保持 | RTC/BKP/session。 |
 | IWDG | /64，喂狗 | 主循环 + 初始化点。 |
 | `DBGMCU` | `DBG_STOP` 默认清除；`DBG_IWDG_STOP` 置位 | 默认构建。 |
@@ -554,7 +554,7 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | SysTick | 运行 | 1 ms。 |
 | DBGMCU | 默认 | SWD 在 Run 可用；STOP 关闭（默认）。 |
 | Flash | 可写 | BlackBox/StateStore/BMS NVM；30 min 记录。 |
-| BQ76920 | RUN | ADC/TEMP/CC on；FET 按策略；保护 0x89/0x57/0x40；`BQ_IsFresh` 2 s 窗口。 |
+| BQ76920 | RUN | ADC/TEMP/CC on；FET 按策略；保护 0x89/0x57/0x40（SCD 100 µs，OCD 仅放电）；`BQ_IsFresh` 2 s 窗口；M2 Protection 监督层评估 BQ 锁存、5 A/30 A 软件 OCP、NTC 温度和允许掩码；CC 符号由 `BQ_CC_DISCHARGE_SIGN` 单点定义。 |
 | MCU ADC/SPI/USB/WWDG/其它 | 未使用 | 项目未启用。 |
 
 ### 1.6.4 逻辑子状态
@@ -565,11 +565,31 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 
 | 状态 | 条件/动作 | 影响 |
 | --- | --- | --- |
-| `SM_STATE_BOOT` | `StateMachine_Init()`；BQ 不 fresh；或 FAULT 清除但 BQ 不 fresh | LED BOOT（PB4 1 Hz + 蓝 RGB）；flow STANDBY。 |
-| `SM_STATE_NORM` | BQ fresh；无 critical fault | LED NORM；flow 由比较器/策略决定 CHARGING/DISCHARGING/STANDBY。 |
-| `SM_STATE_FAULT` | critical fault（BQ_COMM/XREADY/OV/UV/SCD/OCD/ADC_STUCK/POWER/CLK） | LED FAULT（PB3 5 Hz + 红）；policy FAULT、FET 0；不改变 80 MHz/5 V。 |
+| `SM_STATE_BOOT` | `StateMachine_Init()`；无新真实 FULL；自检恢复期 | BOOT 蓝色 RGB/PB4；冷启动自检通过后仍蓝闪至少 2 s，直到真实 FULL；部分电压异常可叠加 HOT。 |
+| `SM_STATE_NORM` | 真实 BQ 帧 fresh；无关键 fault | NORM；flow 由比较器/策略决定 CHARGING/DISCHARGING/STANDBY。 |
+| `SM_STATE_BQ_ANOMALY` | 新批严格判为 PARTIAL_VC5_PACK，且无更高优先级 fault | PB3/HOT 闪烁、RGB 不因部分电压异常切红；策略/保护只按经验证的有条件窗口决定是否放电。 |
+| `SM_STATE_FAULT` | 真实 critical fault（BQ_COMM/XREADY/OV/UV/SCD/OCD/ADC_STUCK/PROTECTION/POWER/CLK 等） | FAULT PB3 5 Hz + RGB 红；策略 FAULT、双 FET 关；优先于 BQ_ANOMALY。 |
 
-#### Self-test 状态
+#### Protection 监督层（M2）
+
+| 状态/条件 | 动作 | 影响 |
+| --- | --- | --- |
+| `PROTECTION_INIT` | 上电/数据未就绪 | `allow=0`，等首帧和配置完成。 |
+| `PROTECTION_NORMAL` | 无 BQ 锁存、无软件 OCP、数据有效 | `allow=0x03`；`PROT_TEMP_ENABLE=1` 时按温度只收紧 CHG 或 DSG。 |
+| `PROTECTION_PARTIAL` | 严格 `BQ_BATCH_PARTIAL_VC5_PACK` 且无硬件/通信真实故障 | 默认 `allow=0`；只有本次曾通过真实 FULL/自检、最近 FULL <20 s、新 CC 与 COMP2/控制/保护证据持续可靠时，可限时放电；部分期 2 A/两次新 CC 转换 OCP。其它 M2 禁止条件优先。 |
+| `PROTECTION_RECOVERY` | boot/LP 首次配置前已锁存 SCD/OCD | `allow=0`；BQ RUN/idle、FET 全关、`|I|≤500 mA` 连续 2 s 后验证式清除。 |
+| `PROTECTION_LATCHED` | BQ 运行期锁存、清除失败、软件 OCP | `allow=0`、`FAULT_BIT_PROTECTION`；软件 OCP 只接受 `Protection_RequestLatchClear()`。 |
+| 软件充电 OCP | CC 充电方向 ≥5 A，2 个新发布帧 | 锁存双 FET 关；事件 0x1C；清除额外要求充电器移除。 |
+| 软件放电 OCP | CC 放电方向 ≥30 A，2 个新发布帧 | 锁存双 FET 关；事件 0x1D；BQ 37.3 A OCD/44.7 A SCD 是硬件后备。 |
+| 温度 inhibit | NTC 充/放电越界，2 s 去抖、2 °C 回差；无效传感器 2 s | 只禁对应方向（无效则双禁）；不锁存、不置 PROTECTION；`PROT_TEMP_ENABLE=1` 才生效；`FAULT_BIT_TEMP` 只报传感器无效。 |
+
+#### BQ 数据质量、归档与报警
+
+每次完整 RUN 批次先按同批 CRC、范围、状态/控制/保护及新转换证据分类：`BQ_BATCH_FULL_CANDIDATE` 只是合理候选，`BQ_BATCH_FULL_REAL_OK` 才是原双帧确认后真实发布；`BQ_BATCH_PARTIAL_VC5_PACK` 必须是 VC1/VC2 在两批独立读数中可信、仅 VC5/BAT 明确异常且 VC3/VC4、CC、状态、保护、通信均正常；其它均为 `BQ_BATCH_INVALID`。`estimated_cell3_mv`/`estimated_pack_mv` 仅展示/质量标志存档，不能改 `bq_snapshot_t.valid/fresh`、清硬件锁存或作保护输入。独立 `bq_cc_sample_t` 仍是同一 BQ 的单一 CC ADC，不是冗余通道。
+
+NORM 每个 RTC 30 min 标记缓存连续 9 个真实 FULL 发布帧；到点最多延后 60 s，达标候选不被后续坏帧覆盖。前 1–3 个异常标记写降级质量记录，缺失电压字段写 0，SOC 只保留估算/无效标志，不单独报警；第四个连续异常，或窗口结束时 VC1/VC2 仍无可信证据，进入 HOT/PB3 + 最多 2 min 蜂鸣。2 min 内 9 个新 FULL 可取消；否则双 FET 经 BQ 回读确认关断后持久锁存禁止输出/自动 LP。报警起算满 5 min 仅置 STOP2/SHIP 未来 trigger，不执行该模式。StateStore 归档标记和报警锁存跨 IWDG/PIN/掉电保留；Flash 写失败不得假设已持久成功，解锁只能由独立安全条件下的人工入口触发。
+
+正常 LP 30 min 标记只需 `BQ_LpMonitorRun()` 两批独立确认，写一条黑匣子记录，不计入 NORM 九帧、不做轻量 SOC/StateStore 电池快照；异常监测保留 mark 并以无 `LP_WAKE_FAULT` 的完整唤醒交给 NORM 60 s 归档，真正通信/保护/黑匣子故障仍按 FAULT full wake。
 
 | 状态 | 条件/动作 | 影响 |
 | --- | --- | --- |
@@ -599,7 +619,8 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | `SETTLE` | 配置完成 | 300 ms ADC settle；`BQ_IsRecovering()`。 |
 | `RUN` | settle 验证通过 | 500 ms 轮询；FET 同步；fresh 发布。 |
 | `BACKOFF` | 通信/配置失败 | 20 ms 重试或 2 s 后重配。 |
-| `ADC_RESTART_OFF` | 受控 ADC 重启 | ADC/CC/FET off 300 ms 后重配。 |
+| `ADC_RESTART_OFF` | 受控 ADC 重启（仅输出关的严格部分异常） | ADC/CC/FET off 800 ms，重新 CONFIG；ADC settle 300 ms，窗口内须重新双帧确认。 |
+| `PARTIAL_RECHECK` | 输出开时严格部分异常 | 保持 ADC/CC/FET，不触发 off→on；500 ms 全量读取照常，额外 10 s 只作复判/限频日志。 |
 
 > LP 轻量路径**不运行**上述 BQ 状态机；它使用阻塞 `BQ_LpSniffInit/BQ_LpBootPrepare`/`BQ_LpMonitorRun`，并强制 BQ off。
 
@@ -950,13 +971,13 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
    - `LpCycle_DisableLegacyWut()`；feed；预检按键。
    - 可选 SMBA 测试：`pb5_mode=1`、`s_smba_test_active=1`（首次）；否则沿用。
    - `LpCycle_BqSniffOnce()`：`BQ_LpSniffInit`（HSI16 100 kHz）→ `BQ_LpBootPrepare`（强制 ADC/TEMP/CC/FET off、300 ms 等）→ `BQ_LpSniffDeInit`；若 `LOAD_PRESENT && CHG_ON=0` → `LpCycle_CheckCharger()`（PA1 低 30 ms + COMP 30 ms）。
-   - PA8 电平检查；PB4 10 ms 心跳；`RtcTime_Read` + `UpdateBootOverhead`；30 min 到点 → `LpCycle_DoMark()`（BQ monitor + BlackBox）。
+   - BQ prepare 后按 post-clear SYS_STAT 的真实保护位检查 ALERT；PB4 10 ms 心跳；`RtcTime_Read` + `UpdateBootOverhead`；30 min 到点 → `LpCycle_DoMark()`（BQ monitor + BlackBox）。
    - 计算 `target_ms`：`min(remaining_to_mark, 30000) - boot_overhead`，最小 1000 ms。
    - SMBA active → `Button_SmbaEnable()`（PB5 AF4、I2C1 HSI16 SMBA）。
 2. `LpCycle_EnterStop(target_ms)`：
    - `Watchdog_SetTimeoutMs(target_ms, lsi_hz)`；失败 → full wake。
    - `RtcTime_Read`；失败 → full wake。
-   - 最终按键/PA8 检查；保存 `last_pr/last_rlr/last_arm_epoch/ms`、`state=STOPPED`。
+   - 最终按键检查；PA8 高时读 SYS_STAT 确认，只有真实保护位才唤醒；保存 `last_pr/last_rlr/last_arm_epoch/ms`、`state=STOPPED`。
    - 使能 PWR/RTCAPB APB+SMEN；SMBA 时 I2C1；GPIOA/B/SYSCFG sleep。
    - `__enable_irq()`、feed、`HAL_SuspendTick()`、清 PendST。
    - `SET_BIT(RCC->CFGR, STOPWUCK)`；`PWR_CR1.LPMS=STOP1`；`SLEEPDEEP=1`；`__DSB`；`__WFI`。
@@ -1338,7 +1359,7 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 
 ## E. 当前实现的边界与已知限制
 
-> 以下按 2026-11-07 源码整理；`DOCS/POWER_MODE.md` 与 `CLAUDE.md` 已同步，历史 CSV/旧日志不代表当前 watch 集。
+> 以下按当前工作树源码整理；本文描述本次目标的质量/归档边界，但不把编译、烧录或上板行为写成已验证事实。
 
 1. **LSE 硬件**：当前板 LSE 不起振，默认 `LP_RTC_USE_LSE=0`，RTC 走 LSI，LP 正常。切到 `=1` 时必须先修好晶振；LSE 失败会回退 LSI 保 boot，但 `PowerMode_LpTimebaseReady()` 失败、LP 禁用并置 LSE/TIMEBASE 故障。RTCSEL 改变会触发一次 `BDRST`，清 BKP/日历一次。
 2. **LSI 绝对时间**：RTC 与 IWDG 同源，30 min 点按 RTC epoch 计，IWDG timeout 用 RTC 差分校准；相对周期自洽，但 LSI 的绝对精度/温漂未标定，不能当长时间计量。
@@ -1373,12 +1394,13 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | BQ transfer timeout | 100 ms | 总线恢复 |
 | BQ ADC conversion | 250 ms | 采样最小间隔 |
 | BQ ADC settle | 300 ms | `BQ_ADC_SETTLE_MS` |
-| BQ resample | 300 ms | OOR 重采样 |
-| BQ restart off | 300 ms | ADC 重启 |
-| BQ restart attempts | 2 | `BQ_ADC_RESTART_MAX_ATTEMPTS` |
+| BQ resample | 500 ms | `BQ_ADC_RESAMPLE_MS`；OOR 后读数间隔不低于 ADC 250 ms 转换 |
+| BQ restart off | 800 ms | `BQ_ADC_RESTART_OFF_HOLD_MS`；仅输出关闭的严格 PARTIAL 重试 |
+| BQ restart attempts | 2 | `BQ_ADC_RESTART_MAX_ATTEMPTS`；严格 PARTIAL 冷却重试不作为通信/真实故障豁免 |
 | BQ OOR streak | 8 | `BQ_OOR_STREAK_RESTART` |
 | BQ good-frame clear | 4 | `BQ_ADC_GOOD_FRAMES_CLEAR` |
-| BQ verdict | 500 ms | 重启后等待发布（当前源码常量） |
+| BQ verdict | 1500 ms | `BQ_ADC_VERDICT_MS`；重启后等待有效发布 |
+| BQ partial retry | 10000 ms | `BQ_PARTIAL_RETRY_MS`；输出关闭时最短重试间隔 |
 | BQ LP off hold | 300 ms | ADC/TEMP/CC/FET 关闭后等待 |
 | Self-test WAIT_BQ | 3 s | 首帧/分类 |
 | Self-test grace | 12 s | 非恢复累计 |

@@ -22,6 +22,30 @@
 #define BB_KIND_WAKE_MASK   3u   /* 新记录：wake 字段直接存 POWER_WAKE_* 位图 */
 #define BB_KIND_EVENT       4u   /* 事件：flags[15:6] 为 event_code */
 
+/* 仅 BB_KIND_PERIODIC 使用 flags[14:6]；旧 24 B 格式与 CRC 不变。
+ * FULL=0 保持旧记录兼容。PARTIAL 必须同时标示缺失的实测电压；缺失
+ * 值落盘为 0，估算电压永远不能填入电芯/包压字段。 */
+#define BB_PERIODIC_Q_FULL          0u
+#define BB_PERIODIC_Q_PARTIAL       (1u << 6)
+#define BB_PERIODIC_Q_CELL1_MISSING (1u << 7)
+#define BB_PERIODIC_Q_CELL2_MISSING (1u << 8)
+#define BB_PERIODIC_Q_CELL3_MISSING (1u << 9)
+#define BB_PERIODIC_Q_PACK_MISSING  (1u << 10)
+#define BB_PERIODIC_Q_SOC_ESTIMATED (1u << 11)
+#define BB_PERIODIC_Q_SOC_INVALID   (1u << 12)
+#define BB_PERIODIC_Q_CC_INVALID    (1u << 13) /* cc_raw 无本批可信转换 */
+#define BB_PERIODIC_Q_TS1_INVALID   (1u << 14) /* TS1 无本批可信采样 */
+#define BB_PERIODIC_Q_MISSING_MASK  (BB_PERIODIC_Q_CELL1_MISSING | \
+                                     BB_PERIODIC_Q_CELL2_MISSING | \
+                                     BB_PERIODIC_Q_CELL3_MISSING | \
+                                     BB_PERIODIC_Q_PACK_MISSING)
+#define BB_PERIODIC_Q_ALL           (BB_PERIODIC_Q_PARTIAL | \
+                                     BB_PERIODIC_Q_MISSING_MASK | \
+                                     BB_PERIODIC_Q_SOC_ESTIMATED | \
+                                     BB_PERIODIC_Q_SOC_INVALID | \
+                                     BB_PERIODIC_Q_CC_INVALID | \
+                                     BB_PERIODIC_Q_TS1_INVALID)
+
 /* 事件码（只用于 BB_KIND_EVENT，10 bit 范围）。 */
 #define BB_EVENT_WAKE_CHARGER   0x10u
 #define BB_EVENT_WAKE_MONITOR   0x11u
@@ -30,6 +54,18 @@
 #define BB_EVENT_BQ_ADC_RESTART 0x15u
 #define BB_EVENT_BQ_ADC_FAULT   0x16u
 #define BB_EVENT_BQ_ADC_RECOVERED 0x17u
+#define BB_EVENT_PROT_TRIP      0x18u
+#define BB_EVENT_PROT_CLEARED   0x19u
+#define BB_EVENT_PROT_CLEAR_FAILED 0x1Au
+#define BB_EVENT_PROT_LATCHED   0x1Bu
+#define BB_EVENT_PROT_SW_CHG_OCP 0x1Cu
+#define BB_EVENT_PROT_SW_DSG_OCP 0x1Du
+#define BB_EVENT_PROT_TEMP_INHIBIT 0x1Eu
+#define BB_EVENT_PROT_TEMP_RECOVER 0x1Fu
+#define BB_EVENT_BQ_VOLTAGE_ALARM 0x20u
+#define BB_EVENT_BQ_VOLTAGE_CANCEL 0x21u
+#define BB_EVENT_BQ_VOLTAGE_LATCHED 0x22u
+#define BB_EVENT_BQ_VOLTAGE_MANUAL_CLEAR 0x23u
 
 /* 旧记录的唤醒原因编码（flags 第 3–5 位）。 */
 #define BB_WAKE_NONE        0u
@@ -51,6 +87,7 @@ typedef struct
     uint8_t  kind;
     uint8_t  wake_mask;    /* 解码为 POWER_WAKE_* 位图 */
     uint16_t event_code;
+    uint16_t quality_flags; /* BB_KIND_PERIODIC 的 BB_PERIODIC_Q_*；其它为 0 */
     uint8_t  valid;
 } black_box_record_t;
 
@@ -83,8 +120,17 @@ int BlackBox_ReadShadow(uint8_t index, black_box_record_t *out);
 /* 返回 0 成功，-1 失败（失败同时置 sticky FAULT_FLASH_LOG）。
  * 记录只含电池快照 + 种类/唤醒原因；故障位图不入 Flash（24 B 布局已定）。 */
 int BlackBox_WritePeriodic(uint32_t uptime_s);
-/* LP 30 min 监测用：记录来自 HSI16 下捕获的 BQ 快照，而不是 BQ_GetSnapshot。 */
+/* LP 30 min 监测用：记录来自 HSI16 下捕获的 BQ 快照，而不是 BQ_GetSnapshot。
+ * uptime_s 是累计 NORM 运行秒；RTC epoch 不能传到此处。 */
 int BlackBox_WritePeriodicSnapshot(const bq_snapshot_t *snap, uint32_t uptime_s);
+
+/* 显式按来源质量归档第九帧候选/部分采集；FULL 只允许 fresh+valid。
+ * PARTIAL 要求至少一个 MISSING 位，并将每个缺失实测电压写 0；调用者
+ * 负责确保非缺失项属于同批可信实测，CC/TS1 无效时须同时标出
+ * BB_PERIODIC_Q_CC_INVALID/BB_PERIODIC_Q_TS1_INVALID 并把对应 raw 字段置 0。
+ * 0=成功，-1=校验或 Flash 写失败。 */
+int BlackBox_WritePeriodicQualified(const bq_snapshot_t *snap, uint32_t uptime_s,
+                                    uint16_t quality_flags);
 int BlackBox_WriteTransition(uint8_t transition_kind, uint8_t wake_cause,
                              uint32_t uptime_s);
 int BlackBox_WriteWake(uint8_t power_wake_mask, uint32_t uptime_s);

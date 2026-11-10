@@ -47,14 +47,21 @@ static void LpSession_Pack(const lp_session_t *s, uint32_t *w)
            (((uint32_t)s->flags & 0xFFu) << 16);            /* BKP3 */
     w[1] = s->next_mark_epoch;                               /* BKP4 */
     w[2] = s->lsi_hz_q16;                                    /* BKP5 */
+    /* 旧 LP03 会话中的位 15..31 一直为 0；将这 17 位和 BKP9 的
+     * 位 12..26 拼成入 LP 时的 32-bit uptime（仍在原有 CRC 范围内）。 */
+    uint32_t uptime = ((s->flags & LP_FLAG_UPTIME_VALID) != 0u) ?
+                      s->uptime_base_s : 0u;
+
     w[3] = ((uint32_t)s->last_pr & 0x07u) |
-           (((uint32_t)s->last_rlr & 0x0FFFu) << 3);        /* BKP6 */
+           (((uint32_t)s->last_rlr & 0x0FFFu) << 3) |
+           ((uptime & 0x1FFFFu) << 15);                         /* BKP6 */
     w[4] = s->last_arm_epoch;                                /* BKP7 */
     w[5] = ((uint32_t)s->last_arm_ms & 0x03FFu) |
            (((uint32_t)s->boot_overhead_ms & 0xFFFFu) << 10);/* BKP8 */
     w[6] = ((uint32_t)s->wake_cause & 0xFFu) |
            (((uint32_t)s->pb5_mode & 0x03u) << 8) |
-           (((uint32_t)s->smba_result & 0x03u) << 10);      /* BKP9 */
+           (((uint32_t)s->smba_result & 0x03u) << 10) |
+           (((uptime >> 17) & 0x7FFFu) << 12);                  /* BKP9 */
     w[7] = (uint32_t)s->seq & 0xFFFFu;                       /* BKP10 */
 }
 
@@ -76,6 +83,11 @@ static void LpSession_Unpack(const uint32_t *w, lp_session_t *s)
     s->pb5_mode = (uint8_t)((w[6] >> 8) & 0x03u);
     s->smba_result = (uint8_t)((w[6] >> 10) & 0x03u);
     s->seq = (uint16_t)(w[7] & 0xFFFFu);
+    if ((s->flags & LP_FLAG_UPTIME_VALID) != 0u)
+    {
+        s->uptime_base_s = (w[3] >> 15) |
+                           (((w[6] >> 12) & 0x7FFFu) << 17);
+    }
 }
 
 static uint8_t LpSession_Valid(const lp_session_t *s)
@@ -99,6 +111,16 @@ static uint8_t LpSession_Valid(const lp_session_t *s)
         {
             return 0u;
         }
+    }
+    if ((s->flags & LP_FLAG_MARK_LP_ARCHIVED) != 0u &&
+        (s->flags & LP_FLAG_MARK_PENDING) == 0u)
+    {
+        return 0u;
+    }
+    if ((s->flags & LP_FLAG_MARK_PENDING) != 0u &&
+        (s->next_mark_epoch == 0u))
+    {
+        return 0u;
     }
     return 1u;
 }

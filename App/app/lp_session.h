@@ -37,8 +37,11 @@ typedef enum
 #define LP_WAKE_FAULT           0x10u
 #define LP_WAKE_SMBA            0x20u
 
-/* lp_session_t.flags */
+/* lp_session_t.flags；BKP3 内均由 LP03 CRC 覆盖。 */
+#define LP_FLAG_UPTIME_VALID    0x01u  /* 新固件保存了入 LP 时的累计运行秒 */
+#define LP_FLAG_MARK_PENDING    0x02u  /* next_mark_epoch 尚未完成归档 */
 #define LP_FLAG_FULL_WAKE       0x04u
+#define LP_FLAG_MARK_LP_ARCHIVED 0x08u /* LP 黑匣子写入成功，StateStore 可补交 */
 #define LP_FLAG_FAULT           0x20u
 
 typedef struct
@@ -57,6 +60,8 @@ typedef struct
     uint8_t  pb5_mode;           /* 0=EXTI5, 1=SMBA test */
     uint8_t  smba_result;        /* 0=未测,1=ALERT,2=无ALERT,3=仅EXTI */
     uint16_t seq;                /* 会话保存序号（最小诊断） */
+    uint32_t uptime_base_s;      /* 入 LP 时的运行累计秒，不包含 RTC/STOP 时间。
+                                   * LP03 兼容：仅 LP_FLAG_UPTIME_VALID 时有效。 */
 } lp_session_t;
 
 /* 读取并校验 BKP 会话；返回 1=有效。无效时把 *s 清零。 */

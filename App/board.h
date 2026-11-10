@@ -71,6 +71,14 @@ extern DMA_HandleTypeDef hdma_log_usart1_tx;/* DMA1_Ch4，USART1_TX */
 #define BQ_CELL_COUNT           3U       /* 本板 3S：CELL3 = VC5-VC4 */
 #define BQ_CURRENT_MA_NUM       844      /* 8.44 µV/LSB ×100 */
 #define BQ_CURRENT_MA_DEN       150      /* 分流 1.5 mΩ ×100；I(mA)=cc_raw×844/150 */
+
+/* BQ CC 符号（唯一板级事实，soc_est 与 protection 都从这里派生）：
+ *   -1 = 充电时 current_ma 为正、放电为负（TI bq769x0 AFE FAQ / bq78350
+ *        约定：VSR = V(SRP) - V(SRN)，SRP 在电池负极侧）；
+ *   +1 = 放电时 current_ma 为正（上位机/库约定，若实测 CC 极性相反则改这里）。
+ * 首次上板必须用已知充电/放电方向确认（SOC 积分方向）；软件 OCP 的方向
+ * 另用 COMP2 判定，不依赖本符号。 */
+#define BQ_CC_DISCHARGE_SIGN    (-1)
 #define BQ_I2C_ADDR_7BIT        (0x08U)
 #define BQ_I2C_ADDR_WRITE       ((BQ_I2C_ADDR_7BIT) << 1)
 #define BQ_I2C_ADDR_READ        (((BQ_I2C_ADDR_7BIT) << 1) | 1U)
@@ -148,7 +156,7 @@ extern uint32_t _image_end;    /* 链接脚本定义：FLASH 镜像真实末尾 
 #define FAULT_BIT_TEMP          (1u << 6)
 #define FAULT_BIT_LSE           (1u << 7)
 #define FAULT_BIT_FLASH_LOG     (1u << 8)
-#define FAULT_BIT_CAN_BUSOFF    (1u << 9)   /* L0 保留 */
+#define FAULT_BIT_PROTECTION    (1u << 9)   /* 保护监督层聚合故障 */
 #define FAULT_BIT_POWER         (1u << 10)
 #define FAULT_BIT_CLK           (1u << 11)
 #define FAULT_BIT_BQ_STALE      (1u << 12)

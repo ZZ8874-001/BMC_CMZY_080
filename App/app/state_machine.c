@@ -16,6 +16,7 @@
                                  FAULT_BIT_BQ_OV | FAULT_BIT_BQ_UV |       \
                                  FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |     \
                                  FAULT_BIT_BQ_ADC_STUCK |                  \
+                                 FAULT_BIT_PROTECTION |                    \
                                  FAULT_BIT_POWER | FAULT_BIT_CLK)
 
 static struct
@@ -25,6 +26,7 @@ static struct
     uint32_t update_count;
     uint32_t fault_enter_count;
     uint16_t last_fault_all;
+    uint8_t partial_anomaly;
 } s_sm;
 
 void StateMachine_Init(void)
@@ -34,6 +36,12 @@ void StateMachine_Init(void)
     s_sm.update_count = 0u;
     s_sm.fault_enter_count = 0u;
     s_sm.last_fault_all = 0u;
+    s_sm.partial_anomaly = 0u;
+}
+
+void StateMachine_SetPartialAnomaly(uint8_t confirmed)
+{
+    s_sm.partial_anomaly = (confirmed != 0u) ? 1u : 0u;
 }
 
 void StateMachine_Update(uint8_t bq_fresh, uint8_t comp_charging, uint16_t fault_all)
@@ -52,9 +60,19 @@ void StateMachine_Update(uint8_t bq_fresh, uint8_t comp_charging, uint16_t fault
         return;
     }
 
-    if (s_sm.state == SM_STATE_FAULT)
+    if (s_sm.partial_anomaly != 0u)
     {
-        /* 故障消失：回到 BOOT，等新一轮有效数据后再判定 NORM。 */
+        /* 确认同批部分电压异常时单独标注，绝不伪装成正常完整好帧；
+         * 上方真实 OV/UV/SCD/OCD/通信/PVD 故障仍优先进入 FAULT。 */
+        s_sm.state = SM_STATE_BQ_ANOMALY;
+        s_sm.flow = SM_FLOW_STANDBY;
+        return;
+    }
+
+    if ((s_sm.state == SM_STATE_FAULT) ||
+        (s_sm.state == SM_STATE_BQ_ANOMALY))
+    {
+        /* 故障/异常消失：没有新鲜完整帧仍回 BOOT，禁止直接标 NORM。 */
         s_sm.state = (bq_fresh != 0u) ? SM_STATE_NORM : SM_STATE_BOOT;
     }
     else if (s_sm.state == SM_STATE_BOOT)

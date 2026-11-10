@@ -3,8 +3,8 @@
  * @file    charge_policy.h
  * @brief   充放电策略层：CHARGE/DISCHARGE/CAL + FET 请求。
  *
- * 只从主循环调用；ISR 不调用。CAL 模式由调试器写 s_policy.cal_mode /
- * s_policy.cal_fet_mask 控制，用于长时间采集标定数据。
+ * 异常部分电压放电只允许 DSG，且必须通过 Protection 独立 CC 门控；
+ * CHARGE/CAL 继续使用现有完整 BQ fresh、自检和保护条件。
  ******************************************************************************
  */
 #ifndef APP_CHARGE_POLICY_H
@@ -34,6 +34,8 @@ void ChargePolicy_Init(void);          /* 清零并 BQ_RequestFetMask(0) */
 void ChargePolicy_OnPairHold3(uint32_t now_ms);
 void ChargePolicy_OnLpWake(uint32_t now_ms);
 void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging);
+/* 四连异常2分钟到期/持久锁存：策略唯一负责安全方向关 FET。 */
+void ChargePolicy_SetArchiveLatch(uint8_t latched);
 
 charge_policy_state_t ChargePolicy_GetState(void);
 uint8_t ChargePolicy_GetRequestedMask(void);

@@ -1,18 +1,17 @@
 /**
  ******************************************************************************
  * @file    led_status.c
- * @brief   PB3/PB4 状态灯 + WS2812 单灯（GRB）。
+ * @brief   PB3/PB4 status LEDs plus the WS2812 single RGB LED.
  *
- * 相位：1 Hz（250 tick 周期）用于 BOOT 慢闪；5 Hz（50 tick 周期）用于 FAULT。
- * 中断只改相位/PB 引脚并置 dirty；RGB 帧在主循环构造并启动 DMA。
- ******************************************************************************
- */
+ * The voltage-quality overlay is intentionally independent from the RGB mode:
+ * partial data flashes HOT/PB3 at 1 Hz, and the anomaly alarm at 5 Hz. A real
+ * LED_MODE_FAULT always owns PB3 and the RGB fault indication.
+ ******************************************************************************/
 #include "app/led_status.h"
 
 #include "board.h"
 #include "bsp/ws2812_uart.h"
 
-#define LED_TICKS_PER_SEC   250u
 #define LED_BLINK_1HZ_TICKS 250u
 #define LED_BLINK_5HZ_TICKS 50u
 
@@ -23,6 +22,8 @@ static struct
     volatile uint32_t tick_count;
     volatile uint8_t phase_1hz;
     volatile uint8_t phase_5hz;
+    volatile uint8_t voltage_partial;
+    volatile uint8_t voltage_alarm;
     volatile uint8_t rgb_dirty;
     uint32_t rgb_send_count;
     uint8_t last_phase_1hz;
@@ -55,6 +56,19 @@ static void LedStatus_DrivePins(void)
         break;
     }
 
+    /* HOT is additive during BOOT/NORM, but a real fault owns PB3. */
+    if (s_led.mode != LED_MODE_FAULT)
+    {
+        if (s_led.voltage_alarm != 0u)
+        {
+            roht_on = s_led.phase_5hz;
+        }
+        else if (s_led.voltage_partial != 0u)
+        {
+            roht_on = s_led.phase_1hz;
+        }
+    }
+
     HAL_GPIO_WritePin(IND_NORM_GPIO_Port, IND_NORM_Pin,
                       (norm_on != 0u) ? GPIO_PIN_SET : GPIO_PIN_RESET);
     HAL_GPIO_WritePin(IND_ROHT_GPIO_Port, IND_ROHT_Pin,
@@ -68,6 +82,8 @@ void LedStatus_Init(void)
     s_led.tick_count = 0u;
     s_led.phase_1hz = 0u;
     s_led.phase_5hz = 0u;
+    s_led.voltage_partial = 0u;
+    s_led.voltage_alarm = 0u;
     s_led.rgb_dirty = 1u;
     s_led.rgb_send_count = 0u;
     s_led.last_phase_1hz = 0xFFu;
@@ -83,7 +99,7 @@ void LedStatus_SetMode(led_mode_t mode, led_flow_t flow)
 {
     if (s_led.mode != mode)
     {
-        s_led.tick_count = 0u;      /* 模式切换后从亮相位开始 */
+        s_led.tick_count = 0u;
         s_led.phase_1hz = 1u;
         s_led.phase_5hz = 1u;
     }
@@ -92,6 +108,22 @@ void LedStatus_SetMode(led_mode_t mode, led_flow_t flow)
         s_led.mode = mode;
         s_led.flow = flow;
         s_led.rgb_dirty = 1u;
+        LedStatus_DrivePins();
+    }
+}
+
+void LedStatus_SetVoltageAnomaly(uint8_t partial, uint8_t alarm)
+{
+    partial = (partial != 0u) ? 1u : 0u;
+    alarm = (alarm != 0u) ? 1u : 0u;
+
+    if ((s_led.voltage_partial != partial) ||
+        (s_led.voltage_alarm != alarm))
+    {
+        s_led.voltage_partial = partial;
+        s_led.voltage_alarm = alarm;
+        s_led.rgb_dirty = 1u;
+        LedStatus_DrivePins();
     }
 }
 
@@ -159,7 +191,6 @@ void LedStatus_Flush(void)
         case LED_FLOW_CAL:
             r = 48u;
             g = 24u;
-            b = 0u;
             break;
         case LED_FLOW_STANDBY:
         case LED_FLOW_FAULT:

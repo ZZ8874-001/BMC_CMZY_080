@@ -31,6 +31,16 @@ typedef enum
 void LedStatus_Init(void);
 void LedStatus_SetMode(led_mode_t mode, led_flow_t flow);
 
+/* PB3/IND_ROHT quality overlay. partial flashes at 1 Hz, alarm at 5 Hz;
+ * RGB remains BOOT/NORM color. LED_MODE_FAULT keeps priority over this
+ * overlay and continues to drive the existing red fault behavior. */
+void LedStatus_SetVoltageAnomaly(uint8_t partial, uint8_t alarm);
+
+/* 独立于 RGB 模式的电压数据质量提示：PB3 以 1 Hz 表示 PARTIAL，
+ * 以 5 Hz 表示 anomaly alarm。不会把 RGB 改成红色；LED_MODE_FAULT
+ * 仍具有最高优先级。LP 轻量路径不调用本模块，灯保持关闭。 */
+void LedStatus_SetVoltageAnomaly(uint8_t partial, uint8_t alarm);
+
 /* 250 Hz 中断上下文。 */
 void LedStatus_Tick(void);
 

@@ -34,7 +34,9 @@ endif
 
 APP_SOURCES =  \
 App/app/main_app.c \
+App/app/bq_anomaly.c \
 App/app/power_mode.c \
+App/app/protection.c \
 App/app/rtc_time.c \
 App/app/lp_session.c \
 App/app/lp_cycle.c \

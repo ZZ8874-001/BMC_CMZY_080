@@ -14,6 +14,7 @@
 #include "app/power_mode.h"
 #include "app/reset_cause.h"
 #include "app/rtc_time.h"
+#include "app/state_store.h"
 #include "app/watchdog.h"
 #include "bsp/bq_ic.h"
 #include "bsp/button.h"
@@ -30,6 +31,7 @@
 
 static lp_session_t s_lp;
 static uint8_t s_lp_loaded;
+static uint8_t s_boot_wake_cause; /* 当前 App_Boot 已校验的 LP_WAKE_*；不是旧 BKP 残留 */
 #if (LP_SMBA_WAKE_TEST != 0u)
 static uint8_t s_smba_test_active;
 #endif
@@ -60,6 +62,54 @@ static void LpCycle_Save(void)
 {
     s_lp.seq++;
     LpSession_Save(&s_lp);
+}
+
+/* RTC 的 mark_epoch 是严格跨 LP/NORM 的归档 ID；即使 FullWake 由监测失败
+ * 触发也不提前推进标记。只在黑匣子/StateStore 均完成后才确认。 */
+static uint8_t LpCycle_FinishMark(uint32_t mark_epoch, uint32_t now_epoch)
+{
+    lp_session_t previous;
+    lp_session_t check;
+    uint32_t next_mark;
+
+    if ((s_lp.next_mark_epoch != mark_epoch) ||
+        ((s_lp.flags & LP_FLAG_MARK_PENDING) == 0u))
+    {
+        return 0u;
+    }
+
+    previous = s_lp;
+    s_lp.flags &= (uint8_t)~(LP_FLAG_MARK_PENDING |
+                              LP_FLAG_MARK_LP_ARCHIVED);
+    do
+    {
+        if (s_lp.next_mark_epoch > (0xFFFFFFFFu - 1800u))
+        {
+            s_lp.next_mark_epoch = 0u;
+            break;
+        }
+        s_lp.next_mark_epoch += 1800u;
+    } while (s_lp.next_mark_epoch <= now_epoch);
+    next_mark = s_lp.next_mark_epoch;
+    LpCycle_Save();
+    if ((LpSession_Load(&check) == 0u) ||
+        (check.next_mark_epoch != next_mark) ||
+        ((check.flags & LP_FLAG_MARK_PENDING) != 0u))
+    {
+        s_lp = previous;
+        return 0u;
+    }
+    s_lp = check;
+    return 1u;
+}
+
+static void LpCycle_PreservePendingFaultWake(void)
+{
+    s_lp.state = LP_SESSION_PAUSED;
+    s_lp.wake_cause = (LP_WAKE_MONITOR | LP_WAKE_FAULT);
+    s_lp.flags |= (LP_FLAG_FULL_WAKE | LP_FLAG_FAULT);
+    LpCycle_Save();
+    s_boot_wake_cause = s_lp.wake_cause;
 }
 
 static void LpCycle_DisableLegacyWut(void)
@@ -154,10 +204,53 @@ static uint8_t LpCycle_IsAlertAsserted(void)
             GPIO_PIN_SET) ? 1u : 0u;
 }
 
-static uint8_t LpCycle_BqSniffOnce(void)
+/* PA8 高只作为触发；真正唤醒只看 SYS_STAT 的 OV/UV/SCD/OCD/XREADY。
+ * CC_READY/XREADY/OVRD_ALERT 在这里清掉，并返回 0（不是真实保护唤醒）。
+ * 返回 1=真实保护位，0=仅非保护位或已清，-1=I2C 读取失败。 */
+static int LpCycle_AlertConfirm(void)
+{
+    uint8_t stat = 0u;
+    uint8_t nonprot = (uint8_t)(BQ_SYS_STAT_CC_READY |
+                                BQ_SYS_STAT_XREADY |
+                                BQ_SYS_STAT_OVRD_ALERT);
+
+    if (LpCycle_IsAlertAsserted() == 0u)
+    {
+        return 0;
+    }
+    if (BQ_LpSniffInit() != 0)
+    {
+        BQ_LpSniffDeInit();
+        return -1;
+    }
+    if (BQ_LpSniffRead(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        BQ_LpSniffDeInit();
+        return -1;
+    }
+    if ((stat & nonprot) != 0u)
+    {
+        (void)BQ_LpSniffClearSysStat(nonprot);
+        HAL_Delay(2u);
+        if (BQ_LpSniffRead(BQ_REG_SYS_STAT, &stat) != 0)
+        {
+            BQ_LpSniffDeInit();
+            return -1;
+        }
+    }
+    BQ_LpSniffDeInit();
+
+    return ((stat & BQ_SYS_STAT_ALERT_WAKE_MASK) != 0u) ? 1 : 0;
+}
+
+static uint8_t LpCycle_BqSniffOnce(uint8_t *prot_mask)
 {
     bq_lp_status_t status;
 
+    if (prot_mask != NULL)
+    {
+        *prot_mask = 0u;
+    }
     if (BQ_LpSniffInit() != 0)
     {
         BQ_LpSniffDeInit();
@@ -169,6 +262,14 @@ static uint8_t LpCycle_BqSniffOnce(void)
         return 0u;
     }
     BQ_LpSniffDeInit();
+
+    /* BQ_LpBootPrepare 返回的是清完 CC_READY/XREADY/OVRD_ALERT 之后的状态；
+     * 只有这些真实保护位才允许作为 LP 唤醒原因。 */
+    if (prot_mask != NULL)
+    {
+        *prot_mask = (uint8_t)(status.sys_stat &
+                               BQ_SYS_STAT_ALERT_WAKE_MASK);
+    }
 
     if ((status.load_present != 0u) && (status.chg_on == 0u))
     {
@@ -272,34 +373,84 @@ static void LpCycle_UpdateBootOverhead(const rtc_epoch_t *now)
 static void LpCycle_DoMark(rtc_epoch_t *now)
 {
     bq_snapshot_t snap;
+    state_store_view_t state;
+    uint32_t mark_epoch = s_lp.next_mark_epoch;
+    uint32_t uptime_s;
+    int monitor;
+    int commit;
+
+    /* 写盘之前保存原始 RTC 标记：监测/Flash/复位失败只能把该标记交给
+     * 完整 NORM 重试，不能把失败窗口误当下一个 30 min 点。 */
+    s_lp.flags |= LP_FLAG_MARK_PENDING;
+    s_lp.flags &= (uint8_t)~LP_FLAG_MARK_LP_ARCHIVED;
+    LpCycle_Save();
+    Watchdog_Feed();
 
     if (BQ_LpSniffInit() != 0)
     {
         BQ_LpSniffDeInit();
         LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
-        return;
     }
-    if (BQ_LpMonitorRun(&snap) != 0)
-    {
-        BQ_LpSniffDeInit();
-        LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
-        return;
-    }
+    monitor = BQ_LpMonitorRun(&snap);
     BQ_LpSniffDeInit();
-
-    Watchdog_Feed();
-    BlackBox_Init();
-    if (BlackBox_WritePeriodicSnapshot(&snap, now->sec) != 0)
+    if (monitor == BQ_LP_MONITOR_VOLTAGE_ANOMALY)
+    {
+        /* 只有 BQ 明确证明完整 CRC 读取、无硬件保护且是电压数据异常，
+         * 才交给 NORM 的 60 s 九帧/降级归档；不置粘性 LP fault。 */
+        LpCycle_ForceFullWake(LP_WAKE_MONITOR);
+    }
+    if (monitor != 0)
     {
         LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
-        return;
     }
-    Watchdog_Feed();
 
-    do
+    Watchdog_Feed();
+    StateStore_Init();
+    StateStore_GetView(&state);
+    if ((state.valid != 0u) &&
+        (state.archive.last_mark_id >= mark_epoch))
     {
-        s_lp.next_mark_epoch += 1800u;
-    } while (s_lp.next_mark_epoch <= now->sec);
+        /* 复位发生在上次 StateStore 落盘与 BKP 标记确认之间；旧标记
+         * 已经归档过，绝不再写第二条 LP 黑匣子周期记录。 */
+        if (LpCycle_FinishMark(mark_epoch, now->sec) == 0u)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+        }
+    }
+    else
+    {
+        BlackBox_Init();
+        uptime_s = ((s_lp.flags & LP_FLAG_UPTIME_VALID) != 0u) ?
+                   s_lp.uptime_base_s : BlackBox_GetUptimeBase();
+        if (uptime_s < BlackBox_GetUptimeBase())
+        {
+            uptime_s = BlackBox_GetUptimeBase();
+        }
+        Watchdog_Feed();
+        if (BlackBox_WritePeriodicSnapshot(&snap, uptime_s) != 0)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+        }
+        Watchdog_Feed();
+
+        /* 两处 Flash 不是原子事务：先记下黑匣子已经成功，若 StateStore
+         * 失败，完整 NORM 仅补交 StateStore，不得重复写同一 LP 快照。 */
+        if (LpCycle_NotePendingMarkArchived(mark_epoch) == 0u)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+        }
+        commit = StateStore_CommitArchiveMark(mark_epoch, mark_epoch,
+                                              STATE_ARCHIVE_MARK_FULL, 0u);
+        Watchdog_Feed();
+        if (commit < 0)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+        }
+        if (LpCycle_FinishMark(mark_epoch, now->sec) == 0u)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
+        }
+    }
 
     if (RtcTime_Read(now) == 0u)
     {
@@ -339,9 +490,17 @@ static void LpCycle_EnterStop(uint32_t target_ms)
 #endif
         LpCycle_ForceFullWake(LP_WAKE_BUTTON);
     }
-    if (LpCycle_IsAlertAsserted() != 0u)
     {
-        LpCycle_ForceFullWake(LP_WAKE_ALERT);
+        int alert = LpCycle_AlertConfirm();
+
+        if (alert > 0)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_ALERT);
+        }
+        if (alert < 0)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_FAULT);
+        }
     }
 
     s_lp.last_pr = (uint8_t)(IWDG->PR & 0x07u);
@@ -427,9 +586,14 @@ static void LpCycle_EnterStop(uint32_t target_ms)
     {
         LpCycle_ForceFullWake(LP_WAKE_BUTTON);
     }
-    if (LpCycle_IsAlertAsserted() != 0u)
     {
-        LpCycle_ForceFullWake(LP_WAKE_ALERT);
+        int alert = LpCycle_AlertConfirm();
+
+        if (alert > 0)
+        {
+            LpCycle_ForceFullWake(LP_WAKE_ALERT);
+        }
+        /* alert<0：ALERT 读不到，按 fault 完整 boot。 */
     }
     LpCycle_ForceFullWake(LP_WAKE_FAULT);
 }
@@ -443,10 +607,33 @@ lp_boot_t LpCycle_ClassifyBoot(void)
     uint8_t rtc_ok;
 
     s_lp_loaded = LpSession_Load(&s_lp);
+    s_boot_wake_cause = 0u;
     rtc_ok = RtcTime_Read(&now);
     if (rtc_ok != 0u)
     {
         s_boot_rtc = now;
+    }
+
+    if ((s_lp_loaded != 0u) &&
+        ((s_lp.flags & LP_FLAG_MARK_PENDING) != 0u))
+    {
+        /* 待归档标记优先保留；但是 HardFault/NMI/RTC 故障仍为安全故障，
+         * 不能伪装成纯电压恢复。完整 NORM 只能在故障解除后处理标记。 */
+        if (((cause & (RESET_CAUSE_HARDFAULT | RESET_CAUSE_NMI)) != 0u) ||
+            (PowerMode_LpTimebaseReady() == 0u) || (rtc_ok == 0u))
+        {
+            LpCycle_PreservePendingFaultWake();
+        }
+        else if ((has_sw != 0u) && (s_lp.state == LP_SESSION_PAUSED) &&
+                 ((s_lp.flags & LP_FLAG_FULL_WAKE) != 0u))
+        {
+            s_boot_wake_cause = s_lp.wake_cause;
+        }
+        else
+        {
+            LpCycle_PreservePendingFaultWake();
+        }
+        return LP_BOOT_WAKE;
     }
 
     /* HardFault/NMI 的 handler 也是软件复位；必须先于 START/WAKE token
@@ -494,6 +681,7 @@ lp_boot_t LpCycle_ClassifyBoot(void)
     if ((has_sw != 0u) && (s_lp.state == LP_SESSION_PAUSED) &&
         ((s_lp.flags & LP_FLAG_FULL_WAKE) != 0u))
     {
+        s_boot_wake_cause = s_lp.wake_cause;
         return LP_BOOT_WAKE;
     }
 
@@ -550,11 +738,17 @@ void LpCycle_Run(lp_boot_t boot)
     uint32_t target_ms;
     uint32_t overhead;
     uint8_t sniff;
+    uint8_t sniff_prot = 0u;
 
     if ((s_lp_loaded == 0u) || (PowerMode_LpTimebaseReady() == 0u) ||
         (RtcTime_Read(&now) == 0u))
     {
         LpCycle_ForceFullWake(LP_WAKE_FAULT);
+    }
+    if ((s_lp.flags & LP_FLAG_MARK_PENDING) != 0u)
+    {
+        /* PREP 阶段出现待处理标记不能再次进入轻量监测、重复写 Flash。 */
+        LpCycle_ForceFullWake(LP_WAKE_MONITOR | LP_WAKE_FAULT);
     }
     if (boot == LP_BOOT_RESUME)
     {
@@ -616,19 +810,20 @@ void LpCycle_Run(lp_boot_t boot)
     }
 #endif
 
-    sniff = LpCycle_BqSniffOnce();
+    sniff = LpCycle_BqSniffOnce(&sniff_prot);
     if (sniff == 0u)
     {
-        sniff = LpCycle_BqSniffOnce();
+        sniff = LpCycle_BqSniffOnce(&sniff_prot);
         if (sniff == 0u)
         {
             LpCycle_ForceFullWake(LP_WAKE_FAULT);
         }
     }
 
-    /* BQ prepare 已关 ADC/CC 并清 CC_READY/XREADY；此时 PA8 仍高才是真正
-     * 需要完整唤醒的保护锁存/ALERT，而不是 CC_READY 造成的假高。 */
-    if (LpCycle_IsAlertAsserted() != 0u)
+    /* BQ prepare 已关 ADC/CC 并清 CC_READY/XREADY/OVRD_ALERT。只有
+     * OV/UV/SCD/OCD/XREADY 这些真实保护位才唤醒；PA8 仅因非保护位为高
+     * 不再触发完整 boot，避免 OVRD_ALERT 毛刺造成 5 s LP 往返。 */
+    if (sniff_prot != 0u)
     {
         LpCycle_ForceFullWake(LP_WAKE_ALERT);
     }
@@ -756,6 +951,13 @@ uint8_t LpCycle_RequestStart(void)
     }
 
     s_lp_loaded = LpSession_Load(&s_lp);
+    if ((s_lp_loaded != 0u) &&
+        ((s_lp.flags & LP_FLAG_MARK_PENDING) != 0u))
+    {
+        /* 未完成 RTC 标记必须先由完整 NORM 归档；禁止新的 START
+         * 令牌覆盖待处理 mark_epoch（正常 TIM2 窗口亦不可代替该 ID）。 */
+        return 0u;
+    }
     if ((s_lp_loaded == 0u) ||
         (s_lp.state == LP_SESSION_IDLE) ||
         (s_lp.state == LP_SESSION_FAULT))
@@ -784,15 +986,120 @@ uint8_t LpCycle_RequestStart(void)
         }
     }
 
+    /* 黑匣子 24 B 的 uptime_s 是累计运行秒；进 STOP 后不再前进。
+     * 利用 LP03 中 CRC 覆盖的空余 BKP 位保存当前 NORM 的精确累计值，
+     * 不把 RTC epoch 或较老的黑匣子基准误写为 uptime。 */
+    s_lp.uptime_base_s = App_GetUptimeSeconds();
+    s_lp.flags |= LP_FLAG_UPTIME_VALID;
     LpCycle_DisableLegacyWut();
-    s_lp.seq++;
-    LpSession_Save(&s_lp);
+    LpCycle_Save();
     Watchdog_Feed();
     __DSB();
     NVIC_SystemReset();
     for (;;)
     {
     }
+}
+
+uint8_t LpCycle_GetPendingMark(uint32_t *mark_epoch)
+{
+    lp_session_t s;
+
+    if (mark_epoch != NULL)
+    {
+        *mark_epoch = 0u;
+    }
+    if (LpSession_Load(&s) == 0u ||
+        (s.flags & LP_FLAG_MARK_PENDING) == 0u ||
+        s.next_mark_epoch == 0u)
+    {
+        return 0u;
+    }
+    if (mark_epoch != NULL)
+    {
+        *mark_epoch = s.next_mark_epoch;
+    }
+    return 1u;
+}
+
+uint8_t LpCycle_IsPendingMarkLpArchived(void)
+{
+    lp_session_t s;
+
+    if (LpSession_Load(&s) == 0u)
+    {
+        return 0u;
+    }
+    return ((s.flags & (LP_FLAG_MARK_PENDING | LP_FLAG_MARK_LP_ARCHIVED)) ==
+            (LP_FLAG_MARK_PENDING | LP_FLAG_MARK_LP_ARCHIVED)) ? 1u : 0u;
+}
+
+uint8_t LpCycle_NotePendingMarkArchived(uint32_t mark_epoch)
+{
+    lp_session_t s;
+
+    if ((mark_epoch == 0u) || (LpSession_Load(&s) == 0u) ||
+        ((s.flags & LP_FLAG_MARK_PENDING) == 0u) ||
+        (s.next_mark_epoch != mark_epoch))
+    {
+        return 0u;
+    }
+    s_lp = s;
+    s_lp_loaded = 1u;
+    s_lp.flags |= LP_FLAG_MARK_LP_ARCHIVED;
+    LpCycle_Save();
+    return (LpSession_Load(&s) != 0u &&
+            (s.flags & (LP_FLAG_MARK_PENDING | LP_FLAG_MARK_LP_ARCHIVED)) ==
+            (LP_FLAG_MARK_PENDING | LP_FLAG_MARK_LP_ARCHIVED) &&
+            s.next_mark_epoch == mark_epoch) ? 1u : 0u;
+}
+
+uint8_t LpCycle_AckPendingMark(uint32_t mark_epoch)
+{
+    lp_session_t s;
+    state_store_view_t state;
+    uint32_t now_epoch;
+
+    if ((mark_epoch == 0u) || (LpSession_Load(&s) == 0u) ||
+        ((s.flags & LP_FLAG_MARK_PENDING) == 0u) ||
+        (s.next_mark_epoch != mark_epoch))
+    {
+        return 0u;
+    }
+    StateStore_GetView(&state);
+    if ((state.valid == 0u) ||
+        (state.archive.last_mark_id != mark_epoch))
+    {
+        return 0u;
+    }
+    {
+        rtc_epoch_t now;
+        if (RtcTime_Read(&now) == 0u)
+        {
+            return 0u;
+        }
+        now_epoch = now.sec;
+    }
+    s_lp = s;
+    s_lp_loaded = 1u;
+    return LpCycle_FinishMark(mark_epoch, now_epoch);
+}
+
+uint32_t LpCycle_GetUptimeBase(void)
+{
+    lp_session_t s;
+
+    if ((s_boot_wake_cause == 0u) || (LpSession_Load(&s) == 0u) ||
+        ((s.flags & LP_FLAG_UPTIME_VALID) == 0u))
+    {
+        return 0u;
+    }
+    return s.uptime_base_s;
+}
+
+uint8_t LpCycle_GetWakeCause(void)
+{
+    return s_boot_wake_cause;
 }
 
 void LpCycle_ApplyWake(void)

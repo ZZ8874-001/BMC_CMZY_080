@@ -14,8 +14,18 @@
  *   off 24 soc01 u16
  *   off 26 soh01 u16
  *   off 28 temp_dc i16
- *   off 30 reserved[16]
- *   off 46 crc16 u16（覆盖 off 0..45）
+ *   off 30 reserved[16] (v1 全 0xFF；v2 使用以下二级 CRC 格式)：
+ *     +0  last_mark_epoch u32 (RTC 秒，非 uptime)
+ *     +4  last_mark_id u32 (NORM/LP 同一递增标记 ID)
+ *     +8  anomaly_count u8 (最多 4)
+ *     +9  alarm_flags u8
+ *     +10 estimate_flags u8
+ *     +11 mark_quality u8
+ *     +12/+13 v2 元数据标识 0xA2/0x5D
+ *     +14 archive_crc16 u16 (仅覆盖 reserved[0..13])
+ *   off 46 crc16 u16（覆盖 off 0..45，v1/v2 均保持原 CRC）
+ *
+ * 上电扫描兼容 v1 和 v2；每次写入为 v2，不改变 48 B 页布局。
  *
  * 只允许初始化/主循环调用；不在 ISR 写 Flash。
  ******************************************************************************
@@ -27,9 +37,17 @@
 #include "bsp/flash_store.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #define SS_MAGIC                0x4C315354UL
-#define SS_VERSION              1u
+#define SS_VERSION_V1           1u
+#define SS_VERSION_V2           2u
+#define SS_ARCHIVE_OFFSET       30u
+#define SS_ARCHIVE_BYTES        16u
+#define SS_ARCHIVE_CRC_OFFSET   44u
+#define SS_ARCHIVE_CRC_LEN      14u
+#define SS_ARCHIVE_TAG0         0xA2u
+#define SS_ARCHIVE_TAG1         0x5Du
 #define SS_CRC_OFFSET           46u
 #define SS_CRC_LEN              46u
 #define SS_SLOT_COUNT           ((uint16_t)(STATE_STORE_FLASH_PAGES * \
@@ -42,6 +60,8 @@
 _Static_assert(STATE_STORE_RECORD_BYTES == 48u, "StateStore record must be 48 B");
 _Static_assert((STATE_STORE_RECORD_BYTES % 8u) == 0u,
                "StateStore record must be 8-byte programmable");
+_Static_assert((SS_ARCHIVE_OFFSET + SS_ARCHIVE_BYTES) == SS_CRC_OFFSET,
+               "StateStore v2 archive must fit reserved 16 B");
 
 static struct
 {
@@ -86,6 +106,28 @@ static uint32_t Ss_SlotAddr(uint16_t slot)
            ((uint32_t)index * STATE_STORE_RECORD_BYTES);
 }
 
+static uint32_t Ss_ReadU32(const uint8_t *p);
+
+/* 断电/编程中断可能留下 CRC 无效的非空槽。跳过它，直到找到空槽；
+ * 页首可直接作为下一写入点，因为写入前会整页擦除。 */
+static uint16_t Ss_FindWritableSlot(uint16_t candidate)
+{
+    uint16_t offset;
+
+    for (offset = 0u; offset < SS_SLOT_COUNT; offset++)
+    {
+        uint16_t slot = (uint16_t)((candidate + offset) % SS_SLOT_COUNT);
+        const uint8_t *p = (const uint8_t *)Ss_SlotAddr(slot);
+
+        if ((slot % SS_SLOTS_PER_PAGE) == 0u ||
+            (Ss_ReadU32(p) == SS_BLANK_U32))
+        {
+            return slot;
+        }
+    }
+    return candidate;
+}
+
 static uint32_t Ss_ReadU32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -113,12 +155,40 @@ static void Ss_WriteU16(uint8_t *p, uint16_t v)
 
 static uint8_t Ss_SlotValid(const uint8_t *p)
 {
-    if ((Ss_ReadU32(p) != SS_MAGIC) ||
-        (Ss_ReadU16(p + 4u) != SS_VERSION))
+    uint16_t version;
+
+    if (Ss_ReadU32(p) != SS_MAGIC)
     {
         return 0u;
     }
-    return (Ss_Crc16(p, SS_CRC_LEN) == Ss_ReadU16(p + SS_CRC_OFFSET)) ? 1u : 0u;
+    version = Ss_ReadU16(p + 4u);
+    if ((version != SS_VERSION_V1) && (version != SS_VERSION_V2))
+    {
+        return 0u;
+    }
+    if (Ss_Crc16(p, SS_CRC_LEN) != Ss_ReadU16(p + SS_CRC_OFFSET))
+    {
+        return 0u;
+    }
+    if (version == SS_VERSION_V2)
+    {
+        const uint8_t *archive = p + SS_ARCHIVE_OFFSET;
+
+        if ((archive[12] != SS_ARCHIVE_TAG0) ||
+            (archive[13] != SS_ARCHIVE_TAG1) ||
+            (Ss_Crc16(archive, SS_ARCHIVE_CRC_LEN) !=
+             Ss_ReadU16(archive + SS_ARCHIVE_CRC_LEN)) ||
+            (archive[8] > 4u) ||
+            ((archive[9] & (uint8_t)~(STATE_ARCHIVE_ALARM_PENDING |
+                                     STATE_ARCHIVE_ALARM_LATCHED |
+                                     STATE_ARCHIVE_SHUTDOWN_CONFIRMED)) != 0u) ||
+            ((archive[10] & (uint8_t)~STATE_ARCHIVE_Q_ALL) != 0u) ||
+            (archive[11] > STATE_ARCHIVE_MARK_CRITICAL))
+        {
+            return 0u;
+        }
+    }
+    return 1u;
 }
 
 static void Ss_Pack(const state_store_view_t *view, uint32_t seq, uint8_t raw[48])
@@ -132,7 +202,7 @@ static void Ss_Pack(const state_store_view_t *view, uint32_t seq, uint8_t raw[48
     }
 
     Ss_WriteU32(&raw[0], SS_MAGIC);
-    Ss_WriteU16(&raw[4], SS_VERSION);
+    Ss_WriteU16(&raw[4], SS_VERSION_V2);
     Ss_WriteU16(&raw[6], view->flags);
     Ss_WriteU32(&raw[8], seq);
     Ss_WriteU32(&raw[12], view->battery_epoch);
@@ -143,6 +213,17 @@ static void Ss_Pack(const state_store_view_t *view, uint32_t seq, uint8_t raw[48
     Ss_WriteU16(&raw[24], view->soc01);
     Ss_WriteU16(&raw[26], view->soh01);
     Ss_WriteU16(&raw[28], (uint16_t)view->temp_dc);
+
+    Ss_WriteU32(&raw[30], view->archive.last_mark_epoch);
+    Ss_WriteU32(&raw[34], view->archive.last_mark_id);
+    raw[38] = view->archive.anomaly_count;
+    raw[39] = view->archive.alarm_flags;
+    raw[40] = view->archive.estimate_flags;
+    raw[41] = view->archive.mark_quality;
+    raw[42] = SS_ARCHIVE_TAG0;
+    raw[43] = SS_ARCHIVE_TAG1;
+    Ss_WriteU16(&raw[SS_ARCHIVE_CRC_OFFSET],
+                Ss_Crc16(&raw[SS_ARCHIVE_OFFSET], SS_ARCHIVE_CRC_LEN));
 
     crc = Ss_Crc16(raw, SS_CRC_LEN);
     Ss_WriteU16(&raw[SS_CRC_OFFSET], crc);
@@ -160,6 +241,16 @@ static void Ss_Unpack(const uint8_t *raw, state_store_view_t *view, uint32_t *se
     view->soc01 = Ss_ReadU16(&raw[24]);
     view->soh01 = Ss_ReadU16(&raw[26]);
     view->temp_dc = (int16_t)Ss_ReadU16(&raw[28]);
+    memset(&view->archive, 0, sizeof(view->archive));
+    if (Ss_ReadU16(&raw[4]) == SS_VERSION_V2)
+    {
+        view->archive.last_mark_epoch = Ss_ReadU32(&raw[30]);
+        view->archive.last_mark_id = Ss_ReadU32(&raw[34]);
+        view->archive.anomaly_count = raw[38];
+        view->archive.alarm_flags = raw[39];
+        view->archive.estimate_flags = raw[40];
+        view->archive.mark_quality = raw[41];
+    }
     view->valid = 1u;
 }
 
@@ -175,17 +266,7 @@ void StateStore_Init(void)
     s_state.seq = 0u;
     s_state.active_slot = 0u;
     s_state.next_slot = 0u;
-    s_state.view.flags = 0u;
-    s_state.view.seq = 0u;
-    s_state.view.battery_epoch = 0u;
-    s_state.view.cell_mv[0] = 0u;
-    s_state.view.cell_mv[1] = 0u;
-    s_state.view.cell_mv[2] = 0u;
-    s_state.view.pack_mv = 0u;
-    s_state.view.soc01 = 0u;
-    s_state.view.soh01 = 0u;
-    s_state.view.temp_dc = 0;
-    s_state.view.valid = 0u;
+    memset(&s_state.view, 0, sizeof(s_state.view));
 
     /* 固件不得侵入预留页。 */
     if ((uint32_t)&_image_end > STATE_STORE_FLASH_BASE)
@@ -248,14 +329,19 @@ uint16_t StateStore_GetActiveSlot(void)
     return s_state.active_slot;
 }
 
-int StateStore_Commit(const state_store_view_t *view)
+/* 内部提交保留 v1 兼容字段；Flash 成功且回读完全一致后才更新 RAM。
+ * archive 必须来自当前 s_state.view 或由显式归档 API 派生，不接受外部
+ * 已过时的 view->archive；这保证 SocEst 普通快照提交不会抹掉锁存。 */
+static int Ss_CommitWithArchive(const state_store_view_t *view,
+                                const state_store_archive_t *archive)
 {
+    state_store_view_t next;
     uint8_t raw[STATE_STORE_RECORD_BYTES];
     uint16_t slot;
     uint32_t addr;
     uint32_t seq;
 
-    if ((view == NULL) || (s_state.err == 2u))
+    if ((view == NULL) || (archive == NULL) || (s_state.err == 2u))
     {
         return -1;
     }
@@ -265,10 +351,18 @@ int StateStore_Commit(const state_store_view_t *view)
     {
         seq = 1u;
     }
+    if (archive->anomaly_count > 4u ||
+        archive->mark_quality > STATE_ARCHIVE_MARK_CRITICAL ||
+        (archive->estimate_flags & (uint8_t)~STATE_ARCHIVE_Q_ALL) != 0u ||
+        (archive->alarm_flags &
+         (uint8_t)~(STATE_ARCHIVE_ALARM_PENDING | STATE_ARCHIVE_ALARM_LATCHED |
+                    STATE_ARCHIVE_SHUTDOWN_CONFIRMED)) != 0u)
+    {
+        return -1;
+    }
 
-    slot = s_state.next_slot;
+    slot = Ss_FindWritableSlot(s_state.next_slot);
     addr = Ss_SlotAddr(slot);
-
     if ((slot % SS_SLOTS_PER_PAGE) == 0u)
     {
         if (Fs_ErasePage(addr) != 0)
@@ -279,15 +373,18 @@ int StateStore_Commit(const state_store_view_t *view)
         }
     }
 
-    Ss_Pack(view, seq, raw);
-    if (Fs_ProgramDwords(addr, raw, STATE_STORE_RECORD_BYTES) != 0)
+    next = *view;
+    next.archive = *archive;
+    Ss_Pack(&next, seq, raw);
+    if ((Fs_ProgramDwords(addr, raw, STATE_STORE_RECORD_BYTES) != 0) ||
+        (memcmp((const void *)addr, raw, STATE_STORE_RECORD_BYTES) != 0))
     {
         s_state.err = 1u;
         Fault_SetSticky(FAULT_BIT_FLASH_STATE);
         return -1;
     }
 
-    s_state.view = *view;
+    s_state.view = next;
     s_state.view.seq = seq;
     s_state.view.valid = 1u;
     s_state.seq = seq;
@@ -296,6 +393,196 @@ int StateStore_Commit(const state_store_view_t *view)
     s_state.next_slot = (uint16_t)((slot + 1u) % SS_SLOT_COUNT);
     s_state.err = 0u;
     return 0;
+}
+
+int StateStore_Commit(const state_store_view_t *view)
+{
+    /* 只允许专用归档接口修改计数/标记/报警；旧的 GetView→Commit
+     * 流程可以自由更新电池快照，却不能回滚 v2 元数据。 */
+    return Ss_CommitWithArchive(view, &s_state.view.archive);
+}
+
+int StateStore_CommitArchiveSnapshot(const state_store_view_t *view,
+                                     uint32_t mark_epoch, uint32_t mark_id,
+                                     uint8_t mark_quality, uint8_t estimate_flags)
+{
+    state_store_archive_t archive;
+    state_store_view_t next;
+    uint16_t missing;
+
+    if ((view == NULL) || (mark_epoch == 0u) || (mark_id == 0u) ||
+        (estimate_flags & (uint8_t)~STATE_ARCHIVE_Q_ALL) != 0u ||
+        ((mark_quality != STATE_ARCHIVE_MARK_FULL) &&
+         (mark_quality != STATE_ARCHIVE_MARK_DEGRADED) &&
+         (mark_quality != STATE_ARCHIVE_MARK_CRITICAL)))
+    {
+        return -1;
+    }
+    if ((s_state.valid != 0u) && (s_state.view.archive.last_mark_id != 0u) &&
+        (mark_id <= s_state.view.archive.last_mark_id))
+    {
+        return 1;  /* 同一 RTC 标记或更早的重放：不写 Flash，不动计数 */
+    }
+
+    missing = (uint16_t)(estimate_flags &
+                         (STATE_ARCHIVE_Q_CELL1_MISSING |
+                          STATE_ARCHIVE_Q_CELL2_MISSING |
+                          STATE_ARCHIVE_Q_CELL3_MISSING |
+                          STATE_ARCHIVE_Q_PACK_MISSING));
+    if (((mark_quality == STATE_ARCHIVE_MARK_FULL) && (missing != 0u)) ||
+        ((mark_quality == STATE_ARCHIVE_MARK_DEGRADED) &&
+         ((missing == 0u) ||
+          ((missing & (STATE_ARCHIVE_Q_CELL1_MISSING |
+                       STATE_ARCHIVE_Q_CELL2_MISSING)) != 0u))) ||
+        ((mark_quality == STATE_ARCHIVE_MARK_CRITICAL) &&
+         ((missing & (STATE_ARCHIVE_Q_CELL1_MISSING |
+                      STATE_ARCHIVE_Q_CELL2_MISSING)) == 0u)))
+    {
+        return -1;
+    }
+
+    /* 未实测的字段必须保持为 0；不允许估算值通过 v2 快照入口落盘。 */
+    if (((missing & STATE_ARCHIVE_Q_CELL1_MISSING) && view->cell_mv[0] != 0u) ||
+        ((missing & STATE_ARCHIVE_Q_CELL2_MISSING) && view->cell_mv[1] != 0u) ||
+        ((missing & STATE_ARCHIVE_Q_CELL3_MISSING) && view->cell_mv[2] != 0u) ||
+        ((missing & STATE_ARCHIVE_Q_PACK_MISSING) && view->pack_mv != 0u))
+    {
+        return -1;
+    }
+
+    next = *view;
+    if (mark_quality != STATE_ARCHIVE_MARK_FULL)
+    {
+        next.flags |= STATE_FLAG_PACK_PARTIAL;
+        next.flags &= (uint16_t)~STATE_FLAG_PACK_VALID;
+    }
+    else
+    {
+        next.flags &= (uint16_t)~STATE_FLAG_PACK_PARTIAL;
+    }
+    if ((missing & STATE_ARCHIVE_Q_PACK_MISSING) != 0u)
+    {
+        next.flags &= (uint16_t)~STATE_FLAG_PACK_VALID;
+    }
+    if ((estimate_flags & STATE_ARCHIVE_Q_SOC_ESTIMATED) != 0u)
+    {
+        next.flags |= STATE_FLAG_SOC_ESTIMATED;
+        next.flags &= (uint16_t)~STATE_FLAG_SOC_VALID;
+    }
+    else
+    {
+        next.flags &= (uint16_t)~STATE_FLAG_SOC_ESTIMATED;
+    }
+    if ((estimate_flags & STATE_ARCHIVE_Q_SOC_INVALID) != 0u)
+    {
+        next.flags &= (uint16_t)~STATE_FLAG_SOC_VALID;
+    }
+
+    archive = s_state.view.archive;
+    archive.last_mark_epoch = mark_epoch;
+    archive.last_mark_id = mark_id;
+    archive.mark_quality = mark_quality;
+    archive.estimate_flags = estimate_flags;
+    if (mark_quality == STATE_ARCHIVE_MARK_FULL)
+    {
+        archive.anomaly_count = 0u;
+        /* 真实 9 帧/LP 两帧本身不撤销已经启动的 2 min 报警，
+         * 不解锁超时保护：只能经显式验证恢复 API 清 PENDING。 */
+    }
+    else if (mark_quality == STATE_ARCHIVE_MARK_CRITICAL)
+    {
+        archive.anomaly_count = 4u;
+        archive.alarm_flags |= STATE_ARCHIVE_ALARM_PENDING;
+    }
+    else
+    {
+        if (archive.anomaly_count < 4u)
+        {
+            archive.anomaly_count++;
+        }
+        if (archive.anomaly_count >= 4u)
+        {
+            archive.alarm_flags |= STATE_ARCHIVE_ALARM_PENDING;
+        }
+    }
+    return Ss_CommitWithArchive(&next, &archive);
+}
+
+int StateStore_CommitArchiveMark(uint32_t mark_epoch, uint32_t mark_id,
+                                 uint8_t mark_quality, uint8_t estimate_flags)
+{
+    state_store_archive_t archive;
+
+    /* LP 快标记只动 v2 计数元数据，不碰已有快照或 SOC 有效位。 */
+    if ((mark_epoch == 0u) || (mark_id == 0u) ||
+        (mark_quality != STATE_ARCHIVE_MARK_FULL) || (estimate_flags != 0u))
+    {
+        return -1;
+    }
+    if ((s_state.valid != 0u) && (s_state.view.archive.last_mark_id != 0u) &&
+        (mark_id <= s_state.view.archive.last_mark_id))
+    {
+        return 1;
+    }
+    archive = s_state.view.archive;
+    archive.last_mark_epoch = mark_epoch;
+    archive.last_mark_id = mark_id;
+    archive.mark_quality = STATE_ARCHIVE_MARK_FULL;
+    archive.estimate_flags = 0u;
+    archive.anomaly_count = 0u;
+    return Ss_CommitWithArchive(&s_state.view, &archive);
+}
+
+int StateStore_SetArchiveAlarm(uint8_t set_flags)
+{
+    state_store_archive_t archive;
+
+    if ((set_flags == 0u) ||
+        (set_flags & (uint8_t)~(STATE_ARCHIVE_ALARM_PENDING |
+                               STATE_ARCHIVE_ALARM_LATCHED |
+                               STATE_ARCHIVE_SHUTDOWN_CONFIRMED)) != 0u)
+    {
+        return -1;
+    }
+    archive = s_state.view.archive;
+    archive.alarm_flags |= set_flags;
+    if (Ss_CommitWithArchive(&s_state.view, &archive) != 0)
+    {
+        /* 持久化失败时 RAM 仍必须禁止放电/LP；上层也要检查 -1 并
+         * 保持自身 fail-closed，断电后 Flash 无法保证该次新锁存。 */
+        s_state.view.archive.alarm_flags |= set_flags;
+        return -1;
+    }
+    return 0;
+}
+
+int StateStore_ConfirmArchiveRecovery(void)
+{
+    state_store_archive_t archive;
+
+    if ((s_state.valid == 0u) ||
+        ((s_state.view.archive.alarm_flags & STATE_ARCHIVE_ALARM_LATCHED) != 0u))
+    {
+        return -1;
+    }
+    archive = s_state.view.archive;
+    archive.anomaly_count = 0u;
+    archive.alarm_flags &= (uint8_t)~STATE_ARCHIVE_ALARM_PENDING;
+    return Ss_CommitWithArchive(&s_state.view, &archive);
+}
+
+int StateStore_SafeClearArchiveAlarm(void)
+{
+    state_store_archive_t archive;
+
+    if (s_state.valid == 0u)
+    {
+        return -1;
+    }
+    archive = s_state.view.archive;
+    archive.anomaly_count = 0u;
+    archive.alarm_flags = 0u;
+    return Ss_CommitWithArchive(&s_state.view, &archive);
 }
 
 int StateStore_ClearLatch(uint16_t flags)

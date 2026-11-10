@@ -149,10 +149,10 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
    电流接近 0 时保持上一个稳定状态（状态机用 BQ 新鲜度区分 standby）。
 4. **PA1 运行中必须为低、LP 中为高**：`HSE_DIS/CHGSC_DIS` 为高会关掉 PACK_SC 前置，两个 SC 节点被拉到约 3.3 V，
    比较器结果无意义；同时 Q5 关停 12 MHz HSE。轻量 LP boot 在 STOP1 前拉高 PA1；唤醒走复位，完整 boot 由 `PowerMode_ClkSwitchToHsePll()` 重新拉低再切 HSE/PLL。充电检查窗口会短暂拉低 PA1，检查完立即恢复高。
-5. **BQ 电流符号相反**：按 SRP/SRN 引脚定义（SRP 靠 VSS 的负端、SRN 正端），放电时 `SRN > SRP`，
-   CC 读数应为**正**、充电为**负**；即 **COMP2 高（充电）↔ CC 为负**。首次联动时用已知充电/放电方向实测确认符号后再定映射。
+5. **BQ 电流符号**：SRP 靠电池负极/VSS 侧、SRN 靠 FET/PACK 侧；引脚电压关系是**充电时 `SRP > SRN`、放电时 `SRN > SRP`**（这不等于 CC 寄存器符号）。TI bq769x0 AFE FAQ / bq78350 对 CC 的约定是 `VSR = V(SRP) − V(SRN)`，**充电为正、放电为负**；即 **COMP2 高（充电）↔ CC 为正**。固件把符号集中在 `board.h` 的 `BQ_CC_DISCHARGE_SIGN`（默认 -1；若上板实测放电为正则改 +1），`soc_est` 和 `protection` 都从它派生。首次联动必须用已知充电/放电方向实测确认后再依赖 OCP 门槛；TI E2E 有极性反转个例，`s_protection.sign_mismatch_streak` 会与 COMP2 交叉检查。
 6. **DAC1 是内部模式**：`DAC_OUT1_Int`，没有外部引脚，也不在 COMP2 的 INM 路径（INM = IO4），启动它不会影响 PA4；
    但不要改成外部引脚输出或把 COMP2_INM 改为 DAC——那会覆盖 `SC_PACK`。保持现状或关闭即可。
+7. **PA8 ALERT 唤醒**：轻量 LP boot 先清 `CC_READY/XREADY/OVRD_ALERT`，只有 SYS_STAT 的 OV/UV/SCD/OCD/XREADY 才作为唤醒；仅 PA8 为高（例如只剩 CC_READY/OVRD_ALERT）不再唤醒。`OVRD_ALERT` 是 ALERT 引脚被外部强制拉高的锁存，BQ 会同时把 CHG/DSG 驱动清 0，因此正常 500 ms run script 也清它；若它反复出现，需按上表给 ALERT 加下拉/滤波并检查毛刺。
 
 ## 4. BQ76920 引脚/网络对照（U1，BQ7692003PWR）
 
@@ -181,8 +181,12 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 | --- | --- | --- | --- |
 | OV | 4.25 V/cell（NMC），delay 1 s | `PROTECT3=0x40`，`OV_TRIP` 动态计算 | 充电上限 4.20 V，留 50 mV 防 CV 末端误触发；数据手册范围 3.15–4.7 V |
 | UV | 2.80 V/cell（NMC），delay 4 s | `PROTECT3=0x40`，`UV_TRIP` 动态计算 | 硬件最后保护；软件 5%/0% 切断应更早；短接未用 VC 通道低于 UVMINQUAL，UV 自动忽略 |
-| OCD | 56 mV（1.5 mΩ → 37.3 A），320 ms | `PROTECT2=0x57` | 高于 30 A 正常放电 |
-| SCD | 67 mV（1.5 mΩ → 44.7 A），100 µs | `PROTECT1=0x89` | RSNS=1，硬件短路保护 |
+| OCD | 56 mV（1.5 mΩ → 37.3 A），320 ms | `PROTECT2=0x57` | **仅放电方向**；高于 30 A 正常放电，硬件后备 |
+| SCD | 67 mV（1.5 mΩ → 44.7 A），100 µs | `PROTECT1=0x89` | RSNS=1，放电硬件短路保护 |
+
+BQ76920 **没有充电过流硬件保护，也没有可编程温度/die 保护阈值**。充电 5 A 和放电 30 A 的软件 OCP 由 `protection.c` 执行：**方向用 COMP2、幅值用 CC**（CC 极性不影响 5 A/30 A 归类），2 个新发布帧（≈0.5–1 s）确认后锁存、双 FET 关；充电 OCP 清除要求充电器移除，放电 OCP 要求负载断开；`Protection_RequestLatchClear()` 只在 FET 全关、`|I| ≤ 500 mA` 连续 2 s 后执行。充电硬件后备仍依赖充电器限流和保险丝；温度必须由 MCU 读取 NTC（BQ die 温只在静止均衡时临时切换），`PROT_TEMP_ENABLE` 在 TS1 上拉模型标定后才置 1。
+
+TS1 上拉模型：BQ 在 `TEMP_SEL=1` 时内部有 10 kΩ 到约 3.3 V；若板上另有外部 10 kΩ 到 5 V，两者并联。25 °C（NTC=10 kΩ）节点电压：仅内部≈1.65 V、仅外部≈2.50 V、两者≈2.77 V。`SOC_EST_TS1_PULL_MV/OHM` 按实测等效为 `3300/10000`、`5000/10000` 或 `4150/5000`（戴维南），再做 0 °C/45 °C 两点复核后才启用温度保护。
 
 `OV_TRIP/UV_TRIP` 按读回的 `ADCGAIN`（µV/LSB）和 `ADCOFFSET`（mV）反算：
 `FULL=((V_mV−offset)×1000)/(365+gain)`，取 `FULL>>4` 的低 8 位；OV 全码高 2 位固定 `10`、低 4 位 `1000`，UV 固定 `01`/`0000`。
@@ -216,7 +220,7 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 | 17 | VC0 | `BQ_VC0` | R32 100 Ω / C9 100 nF → `BTT_0P_0V`（第 1 节负端） |
 | 18 | SRP | `BQ_SRP` | R6 100 Ω → BTT_N 侧（靠近 VSS）的分流电阻端；数据手册定义为“负电流检测” |
 | 19 | SRN | `BQ_SRN` | R7 100 Ω → 分流电阻的 FET/PACK 侧；数据手册定义为“正电流检测” |
-| 20 | ALERT | `BQ_ALT` | → MCU PA8；高有效输出（带弱下拉），是 SYS_STAT 所有位的 OR；对应状态位写 1 清除后 ALERT 才撤销；数据手册也把它作 override 输入 |
+| 20 | ALERT | `BQ_ALT` | → MCU PA8；高有效输出（带弱下拉），是 SYS_STAT 所有位的 OR；对应状态位写 1 清除后 ALERT 才撤销；数据手册也把它作 override 输入。**OVRD_ALERT(bit4) 不是保护故障，但会把 CHG/DSG 驱动强制为 0**；固件用 0xB0 清 `CC_READY/XREADY/OVRD_ALERT`，LP 只对 OV/UV/SCD/OCD/XREADY 唤醒。V0.80 只有 BQ 内部弱下拉（0.8–8 MΩ），建议在 ALERT 到 VSS 加 500 kΩ–1 MΩ + 约 470 pF（TI 建议），不要加上拉，否则一次毛刺会置 OVRD_ALERT 并跨 MCU 复位锁存 |
 
 BQ 在 **POR 后总是进入 SHIP 模式**；退出 SHIP 需要 TS1 出现**上升沿**并越过 VBOOT（>1.0 V 才保证，
 0.3–1.0 V 不确定，<0.3 V 不 boot）。BQ 内部 10 kΩ TS1 上拉只在 NORMAL/TEMP_SEL=1 测温时有效，

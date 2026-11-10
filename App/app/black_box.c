@@ -31,6 +31,12 @@
 #define BB_SLOT_COUNT       BB_RECORD_COUNT          /* 1020 */
 #define BB_BLANK_U32        0xFFFFFFFFUL
 
+_Static_assert(BB_RECORD_BYTES == 24u, "Black-box record must remain 24 B");
+_Static_assert((BB_RECORD_BYTES % 8u) == 0u,
+               "Black-box record must be doubleword programmable");
+_Static_assert((BB_KIND_EVENT & BB_PERIODIC_Q_PARTIAL) == 0u,
+               "Periodic quality flags must not alter record kind bits");
+
 typedef struct
 {
     uint32_t seq;
@@ -206,6 +212,8 @@ static int Bb_DecodeSlot(uint16_t slot, black_box_record_t *out)
     out->wake_mask = Bb_DecodeWakeMask(out->kind, out->flags);
     out->event_code = (out->kind == BB_KIND_EVENT) ?
                       (uint16_t)((out->flags >> 6) & 0x03FFu) : 0u;
+    out->quality_flags = (out->kind == BB_KIND_PERIODIC) ?
+                         (uint16_t)(out->flags & BB_PERIODIC_Q_ALL) : 0u;
     out->valid = 1u;
     return 0;
 }
@@ -225,6 +233,8 @@ static void Bb_PublicFromRecord(const bb_record_t *src, black_box_record_t *dst)
     dst->wake_mask = Bb_DecodeWakeMask(dst->kind, dst->flags);
     dst->event_code = (dst->kind == BB_KIND_EVENT) ?
                       (uint16_t)((dst->flags >> 6) & 0x03FFu) : 0u;
+    dst->quality_flags = (dst->kind == BB_KIND_PERIODIC) ?
+                         (uint16_t)(dst->flags & BB_PERIODIC_Q_ALL) : 0u;
     dst->valid = 1u;
 }
 
@@ -493,6 +503,64 @@ int BlackBox_WritePeriodicSnapshot(const bq_snapshot_t *snap, uint32_t uptime_s)
         return -1;
     }
     return Bb_WriteRecordSnapshot(uptime_s, flags, snap);
+}
+
+int BlackBox_WritePeriodicQualified(const bq_snapshot_t *snap, uint32_t uptime_s,
+                                    uint16_t quality_flags)
+{
+    bq_snapshot_t archive;
+    uint16_t missing;
+
+    if ((snap == NULL) || ((quality_flags & (uint16_t)~BB_PERIODIC_Q_ALL) != 0u))
+    {
+        return -1;
+    }
+    missing = (uint16_t)(quality_flags & BB_PERIODIC_Q_MISSING_MASK);
+    if ((quality_flags & BB_PERIODIC_Q_PARTIAL) == 0u)
+    {
+        /* 电压 FULL 可同时带 SOC_ESTIMATED/SOC_INVALID；只有缺失电压
+         * 才要求显式 PARTIAL，避免把 SOC 来源和电压来源混为一谈。 */
+        if ((missing != 0u) || (snap->fresh == 0u) || (snap->valid == 0u))
+        {
+            return -1;
+        }
+    }
+    else if (missing == 0u)
+    {
+        return -1;
+    }
+
+    /* 仅在这条显式 API 接受无效快照；调用者提供的非缺失电压是同批实测，
+     * 被标为 MISSING 的字段无论入参为何一律写 0，避免旧发布值冒充。 */
+    archive = *snap;
+    if ((missing & BB_PERIODIC_Q_CELL1_MISSING) != 0u)
+    {
+        archive.cell_mv[0] = 0u;
+    }
+    if ((missing & BB_PERIODIC_Q_CELL2_MISSING) != 0u)
+    {
+        archive.cell_mv[1] = 0u;
+    }
+    if ((missing & BB_PERIODIC_Q_CELL3_MISSING) != 0u)
+    {
+        archive.cell_mv[2] = 0u;
+    }
+    if ((missing & BB_PERIODIC_Q_PACK_MISSING) != 0u)
+    {
+        archive.pack_mv = 0u;
+    }
+    if ((quality_flags & BB_PERIODIC_Q_CC_INVALID) != 0u)
+    {
+        archive.cc_raw = 0;
+    }
+    if ((quality_flags & BB_PERIODIC_Q_TS1_INVALID) != 0u)
+    {
+        archive.ts1_raw = 0u;
+    }
+
+    return Bb_WriteRecordSnapshot(uptime_s,
+                                  (uint16_t)(BB_KIND_PERIODIC | quality_flags),
+                                  &archive);
 }
 
 int BlackBox_WriteTransition(uint8_t transition_kind, uint8_t wake_cause,

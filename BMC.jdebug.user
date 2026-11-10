@@ -4,20 +4,29 @@ GraphedExpression="(s_bq).state", DisplayFormat=DISPLAY_FORMAT_DEC, Color=#e56a6
 GraphedExpression="(s_bq).state_enter_ms", Color=#35792b, Show=0
 GraphedExpression="(s_bq).current_op", DisplayFormat=DISPLAY_FORMAT_DEC, Color=#769dda, Show=0
 GraphedExpression="(s_bq).frame_ok_count", Color=#b14f0d
-OpenDocument="main.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/Core/Src/main.c", Line=0
+OpenDocument="main_app.h", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/App/app/main_app.h", Line=0
+OpenDocument="main.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/Core/Src/main.c", Line=85
+OpenDocument="stm32l4xx_it.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/Core/Src/stm32l4xx_it.c", Line=70
+OpenDocument="startup_stm32l432xx.s", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/startup_stm32l432xx.s", Line=46
+OpenDocument="soh.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/App/detect/bms/soh.c", Line=774
+OpenDocument="main_app.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/App/app/main_app.c", Line=717
+OpenDocument="led_status.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/App/app/led_status.c", Line=67
+OpenDocument="Ozone_Watched_Data_1_261108复位后.csv", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/dbglog/Ozone_Watched_Data_1_261108复位后.csv", Line=0
+OpenDocument="bq_ic.c", FilePath="//192.168.191.221/Shuchen's_Documents/BMC_CMZY_080/App/bsp/bq_ic.c", Line=176
 OpenToolbar="Debug", Floating=0, x=0, y=0
 OpenWindow="Source Files", DockArea=LEFT, x=0, y=0, w=825, h=1398, TabPos=0, TopOfStack=0, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0
+OpenWindow="Disassembly", DockArea=RIGHT, x=0, y=0, w=783, h=342, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0
 OpenWindow="Watched Data 1", DockArea=LEFT, x=0, y=0, w=825, h=1398, TabPos=1, TopOfStack=1, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0
-OpenWindow="Data Sampling", DockArea=RIGHT, x=0, y=1, w=783, h=485, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0, VisibleTab=0, UniformSampleSpacing=0
-OpenWindow="Timeline", DockArea=RIGHT, x=0, y=0, w=783, h=934, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=1, DataPaneShown=1, PowerPaneShown=0, CodePaneShown=0, PinCursor="Cursor Movable", TimePerDiv="5 s / Div", TimeStampFormat="Time", DataGraphDrawAsPoints=0, DataGraphLegendShown=1, DataGraphUniformSampleSpacing=0, DataGraphLegendPosition="0;0", DataGraphShowNamesAtCursor=1, PowerGraphDrawAsPoints=0, PowerGraphLegendShown=0, PowerGraphAvgFilterTime=Off, PowerGraphAvgFilterLen=Off, PowerGraphUniformSampleSpacing=0, PowerGraphLegendPosition="510;0", CodeGraphLegendShown=0, CodeGraphLegendPosition="531;0"
+OpenWindow="Data Sampling", DockArea=RIGHT, x=0, y=2, w=783, h=392, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0, VisibleTab=0, UniformSampleSpacing=0
+OpenWindow="Timeline", DockArea=RIGHT, x=0, y=1, w=783, h=684, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=1, DataPaneShown=1, PowerPaneShown=0, CodePaneShown=0, PinCursor="Cursor Movable", TimePerDiv="2 s / Div", TimeStampFormat="Time", DataGraphDrawAsPoints=0, DataGraphLegendShown=1, DataGraphUniformSampleSpacing=0, DataGraphLegendPosition="0;0", DataGraphShowNamesAtCursor=1, PowerGraphDrawAsPoints=0, PowerGraphLegendShown=0, PowerGraphAvgFilterTime=Off, PowerGraphAvgFilterLen=Off, PowerGraphUniformSampleSpacing=0, PowerGraphLegendPosition="510;0", CodeGraphLegendShown=0, CodeGraphLegendPosition="530;0"
 OpenWindow="Console", DockArea=BOTTOM, x=0, y=0, w=2736, h=215, FilterBarShown=0, TotalValueBarShown=0, ToolBarShown=0
 SmartViewPlugin="", Page="", Toolbar="Hidden", Window="SmartView 1"
 TableHeader="Source Files", SortCol="File", SortOrder="ASCENDING", VisibleCols=["File";"Status";"Size";"#Insts";"Path"], ColWidths=[233;100;100;100;1124]
 TableHeader="Data Sampling Table", SortCol="None", SortOrder="ASCENDING", VisibleCols=["Index";"Time";" (s_bq).state";" (s_bq).state_enter_ms";" (s_bq).current_op";" (s_bq).frame_ok_count"], ColWidths=[100;100;100;100;100;100]
-TableHeader="Data Sampling Setup", SortCol="Min. Change", SortOrder="DESCENDING", VisibleCols=["Expression";"Type";"Value";"Min";"Max";"Average";"# Changes";"Min. Change";"Max. Change"], ColWidths=[254;179;100;100;100;124;130;150;150]
+TableHeader="Data Sampling Setup", SortCol="Min. Change", SortOrder="DESCENDING", VisibleCols=["Expression";"Type";"Value";"Min";"Max";"Average";"# Changes";"Min. Change";"Max. Change"], ColWidths=[254;179;113;100;113;135;130;157;150]
 TableHeader="Power Sampling", SortCol="None", SortOrder="ASCENDING", VisibleCols=["Index";"Time";"Ch 0"], ColWidths=[100;100;100]
 TableHeader="RegisterSelectionDialog", SortCol="None", SortOrder="ASCENDING", VisibleCols=[], ColWidths=[]
-TableHeader="Watched Data 1", SortCol="Expression", SortOrder="ASCENDING", VisibleCols=["Expression";"Value";"Location";"Refresh"], ColWidths=[232;259;100;234]
+TableHeader="Watched Data 1", SortCol="Expression", SortOrder="ASCENDING", VisibleCols=["Expression";"Value";"Location";"Refresh"], ColWidths=[232;259;100;204]
 TableHeader="TargetExceptionDialog", SortCol="Name", SortOrder="ASCENDING", VisibleCols=["Name";"Value";"Address";"Description"], ColWidths=[200;196;191;850]
 WatchedExpression="hi2c1", RefreshRate=1, DisplayFormat=DISPLAY_FORMAT_HEX, Window=Watched Data 1
 WatchedExpression="s_power", RefreshRate=1, DisplayFormat=DISPLAY_FORMAT_HEX, Window=Watched Data 1
@@ -28,3 +37,4 @@ WatchedExpression="s_bb_shadow", RefreshRate=1, DisplayFormat=DISPLAY_FORMAT_HEX
 WatchedExpression="s_soc_est", RefreshRate=1, DisplayFormat=DISPLAY_FORMAT_HEX, Window=Watched Data 1
 WatchedExpression="hrtc", RefreshRate=1, DisplayFormat=DISPLAY_FORMAT_HEX, Window=Watched Data 1
 WatchedExpression="s_lp", RefreshRate=1, Window=Watched Data 1
+WatchedExpression="s_protection", RefreshRate=1, Window=Watched Data 1
