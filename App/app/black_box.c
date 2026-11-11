@@ -445,8 +445,9 @@ static int Bb_WriteRecordSnapshot(uint32_t uptime_s, uint16_t flags,
     rec.uptime_s = uptime_s;
     rec.cell_mv[0] = snap->cell_mv[0];
     rec.cell_mv[1] = snap->cell_mv[1];
-    rec.cell_mv[2] = snap->cell_mv[2];
-    rec.pack_mv = snap->pack_mv;
+    /* 记录只写真实可信值；异常时控制值可能是估算，绝不落盘。 */
+    rec.cell_mv[2] = (snap->log_cell3_valid != 0u) ? snap->cell_mv[2] : 0u;
+    rec.pack_mv = (snap->log_pack_valid != 0u) ? snap->pack_mv : 0u;
     rec.cc_raw = snap->cc_raw;
     rec.ts1_raw = snap->ts1_raw;
     rec.flags = flags;

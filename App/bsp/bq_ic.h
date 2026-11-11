@@ -33,8 +33,9 @@
 /* 3S 固定接法（数据手册 Table 9-2）：
  *   CELL1 = VC1-VC0, CELL2 = VC2-VC1, CELL3 = VC5-VC4；
  *   VC4-VC3、VC3-VC2 在板上短接。飞线已完成，不再保留 4S/VC3 兼容分支。
- * 注意：本板 VC5/CELL3 与 BAT/PACK 不可信，只作 raw 诊断；控制值由
- * VC1/VC2 合成（cell3 = 两节均值，pack = 三节和）。 */
+ * 注意：本板 VC5/CELL3 与 BAT/PACK 可能间歇异常。控制值在真实值通过
+ * 合理性检查时优先采用实测，否则回退为 VC1/VC2 估算（cell3 = 两节均值，
+ * pack = 三节和）。VC3/VC4 始终只作 raw 诊断。 */
 #define BQ_REG_BAT          0x2Au
 #define BQ_REG_TS1          0x2Cu
 #define BQ_REG_CC           0x32u
@@ -132,9 +133,10 @@ typedef struct
     uint16_t crc_ok_mask;        /* 本批实际经 CRC 的各寄存器 */
     uint16_t field_ok_mask;      /* 本批 CRC + 必需字段合理性/配置校验 */
     uint16_t raw_cell[3];        /* VC1/VC2/VC5 原始码；VC5 仅诊断 */
-    uint16_t cell_mv[3];         /* [0]=VC1 实测, [1]=VC2 实测, [2]=两节合成均值 */
+    uint16_t cell_mv[3];         /* [0]=VC1 实测, [1]=VC2 实测,
+                                  * [2]=真实 VC5 可信值，否则两节均值 */
     uint16_t raw_pack;           /* BAT 原始码，仅诊断 */
-    uint16_t pack_mv;            /* 三节合成总压（控制值） */
+    uint16_t pack_mv;            /* 真实 BAT 可信值，否则三节估算和（控制值） */
     uint16_t raw_vc3;
     uint16_t raw_vc4;
     uint16_t ts1_raw;            /* 同批 TS1（CRC+14-bit 格式） */
@@ -167,8 +169,8 @@ typedef struct
 
 typedef struct
 {
-    uint16_t cell_mv[3];    /* [0]=VC1, [1]=VC2, [2]=合成均值 (c1+c2+1)/2 */
-    uint16_t pack_mv;       /* 合成总压 = c1 + c2 + c3_syn */
+    uint16_t cell_mv[3];    /* [0]=VC1, [1]=VC2, [2]=真实 VC5 或两节均值 */
+    uint16_t pack_mv;       /* 真实 BAT 或三节估算和 */
     uint16_t log_cell3_mv;  /* 真实 VC5：可信时记录实测，否则 0 */
     uint16_t log_pack_mv;   /* 真实 BAT：可信时记录实测，否则 0 */
     int16_t  cc_raw;
@@ -254,6 +256,15 @@ uint8_t BQ_GetFetMaskRequested(void);
 uint8_t BQ_GetFetMaskApplied(void);
 int BQ_ApplyFetMaskNow(uint8_t mask);
 
+/* 同态重写资格：BQ RUN/总线空闲，无 FET/SYS_STAT 同步，无 ADC 重启/恢复/
+ * 重采样/verdict，request==applied，保护配置已确认。只读，无 I2C。 */
+uint8_t BQ_IsSameStateWriteReady(void);
+
+/* 仅当实际 SYS_CTRL2 与 expected_mask 一致时，把同一 FET 状态重写一次。
+ * 0=成功；-1=不允许/实际状态不符/影子不一致；-2=I2C 写或回读失败。
+ * 不改变 request_fet_mask / fet_mask_applied，不改变策略请求。 */
+int BQ_ApplyFetMaskIfUnchanged(uint8_t expected_mask);
+
 /* 旧的非复位 LP 进入 API（保留兼容）：指定 FET mask（默认 0x00）。
  * 返回 0=成功，-1=通信/回读失败，-2=正在 ADC 重启/配置，暂不允许进入 LP。 */
 int BQ_PrepareForLpMask(uint8_t fet_mask);
@@ -294,9 +305,9 @@ typedef struct
 } bq_lp_status_t;
 
 int BQ_LpBootPrepare(bq_lp_status_t *out);
-/* 复位安全 LP：0=两批独立实测确认（cell1/2 实测，cell3/pack 合成），
- * -1=通信/CRC/VC1/VC2/状态/保护故障或未知。VC5/BAT 只作 raw 诊断，
- * 不再产生“电压异常”专用返回码。 */
+/* 复位安全 LP：0=两批独立实测确认（cell1/2 实测；cell3/pack 可信时实测，
+ * 否则估算），-1=通信/CRC/VC1/VC2/状态/保护故障或未知。VC3/VC4 只作
+ * raw 诊断，不产生“电压异常”专用返回码。 */
 int BQ_LpMonitorRun(bq_snapshot_t *out);
 
 #define BQ_SYS_STAT_OCD         (1u << 0)

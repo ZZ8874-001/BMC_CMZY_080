@@ -123,8 +123,9 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 - 滤波时间常数：节点看到的等效电阻 ≈ 330k‖(910k + 二极管) ≈ **242 kΩ**，C = 100 nF，
   因此 **τ ≈ 24 ms**（约 5τ ≈ 120 ms 才稳定到 1%）。这是“充放电状态”级别的慢信号，不能当快速过流保护。
 - 比较器看到的差模信号 = `0.266 × I × (R分流 + Rds(on)Q2/Q3)`。
-  10 A 时约几十 mV；1 A 时只有几 mV，接近/低于 COMP2 的输入失调与噪声。
+  10 A 时约几十 mV；1 A 时只有几 mV，**100 mA 时约 0.3 mV**，接近/低于 COMP2 的输入失调与噪声。
   **精确电流/荷电状态请用 BQ76920 的 SRP/SRN 库仑计读数，COMP2 只做粗方向判定。**
+- 因此 `ChargePolicy` 在 CHARGE 中用充电电流兜底：`charge_current_ma >20 mA` 时即使 COMP2 为低也保持充电器存在；`<10 mA` 释放；10–20 mA 回差。接近充满（显示 SOC>90 且充电电流 <10 mA，允许最多 −20 mA 的 CC 零点偏置）时只开 CHG、关 DSG，让 DSG 体二极管提供额外压降，COMP2 重新可判充电器；电流 >20 mA 或 SOC<85% 退出该子模式。
 
 ### 3.3 极性（结论）
 
@@ -193,7 +194,8 @@ TS1 上拉模型：BQ 在 `TEMP_SEL=1` 时内部有 10 kΩ 到约 3.3 V；若板
 
 ### L1 充放电 FET 策略
 
-- `COMP2` 充电方向稳定为高：`ChargePolicy_Task()` 进入 CHARGE，请求 `SYS_CTRL2=0x43`（CC + CHG + DSG）。
+- `COMP2` 充电方向稳定为高，或 CHARGE 中充电电流 >20 mA：`ChargePolicy_Task()` 进入/保持 CHARGE，正常请求 `SYS_CTRL2=0x43`（CC + CHG + DSG）。
+- 近满体二极管子模式（显示 SOC>90 且充电电流 <10 mA）：请求 `SYS_CTRL2=0x41`（CC + CHG，DSG 关），利用 DSG 体二极管压降 + COMP2 判充电器；电流 >20 mA 或 SOC<85% 恢复 `0x43`。
 - 无充电器时，`GESTURE_PAIR_HOLD3` 切换 DISCHARGE/IDLE；DISCHARGE 同样双管全开，IDLE 请求 `SYS_CTRL2=0x40`（双管关）。
 - 充电器优先：DISCHARGE 中插入充电器转 CHARGE，并清放电 latch；拔出后回 IDLE，不自动恢复放电。
 - 关键故障强制双管关；LP 进入前 `BQ_PrepareForLpMask()` 把请求影子同步为 LP mask（默认 0），避免唤醒后重放旧请求。

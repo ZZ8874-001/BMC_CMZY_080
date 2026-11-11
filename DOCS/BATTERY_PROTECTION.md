@@ -1,6 +1,6 @@
 # 电池保护逻辑：作用范围与当前实现
 
-> **2026-11-10 降级说明（优先于下文旧描述）**：当前固件不再使用真实 VC5/包压做控制、保护或 SOC；`cell3=(cell1+cell2+1)/2`、`pack=三节和`。真实 VC5/VC3/VC4/BAT 仅作 raw 诊断，可信时写黑匣子/StateStore，否则置 0 并置 missing。BQ 硬件 OV/UV 仅在 cell1/cell2 实测安全时忽略；均衡永久关闭（`CELLBAL1=0` 回读）。`bq_anomaly.c/.h`、partial/2 A OCP、9 帧认证、2 min/5 min 锁存和 0x20-0x23 事件已删除。下文涉及这些路径的段落视为历史。
+> **2026-11-11 更新说明（优先于下文旧描述）**：控制/SOC 在真实 VC5/BAT 可信时优先采用实测，异常时回退为 VC1/VC2 估算（`cell3=(c1+c2+1)/2`、`pack=c1+c2+c3`）；保护/报错动作不变，仍不直接使用 cell3/pack。记录只写真实可信值，异常时 V3/包压置 0 并置 missing；估算不落盘。VC3/VC4 仅作 raw 诊断；BQ 硬件 OV/UV 仅在 cell1/cell2 实测安全时忽略；均衡永久关闭（`CELLBAL1=0` 回读）。`bq_anomaly.c/.h`、partial/2 A OCP、9 帧认证、2 min/5 min 锁存和 0x20-0x23 事件已删除。下文涉及这些路径的段落视为历史。
 
 > 依据：当前工作树中的 `App/` 源码（`protection.c/.h`；`bq_anomaly.c/.h` 已删除）。本文描述**已编码的实际路径**，不是已完成上板安全认证的规格；与旧文档或注释不一致时以源码及 BQ769x0 数据手册 `DOCS/bq769X0.pdf` 为准。编译成功不等于阈值、方向、时序、开关管动作已经实测。
 
@@ -48,7 +48,7 @@ BQ 的 OV/UV 依赖 ADC：NORM 配置、受控 ADC 重启期间以及 reset-base
 
 ### 3.2 正常准入和软件 OCP
 
-**正常准入**要求 `SelfTest_IsDone/IsPassed`、状态机 NORM、BQ RUN、`BQ_IsFresh(now_ms)` 和电源模式 NORM；充电器由消抖 COMP2 高电平指示，下降后还需 1 s 才撤销。IDLE 请求双管关；CHARGE、DISCHARGE 在通常路径请求 `BQ_FET_MASK_ALL=0x03`，再与保护掩码相与。上电 `BQ_DEFAULT_FET_MASK` 虽为 ALL，但 CONFIG 结束实际只开启 CC、FET 位为 0，`ChargePolicy_Init()` 也立即请求 0；不能把宏当作最终上电开关状态。来源：`App/app/charge_policy.c:50-109,144-175,233-478`、`App/bsp/bq_ic.c:1806-1867`。
+**正常准入**要求 `SelfTest_IsDone/IsPassed`、状态机 NORM、BQ RUN、`BQ_IsFresh(now_ms)` 和电源模式 NORM；充电器由消抖 COMP2 高电平指示，或 CHARGE 中充电电流 >20 mA 保持；COMP2 低且无电流支撑时还需 1 s 才撤销。近满（显示 SOC>90 且充电电流 <10 mA）时只请求 CHG（`0x01`），用 DSG 体二极管压降让 COMP2 判充电器；电流 >20 mA 或 SOC<85% 恢复双管。SOC 只作策略启发，不是保护。IDLE 请求双管关；CHARGE、DISCHARGE 在通常路径请求 `BQ_FET_MASK_ALL=0x03`，再与保护掩码相与。上电 `BQ_DEFAULT_FET_MASK` 虽为 ALL，但 CONFIG 结束实际只开启 CC、FET 位为 0，`ChargePolicy_Init()` 也立即请求 0；不能把宏当作最终上电开关状态。来源：`App/app/charge_policy.c`、`App/bsp/bq_ic.c`。
 
 | 软件项目 | 触发条件 | 处置/解除 |
 | --- | --- | --- |

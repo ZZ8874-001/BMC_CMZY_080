@@ -53,6 +53,19 @@
 #define APP_IDLE_LP_MS              5000u   /* 无操作/无充电 5 s 自动进 LP */
 #define APP_BOOT_VOLTAGE_HOLD_MS    2000u
 
+/* VC5/BAT 异常恢复：同值重写 SYS_CTRL2（假开关）。 */
+#define APP_FAKE_SWITCH_RETRY_MS        2500u
+/* 门控跳过用短重试：利用 500 ms BQ 轮询之间的空闲窗口；实际动作仍 >=2.5 s。 */
+#define APP_FAKE_SWITCH_GATE_RETRY_MS   50u
+#define APP_FAKE_SWITCH_LP_LEAD_MS      3000u
+
+#define APP_FAKE_SWITCH_RESULT_NONE     0u
+#define APP_FAKE_SWITCH_RESULT_OK       1u
+#define APP_FAKE_SWITCH_RESULT_FAIL     2u
+#define APP_FAKE_SWITCH_RESULT_BUSY     3u
+#define APP_FAKE_SWITCH_RESULT_GATED    4u
+#define APP_FAKE_SWITCH_RESULT_LP       5u
+
 /* s_app.auto_lp_block：自动 LP 被哪一项条件挡住（Ozone 直接看）。 */
 #define APP_LP_BLOCK_CHARGING       (1u << 0)
 #define APP_LP_BLOCK_BUTTON         (1u << 1)
@@ -109,6 +122,18 @@ static struct
     uint32_t pending_lp_mark_epoch;
     uint8_t pending_lp_mark_active;
     uint8_t pending_lp_mark_lp_archived;
+
+    /* VC5/BAT 异常 -> 同值重写 SYS_CTRL2（RAM only）。 */
+    uint32_t fake_switch_seen_batch_seq;
+    uint32_t fake_switch_next_ms;
+    uint32_t fake_switch_attempt_count;
+    uint32_t fake_switch_ok_count;
+    uint32_t fake_switch_fail_count;
+    uint32_t fake_switch_skip_busy_count;
+    uint32_t fake_switch_skip_gate_count;
+    uint8_t fake_switch_anomaly;
+    uint8_t fake_switch_last_result;
+    uint8_t fake_switch_last_mask;
 } s_app;
 
 /* ---------------- 内部工具 ---------------- */
@@ -580,6 +605,157 @@ static void App_ArchiveTask(uint32_t now_ms)
     s_app.archive_mark_id = 0u;
 }
 
+static uint8_t App_FakeSwitchLpImminent(uint32_t now_ms)
+{
+    /* 充电/按键/策略/保护本身会阻止 LP，不构成“LP 临近”。 */
+    if ((s_app.comparator_charging != 0u) ||
+        (Button_IsPressed() != 0u) ||
+        (ChargePolicy_IsLpBlocked() != 0u) ||
+        (Protection_IsLpBlocked() != 0u))
+    {
+        return 0u;
+    }
+    return ((now_ms - s_app.last_activity_ms) >=
+            (APP_IDLE_LP_MS - APP_FAKE_SWITCH_LP_LEAD_MS)) ? 1u : 0u;
+}
+
+static uint8_t App_FakeSwitchGatesReady(uint32_t now_ms)
+{
+    if ((SelfTest_IsDone() == 0u) || (SelfTest_IsPassed() == 0u))
+    {
+        return 0u;
+    }
+    if (StateMachine_GetState() != SM_STATE_NORM)
+    {
+        return 0u;
+    }
+    if ((BQ_GetState() != BQ_ST_RUN) || (BQ_IsFresh(now_ms) == 0u))
+    {
+        return 0u;
+    }
+    if ((BQ_IsRecovering() != 0u) || (BQ_GetAdcRecoveryFailed() != 0u))
+    {
+        return 0u;
+    }
+    if ((PowerMode_GetState() != POWER_STATE_NORM) ||
+        (Protection_GetState() != PROTECTION_NORMAL) ||
+        (Protection_IsLpBlocked() != 0u))
+    {
+        return 0u;
+    }
+    if ((ChargePolicy_GetState() == CHARGE_POLICY_CAL) ||
+        (ChargePolicy_GetState() == CHARGE_POLICY_FAULT) ||
+        (ChargePolicy_IsCalibration() != 0u))
+    {
+        return 0u;
+    }
+    if (Button_IsPressed() != 0u)
+    {
+        return 0u;
+    }
+    if ((s_app.pending_lp_mark_active != 0u) ||
+        (s_app.norm_mark_active != 0u) ||
+        (LpCycle_GetPendingMark(NULL) != 0u))
+    {
+        return 0u;
+    }
+    if ((BQ_GetFetMaskApplied() &
+         (uint8_t)~Protection_GetAllowedFetMask()) != 0u)
+    {
+        return 0u;
+    }
+    return 1u;
+}
+
+/* 最低优先级：只在新完整批次上判断真实 VC5/BAT 是否异常；异常时播放与
+ * 当前输出同方向的提示音，并同值重写 SYS_CTRL2。动作后 2.5 s 内不重复。 */
+static void App_FakeSwitchTask(uint32_t now_ms)
+{
+    bq_batch_quality_t batch;
+    uint8_t mask;
+    int rc;
+
+    BQ_GetBatchQuality(&batch);
+    if ((batch.complete == 0u) || (batch.batch_seq == 0u) ||
+        (batch.batch_seq == s_app.fake_switch_seen_batch_seq))
+    {
+        return;
+    }
+
+    /* VC1/VC2 不可信的批不能作为触发依据。 */
+    if ((batch.field_ok_mask & (BQ_FIELD_VC1 | BQ_FIELD_VC2)) !=
+        (BQ_FIELD_VC1 | BQ_FIELD_VC2))
+    {
+        s_app.fake_switch_seen_batch_seq = batch.batch_seq;
+        return;
+    }
+
+    if ((batch.log_cell3_valid != 0u) && (batch.log_pack_valid != 0u))
+    {
+        s_app.fake_switch_seen_batch_seq = batch.batch_seq;
+        s_app.fake_switch_anomaly = 0u;
+        s_app.fake_switch_next_ms = 0u;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_NONE;
+        return;
+    }
+
+    /* 异常批先不标记 seen：若因 BQ 脚本/同步/蜂鸣器/LP 门控跳过，
+     * 下一圈可以继续用同一批，在实际动作或恢复正常后再消费该批。 */
+    s_app.fake_switch_anomaly = 1u;
+    if ((int32_t)(now_ms - s_app.fake_switch_next_ms) < 0)
+    {
+        return;
+    }
+
+    if (App_FakeSwitchLpImminent(now_ms) != 0u)
+    {
+        s_app.fake_switch_skip_gate_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_LP;
+        s_app.fake_switch_next_ms = now_ms + APP_FAKE_SWITCH_GATE_RETRY_MS;
+        return;
+    }
+    if (App_FakeSwitchGatesReady(now_ms) == 0u)
+    {
+        s_app.fake_switch_skip_gate_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_GATED;
+        s_app.fake_switch_next_ms = now_ms + APP_FAKE_SWITCH_GATE_RETRY_MS;
+        return;
+    }
+    if (Buzzer_IsActive() != 0u)
+    {
+        s_app.fake_switch_skip_busy_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_BUSY;
+        s_app.fake_switch_next_ms = now_ms + APP_FAKE_SWITCH_GATE_RETRY_MS;
+        return;
+    }
+    if (BQ_IsSameStateWriteReady() == 0u)
+    {
+        s_app.fake_switch_skip_gate_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_GATED;
+        s_app.fake_switch_next_ms = now_ms + APP_FAKE_SWITCH_GATE_RETRY_MS;
+        return;
+    }
+
+    mask = (uint8_t)(BQ_GetFetMaskApplied() & BQ_FET_MASK_ALL);
+    s_app.fake_switch_last_mask = mask;
+    s_app.fake_switch_seen_batch_seq = batch.batch_seq;
+    Buzzer_StartPattern((mask != BQ_FET_MASK_NONE) ?
+                        BUZZER_PATTERN_WAKE : BUZZER_PATTERN_LP_ENTER);
+    rc = BQ_ApplyFetMaskIfUnchanged(mask);
+    s_app.fake_switch_attempt_count++;
+    if (rc == 0)
+    {
+        s_app.fake_switch_ok_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_OK;
+    }
+    else
+    {
+        s_app.fake_switch_fail_count++;
+        s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_FAIL;
+    }
+    s_app.fake_switch_next_ms = now_ms + APP_FAKE_SWITCH_RETRY_MS;
+}
+
 static void App_HandleSelfTestCompletion(void)
 {
     uint8_t event = SelfTest_TakeEvent();
@@ -756,7 +932,8 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned long)snapshot.verdict_deadline_ms,
                    (unsigned long)snapshot.adc_restart_last_ms);
 
-    App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u rsn=%u\r\n",
+    App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u "
+                   "cp=%u bd=%u ih=%u cmp=%u I=%ld soc=%u rsn=%u\r\n",
                    (unsigned)ChargePolicy_GetState(),
                    (unsigned)ChargePolicy_GetRequestedMask(),
                    (unsigned)BQ_GetFetMaskApplied(),
@@ -765,7 +942,24 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)((ChargePolicy_GetState() ==
                                CHARGE_POLICY_DISCHARGE) ? 1u : 0u),
                    (unsigned)ChargePolicy_IsCalibration(),
+                   (unsigned)ChargePolicy_IsChargerPresent(),
+                   (unsigned)ChargePolicy_GetBodyDiodeMode(),
+                   (unsigned)ChargePolicy_GetChargeCurrentHold(),
+                   (unsigned)s_app.comparator_charging,
+                   (long)snapshot.current_ma,
+                   (unsigned)SocEst_GetSocPercent(),
                    (unsigned)ChargePolicy_GetCalEndReason());
+    App_Log_Printf("[VSW] an=%u n=%lu ok=%lu fail=%lu busy=%lu gate=%lu "
+                   "res=%u mask=%02X next=%lu\r\n",
+                   (unsigned)s_app.fake_switch_anomaly,
+                   (unsigned long)s_app.fake_switch_attempt_count,
+                   (unsigned long)s_app.fake_switch_ok_count,
+                   (unsigned long)s_app.fake_switch_fail_count,
+                   (unsigned long)s_app.fake_switch_skip_busy_count,
+                   (unsigned long)s_app.fake_switch_skip_gate_count,
+                   (unsigned)s_app.fake_switch_last_result,
+                   (unsigned)s_app.fake_switch_last_mask,
+                   (unsigned long)s_app.fake_switch_next_ms);
 }
 
 static void App_DegradedLoop(void)
@@ -850,6 +1044,16 @@ void App_Init(void)
     s_app.pending_lp_mark_epoch = 0u;
     s_app.pending_lp_mark_active = 0u;
     s_app.pending_lp_mark_lp_archived = 0u;
+    s_app.fake_switch_seen_batch_seq = 0u;
+    s_app.fake_switch_next_ms = 0u;
+    s_app.fake_switch_attempt_count = 0u;
+    s_app.fake_switch_ok_count = 0u;
+    s_app.fake_switch_fail_count = 0u;
+    s_app.fake_switch_skip_busy_count = 0u;
+    s_app.fake_switch_skip_gate_count = 0u;
+    s_app.fake_switch_anomaly = 0u;
+    s_app.fake_switch_last_result = APP_FAKE_SWITCH_RESULT_NONE;
+    s_app.fake_switch_last_mask = 0u;
 
     Fault_Init();
     PowerMode_Init();          /* 16 MHz → 80 MHz；核对 RTC 源/LSE 健康 */
@@ -918,6 +1122,8 @@ void App_Loop(void)
     button_event_t button_ev;
     gesture_event_t gesture_ev;
     bq_snapshot_t bq_snap;
+    soc_est_snapshot_t soc_snap;
+    charge_policy_input_t policy_in;
 
     Watchdog_Feed();
     Fault_PowerRecoverTask(HAL_GetTick());
@@ -990,7 +1196,19 @@ void App_Loop(void)
                     SocEst_IsTempValid(), SocEst_GetTempDc());
     StateMachine_Update(BQ_IsFresh(now_ms), s_app.comparator_charging,
                         Fault_GetAll());
-    ChargePolicy_Task(now_ms, s_app.comparator_charging);
+    policy_in.charge_current_ma =
+        (-(int32_t)bq_snap.current_ma) * BQ_CC_DISCHARGE_SIGN;
+    policy_in.current_valid =
+        ((bq_snap.valid != 0u) && (bq_snap.fresh != 0u) &&
+         (BQ_IsFresh(now_ms) != 0u)) ? 1u : 0u;
+    SocEst_GetSnapshot(&soc_snap);
+    policy_in.soc01 = (uint16_t)((soc_snap.soc01 < 0) ? 0 :
+                       ((soc_snap.soc01 > 10000) ? 10000 : soc_snap.soc01));
+    /* 只要求真实 BQ 帧，不要求 NMC 标定；SOC 仅作近满策略启发，不是保护输入。 */
+    policy_in.soc_valid =
+        ((soc_snap.frame_valid != 0u) &&
+         (soc_snap.quality == SOC_EST_QUALITY_REAL)) ? 1u : 0u;
+    ChargePolicy_Task(now_ms, s_app.comparator_charging, &policy_in);
     Protection_Service(now_ms, &bq_snap);
     App_ProtectionEventTask();
 
@@ -1000,6 +1218,7 @@ void App_Loop(void)
     /* 先处理 LP 待标记和 NORM 30 min 标记，再判断能否进 LP；否则
      * 标记到达的这一圈可能抢先复位，造成档案窗口漏处理。 */
     App_ArchiveTask(now_ms);
+    App_FakeSwitchTask(now_ms);   /* 最低优先级：所有其它服务之后 */
 
     /* 自动 LP：逐项记录阻止原因，5 s 无活动且无阻止项时请求 LP。 */
     {

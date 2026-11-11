@@ -234,5 +234,5 @@ void Buzzer_Stop(void)
 
 uint8_t Buzzer_IsActive(void)
 {
-    return (s_buzzer.pattern != NULL) ? 1u : 0u;
+    return ((s_buzzer.pattern != NULL) || (s_buzzer.output_on != 0u)) ? 1u : 0u;
 }

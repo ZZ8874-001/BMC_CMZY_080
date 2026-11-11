@@ -1,7 +1,7 @@
 
 # BMC_CMZY_080 电源模式与切换说明（L0 + M1 基础）
 
-> **2026-11-10 降级说明**：真实 VC5/包压不再参与控制/保护/SOC；cell3 取前两节均值、pack 取三节和，raw VC5/BAT 仅诊断。`bq_anomaly.c/.h` 与 partial/2 A OCP/9 帧/2 min/5 min 锁存已删除；均衡永久关闭。LP monitor 只校验 cell1/2，`-2` 电压异常返回码已删除；LP ALERT 唤醒只用 SCD/OCD/XREADY。下文相关旧描述视为历史。
+> **2026-11-11 更新说明**：控制/SOC 在真实 VC5/BAT 可信时优先采用实测，异常时回退为 VC1/VC2 估算；保护/报错动作不变，仍不直接使用 cell3/pack。记录只写真实可信值，异常时 V3/包压置 0；估算不落盘。VC3/VC4 仅作 raw 诊断。`bq_anomaly.c/.h` 与 partial/2 A OCP/9 帧/2 min/5 min 锁存已删除；均衡永久关闭。LP monitor 只校验 cell1/2，`-2` 电压异常返回码已删除；LP ALERT 唤醒只用 SCD/OCD/XREADY。下文相关旧描述视为历史。
 
 依据（当前工作树：复位式 LP、M2 保护监督层；具体行为与参数以当前源码为准，旧镜像体积及构建记录不代表本次改动的验证结果）：
 
@@ -115,7 +115,7 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 ### 3.1 L1 充放电策略与 CAL
 
 - `ChargePolicy_Task()` 在 `StateMachine_Update()` 之后运行，状态优先级：`FAULT > CAL > CHARGE(充电器) > DISCHARGE(手势) > IDLE`。
-- `comp_charging`（COMP2 消抖）上升立即置充电器存在；连续低 1000 ms 才撤销。充电器插入沿用既有 BQ fresh、自检和保护门控，部分异常**不保证持续充电**；移除后回 IDLE，双管关。
+- `comp_charging`（COMP2 消抖）上升立即置充电器存在；CHARGE 中充电电流 >20 mA 也可保持存在（COMP2 在 MOS 导通后差模太小）；COMP2 低且无电流支撑时连续 1000 ms 才撤销。近满（显示 SOC>90 且充电电流 <10 mA，允许 −20 mA 内 CC 零偏）只请求 CHG，利用 DSG 体二极管 + COMP2 判充电器；电流 >20 mA 或 SOC<85% 恢复双管。充电器插入沿用既有 BQ fresh、自检和保护门控，部分异常**不保证持续充电**；移除后回 IDLE，双管关。
 - `GESTURE_PAIR_HOLD3` 切换 DISCHARGE/IDLE；严格部分异常时若本次唤醒已取得真实好帧、20 s 和新 CC/保护/方向门控均成立，异常期已关输出亦可重新按键请求**有条件**放电；其它情况下不得因按键绕过关断或持久锁存。充电/真实 FAULT/CAL/充电器存在时仍拒绝。
 - 关键故障强制请求 0、进入策略 FAULT；CAL 自动结束，不自动恢复。
 - `CHARGE/DISCHARGE` 常规模式请求 `BQ_FET_MASK_ALL`，最终仍需与 `Protection_GetAllowedFetMask()` 和异常锁存门控相与；有条件部分放电**不代表双管无条件全开**。输出关断优先即时申请、RUN/idle 时核实实际 BQ FET 状态，不把请求影子当作已确认关断。

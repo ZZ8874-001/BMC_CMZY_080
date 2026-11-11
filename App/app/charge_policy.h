@@ -30,15 +30,29 @@ typedef enum
     CHARGE_POLICY_CAL_END_LP
 } charge_policy_cal_end_t;
 
+/* 充电器存在/近满判据的输入。charge_current_ma 已按 BQ_CC_DISCHARGE_SIGN
+ * 修正为“充电为正”；soc01 为 0..10000 的显示 SOC，只作策略启发，不是保护。 */
+typedef struct
+{
+    int32_t  charge_current_ma;
+    uint16_t soc01;
+    uint8_t  current_valid;
+    uint8_t  soc_valid;
+} charge_policy_input_t;
+
 void ChargePolicy_Init(void);          /* 清零并 BQ_RequestFetMask(0) */
 void ChargePolicy_OnPairHold3(uint32_t now_ms);
 void ChargePolicy_OnLpWake(uint32_t now_ms);
-void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging);
+void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
+                       const charge_policy_input_t *in);
 
 charge_policy_state_t ChargePolicy_GetState(void);
 uint8_t ChargePolicy_GetRequestedMask(void);
 uint8_t ChargePolicy_IsLpBlocked(void);
 uint8_t ChargePolicy_IsCalibration(void);
+uint8_t ChargePolicy_IsChargerPresent(void);
+uint8_t ChargePolicy_GetBodyDiodeMode(void);
+uint8_t ChargePolicy_GetChargeCurrentHold(void);
 charge_policy_cal_end_t ChargePolicy_GetCalEndReason(void);
 
 #endif /* APP_CHARGE_POLICY_H */
