@@ -577,7 +577,7 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | SysTick                   | 运行               | 1 ms。                                                                                                                                                                                                                  |
 | DBGMCU                    | 默认               | SWD 在 Run 可用；STOP 关闭（默认）。                                                                                                                                                                                    |
 | Flash                     | 可写               | BlackBox/StateStore/BMS NVM；30 min 记录。                                                                                                                                                                              |
-| BQ76920                   | RUN                | ADC/TEMP/CC on；FET 按策略；保护 0x89/0x57/0x40（SCD 100 µs，OCD 仅放电）；`BQ_IsFresh` 2 s 窗口；M2 Protection 监督层评估 BQ 锁存、5 A/30 A 软件 OCP、NTC 温度和允许掩码；CC 符号由 `BQ_CC_DISCHARGE_SIGN` 单点定义。 |
+| BQ76920                   | RUN                | ADC/TEMP/CC on；FET 按策略；保护 0x89/0x57/0x40（SCD 100 µs，OCD 仅放电）；`BQ_IsFresh` 2 s 窗口；M2 Protection 监督层评估 BQ 锁存、5.5 A/1 s 与 33 A/500 ms 软件 OCP、4–54 °C NTC 包温度门控和允许掩码；CC 符号由 `BQ_CC_DISCHARGE_SIGN` 单点定义。 |
 | MCU ADC/SPI/USB/WWDG/其它 | 未使用             | 项目未启用。                                                                                                                                                                                                            |
 
 ### 1.6.4 逻辑子状态
@@ -600,13 +600,13 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 | 状态/条件             | 动作                                                   | 影响                                                                                                                                                                     |
 | ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PROTECTION_INIT`     | 上电/数据未就绪                                        | `allow=0`，等首帧和配置完成。                                                                                                                                            |
-| `PROTECTION_NORMAL`   | 无 BQ 锁存、无软件 OCP、数据有效                       | `allow=0x03`；`PROT_TEMP_ENABLE=1` 时按温度只收紧 CHG 或 DSG。                                                                                                           |
+| `PROTECTION_NORMAL`   | 无 BQ 锁存、无软件 OCP、数据有效                       | `allow=0x03`；`PROT_TEMP_ENABLE=1` 时按 4–54 °C 包温度门控收紧 CHG/DSG。                                                                                                 |
 | `PROTECTION_PARTIAL`  | 严格 `BQ_BATCH_PARTIAL_VC5_PACK` 且无硬件/通信真实故障 | 默认 `allow=0`；只有本次曾通过真实 FULL/自检、最近 FULL <20 s、新 CC 与 COMP2/控制/保护证据持续可靠时，可限时放电；部分期 2 A/两次新 CC 转换 OCP。其它 M2 禁止条件优先。 |
 | `PROTECTION_RECOVERY` | boot/LP 首次配置前已锁存 SCD/OCD                       | `allow=0`；BQ RUN/idle、FET 全关、`                                                                                                                                      |
 | `PROTECTION_LATCHED`  | BQ 运行期锁存、清除失败、软件 OCP                      | `allow=0`、`FAULT_BIT_PROTECTION`；软件 OCP 只接受 `Protection_RequestLatchClear()`。                                                                                    |
-| 软件充电 OCP          | CC 充电方向 ≥5 A，2 个新发布帧                        | 锁存双 FET 关；事件 0x1C；清除额外要求充电器移除。                                                                                                                       |
-| 软件放电 OCP          | CC 放电方向 ≥30 A，2 个新发布帧                       | 锁存双 FET 关；事件 0x1D；BQ 37.3 A OCD/44.7 A SCD 是硬件后备。                                                                                                          |
-| 温度 inhibit          | NTC 充/放电越界，2 s 去抖、2 °C 回差；无效传感器 2 s  | 只禁对应方向（无效则双禁）；不锁存、不置 PROTECTION；`PROT_TEMP_ENABLE=1` 才生效；`FAULT_BIT_TEMP` 只报传感器无效。                                                      |
+| 软件充电 OCP          | CC 充电方向 ≥5.5 A，持续 1 s，至少 2 个新发布帧        | 锁存双 FET 关；事件 0x1C；清除额外要求充电器移除。                                                                                                                       |
+| 软件放电 OCP          | CC 放电方向 ≥33 A，持续 500 ms，至少 2 个新发布帧      | 锁存双 FET 关；事件 0x1D；BQ 37.3 A OCD/44.7 A SCD 是硬件后备。                                                                                                          |
+| 温度 inhibit          | 包温度 <4 °C 或 >54 °C，2 s 去抖、2 °C 回差；无效传感器 2 s | 充电和放电都收紧（无效则双禁）；不锁存、不置 PROTECTION；`PROT_TEMP_ENABLE=1`；`FAULT_BIT_TEMP` 报传感器无效。                                                          |
 
 #### BQ 数据质量、归档与报警
 
@@ -1260,7 +1260,8 @@ NORM 每个 RTC 30 min 标记缓存连续 9 个真实 FULL 发布帧；到点最
 | ----------- | -------------------------------- | ------------ | ------------ |
 | IDLE      | NormalReady + charger          | CHARGE     | 0x03       |
 | IDLE      | NormalReady + user discharge   | DISCHARGE  | 0x03       |
-| CHARGE    | charger absent 1 s / not ready | IDLE       | 0x00       |
+| CHARGE    | charger absent 5.2 s / not ready | IDLE       | 0x00       |
+| DISCHARGE | 前 10 s 净充电 ≥100 mA（回差 90） | CHARGE     | 0x03（近满可为 0x01） |
 | DISCHARGE | PAIR_HOLD3 toggle / not ready  | IDLE       | 0x00       |
 | IDLE      | cal_mode + CalReady            | CAL        | debug mask |
 | CAL       | USER/FAULT/NOTREADY/LP         | IDLE/FAULT | 0x00       |

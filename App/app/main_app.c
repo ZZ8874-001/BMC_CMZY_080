@@ -933,7 +933,8 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned long)snapshot.adc_restart_last_ms);
 
     App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u "
-                   "cp=%u bd=%u ih=%u cmp=%u I=%ld soc=%u rsn=%u\r\n",
+                   "cp=%u bd=%u ih=%u cmp=%u I=%ld soc=%u rsn=%u "
+                   "dd=%u dc=%lu\r\n",
                    (unsigned)ChargePolicy_GetState(),
                    (unsigned)ChargePolicy_GetRequestedMask(),
                    (unsigned)BQ_GetFetMaskApplied(),
@@ -948,7 +949,9 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)s_app.comparator_charging,
                    (long)snapshot.current_ma,
                    (unsigned)SocEst_GetSocPercent(),
-                   (unsigned)ChargePolicy_GetCalEndReason());
+                   (unsigned)ChargePolicy_GetCalEndReason(),
+                   (unsigned)ChargePolicy_GetDischargeChargeDetect(),
+                   (unsigned long)ChargePolicy_GetDischargeChargeDetectCount());
     App_Log_Printf("[VSW] an=%u n=%lu ok=%lu fail=%lu busy=%lu gate=%lu "
                    "res=%u mask=%02X next=%lu\r\n",
                    (unsigned)s_app.fake_switch_anomaly,

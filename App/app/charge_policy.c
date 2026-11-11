@@ -19,21 +19,30 @@
 
 #include <stddef.h>
 
-#define CHARGE_POLICY_CHARGER_LOW_MS 1000u
+/* 平衡充会故意暂时关断输出（电流先降到 0），若按 1 s 去抖会被误判为
+ * 充电器移除，造成 CHARGE→IDLE→CHARGE 反复。5.2 s 覆盖该短暂断流。 */
+#define CHARGE_POLICY_CHARGER_LOW_MS 5200u
 
 /* COMP2 在 MOS 导通后只看到 I×(Rshunt+Rds_on)×0.266；100 mA 时仅约 0.3 mV。
- * 充电电流 >20 mA 时用电流保持“充电器存在”；<10 mA 时释放；10–20 mA 回差。
- * 近满时关 DSG、保留 CHG，让 DSG 体二极管提供压降，COMP2 重新可用。 */
+ * 充电电流 >30 mA 时用电流保持“充电器存在”；<20 mA 时释放；20–30 mA 回差。
+ * 近满（SOC>90 且 -20 mA < I < 220 mA）时关 DSG、保留 CHG，让 DSG 体二极管
+ * 提供压降，COMP2 重新可用；电流 >320 mA 或 SOC<85% 退出。 */
 #ifndef CHARGE_POLICY_BODY_DIODE_ENABLE
 #define CHARGE_POLICY_BODY_DIODE_ENABLE      1u
 #endif
-#define CHARGE_POLICY_CURRENT_HOLD_MA         20
-#define CHARGE_POLICY_CURRENT_RELEASE_MA      10
-#define CHARGE_POLICY_NEAR_FULL_ENTER_MA      10
+#define CHARGE_POLICY_CURRENT_HOLD_MA         30
+#define CHARGE_POLICY_CURRENT_RELEASE_MA      20
+#define CHARGE_POLICY_NEAR_FULL_ENTER_MA      220
 #define CHARGE_POLICY_NEAR_FULL_MIN_MA        (-20) /* 未标定 CC 零点允许的负偏置 */
-#define CHARGE_POLICY_NEAR_FULL_EXIT_MA       20
+#define CHARGE_POLICY_NEAR_FULL_EXIT_MA       320
 #define CHARGE_POLICY_NEAR_FULL_SOC01         9000u
 #define CHARGE_POLICY_NEAR_FULL_EXIT_SOC01    8500u
+
+/* DISCHARGE 进入后的前 10 s：净充电电流 >=100 mA 视为外部设备正在充电，
+ * 直接切 CHARGE；<=90 mA 释放（10 mA 回差）。输入与 CHARGE 电流判据相同。 */
+#define CHARGE_POLICY_DISCHARGE_CHARGE_WINDOW_MS 10000u
+#define CHARGE_POLICY_DISCHARGE_CHARGE_SET_MA    100
+#define CHARGE_POLICY_DISCHARGE_CHARGE_CLEAR_MA  90
 
 static struct
 {
@@ -53,6 +62,7 @@ static struct
     uint8_t soc_valid;
     uint8_t charge_current_hold;
     uint8_t body_diode_mode;
+    uint8_t discharge_charge_detect;
 
     uint8_t cal_pending;
     uint8_t cal_active;
@@ -74,6 +84,7 @@ static struct
     uint32_t current_hold_count;
     uint32_t body_diode_enter_count;
     uint32_t body_diode_exit_count;
+    uint32_t discharge_charge_detect_count;
 } s_policy;
 
 static uint8_t ChargePolicy_NormalReady(uint32_t now_ms)
@@ -92,6 +103,45 @@ static uint8_t ChargePolicy_CalReady(uint32_t now_ms)
                      (BQ_GetState() == BQ_ST_RUN) &&
                      (BQ_IsFresh(now_ms) != 0u) &&
                      (PowerMode_GetState() == POWER_STATE_NORM));
+}
+
+/* DISCHARGE 前 10 s 的外部充电兜底；闩锁只在本状态窗口内有效。 */
+static void ChargePolicy_UpdateDischargeChargeDetect(uint32_t now_ms)
+{
+    if (s_policy.state != CHARGE_POLICY_DISCHARGE)
+    {
+        s_policy.discharge_charge_detect = 0u;
+        return;
+    }
+    if ((now_ms - s_policy.state_enter_ms) >=
+        CHARGE_POLICY_DISCHARGE_CHARGE_WINDOW_MS)
+    {
+        s_policy.discharge_charge_detect = 0u;
+        return;
+    }
+    if (s_policy.charger_present != 0u)
+    {
+        s_policy.discharge_charge_detect = 0u;
+        return;
+    }
+    if (s_policy.current_valid == 0u)
+    {
+        return;   /* 不用失效电流置位/清除 */
+    }
+
+    if (s_policy.charge_current_ma >= CHARGE_POLICY_DISCHARGE_CHARGE_SET_MA)
+    {
+        if (s_policy.discharge_charge_detect == 0u)
+        {
+            s_policy.discharge_charge_detect_count++;
+        }
+        s_policy.discharge_charge_detect = 1u;
+    }
+    else if (s_policy.charge_current_ma <=
+             CHARGE_POLICY_DISCHARGE_CHARGE_CLEAR_MA)
+    {
+        s_policy.discharge_charge_detect = 0u;
+    }
 }
 
 static void ChargePolicy_RequestMask(uint8_t mask)
@@ -144,6 +194,7 @@ static void ChargePolicy_SetState(charge_policy_state_t new_state,
         s_policy.charge_current_hold = 0u;
         s_policy.body_diode_mode = 0u;
     }
+    s_policy.discharge_charge_detect = 0u;
 
     if (announce == 0u)
     {
@@ -181,6 +232,7 @@ void ChargePolicy_Init(void)
     s_policy.soc_valid = 0u;
     s_policy.charge_current_hold = 0u;
     s_policy.body_diode_mode = 0u;
+    s_policy.discharge_charge_detect = 0u;
     s_policy.cal_pending = 0u;
     s_policy.cal_active = 0u;
     s_policy.cal_mode = 0u;
@@ -201,6 +253,7 @@ void ChargePolicy_Init(void)
     s_policy.current_hold_count = 0u;
     s_policy.body_diode_enter_count = 0u;
     s_policy.body_diode_exit_count = 0u;
+    s_policy.discharge_charge_detect_count = 0u;
 
     /* 不修改 BQ_DEFAULT_FET_MASK 宏；策略接管后 IDLE 明确请求 0。 */
     BQ_RequestFetMask(BQ_FET_MASK_NONE);
@@ -236,6 +289,7 @@ void ChargePolicy_OnLpWake(uint32_t now_ms)
     s_policy.soc_valid = 0u;
     s_policy.charge_current_hold = 0u;
     s_policy.body_diode_mode = 0u;
+    s_policy.discharge_charge_detect = 0u;
     s_policy.cal_pending = 0u;
 
     if ((s_policy.cal_mode != 0u) || (s_policy.cal_active != 0u))
@@ -294,7 +348,7 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
     }
 
     /* MOS 导通后 COMP2 差模只有 I×(Rshunt+Rds_on)×0.266；100 mA 时约 0.3 mV。
-     * CHARGE 中充电电流 >20 mA 置位电流保持，<10 mA 释放，10–20 mA 回差。 */
+     * CHARGE 中充电电流 >30 mA 置位电流保持，<20 mA 释放，20–30 mA 回差。 */
     if ((s_policy.state == CHARGE_POLICY_CHARGE) &&
         (s_policy.current_valid != 0u))
     {
@@ -319,8 +373,12 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
     current_hold = ((s_policy.state == CHARGE_POLICY_CHARGE) &&
                     (s_policy.charge_current_hold != 0u)) ? 1u : 0u;
 
-    /* 充电器：COMP2 高或 CHARGE 中电流保持；两者都没有时仍用 1 s 低电平去抖。 */
-    if ((comp_charging != 0u) || (current_hold != 0u))
+    ChargePolicy_UpdateDischargeChargeDetect(now_ms);
+
+    /* 充电器：COMP2 高、CHARGE 中电流保持，或 DISCHARGE 前 10 s 的外部充电
+     * 闩锁。三者都没有时仍用 5.2 s 低电平去抖（平衡充可短暂关断输出）。 */
+    if ((comp_charging != 0u) || (current_hold != 0u) ||
+        (s_policy.discharge_charge_detect != 0u))
     {
         s_policy.charger_present = 1u;
         s_policy.charger_low_active = 0u;
@@ -446,7 +504,7 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
 #if (CHARGE_POLICY_BODY_DIODE_ENABLE != 0u)
             if (s_policy.body_diode_mode == 0u)
             {
-                /* 近满且电流 <10 mA：关 DSG，保留 CHG；DSG 体二极管抬高 COMP2 差模。 */
+                /* 近满且电流在 -20..220 mA：关 DSG，保留 CHG；DSG 体二极管抬高 COMP2 差模。 */
                 if ((s_policy.current_valid != 0u) &&
                     (s_policy.soc_valid != 0u) &&
                     (s_policy.soc01 > CHARGE_POLICY_NEAR_FULL_SOC01) &&
@@ -579,6 +637,16 @@ uint8_t ChargePolicy_GetBodyDiodeMode(void)
 uint8_t ChargePolicy_GetChargeCurrentHold(void)
 {
     return s_policy.charge_current_hold;
+}
+
+uint8_t ChargePolicy_GetDischargeChargeDetect(void)
+{
+    return s_policy.discharge_charge_detect;
+}
+
+uint32_t ChargePolicy_GetDischargeChargeDetectCount(void)
+{
+    return s_policy.discharge_charge_detect_count;
 }
 
 charge_policy_cal_end_t ChargePolicy_GetCalEndReason(void)

@@ -28,7 +28,7 @@
 
 - 基线 commit：`ce8d609`（`fix:fuck烂掉的ADC，直接用正常的VC1，VC2值`）。
 - 工作树：已修改的 App 源、`DOCS/BATTERY_PROTECTION.md`、`DOCS/POWER_MODE.md`、`DOCS/SYSTEM_STATES.md`、`BMC.jdebug.user`；另有未跟踪的原始 L1 计划与本副本。本文描述的是该工作树快照，不是干净发布。
-- 构建（2026-11-11 clean build，含充电电流兜底）：text 80736 B、data 168 B、bss 6976 B、`_image_end=0x08013C08`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
+- 构建（2026-11-11 clean build，含充电电流兜底与 D-PROT1 保护决策）：text 81064 B、data 168 B、bss 6984 B、`_image_end=0x08013D50`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
 - 文档优先级：当前代码 > `CLAUDE.md` 的 2026-11-10/11 当前状态段 > `DOCS/POWER_MODE.md`/`SYSTEM_STATES.md` 顶部更新说明 > 本计划原文。`DOCS/BATTERY_PROTECTION.md` 顶部虽有 2026-11-11 更新说明，但正文仍残留已删除的 partial/`bq_anomaly` 历史段落，不能整篇当作当前状态。
 
 ### G1.2 已落地的关键路径
@@ -36,10 +36,10 @@
 - **时钟/NORM**：冷启动 `SystemClock_Config()` 只开 HSI16；`PowerMode_ClkSwitchToHsePll()` 在 `App_Init()` 内切 HSE bypass 12 MHz + PLL 80 MHz（PLLM=3/PLLN=40/PLLR=2，Scale1，4WS）；App 不得直接调用 `SystemClock_Config()`。
 - **LP**：`PowerMode_RequestLp()` → `LpCycle_RequestStart()` 写 BKP START token → 软件复位；轻量 boot 在 HSI16 做 BQ sniff、充电器/PB5/PA8 检查、30 min 标记、校准 IWDG timeout，然后 STOP1；IWDG 超时复位下一次轻量 boot。`LP_BASE_CYCLE_MS=30000`。RTC WUT 和 LPTIM1 被显式关闭，`RTC_WKUP_IRQHandler` 只清 pending/WUTF。默认 `LP_RTC_USE_LSE=0` 走 LSI（板载 LSE 不起振）；`=1` 才启动 LSE、LSE 失败回退 LSI 并禁用 LP。
 - **充电检测/唤醒**：每次轻量 boot 读 `LOAD_PRESENT`（要求 `!CHG_ON`）后，临时 PA1=0、等 30 ms、启动 COMP2、再等 30 ms 读方向；判定为充电则写 WAKE token + 软件复位，下一次完整 `App_Init` 进入 CHARGE。**该检查约每 30 s 一次，不是 1 s 一次**。PA8 是 EXTI event rising，不能唤醒 STOP1；轻量 boot 读 `SYS_STAT`，LP 唤醒只认 SCD/OCD/XREADY，OV/UV/CC_READY/OVRD_ALERT 被排除。
-- **工作状态**：`state_machine` 只有 BOOT/NORM/FAULT；`charge_policy` 只有 IDLE/CHARGE/DISCHARGE/CAL/FAULT。CHARGE 和 DISCHARGE 正常请求 `BQ_FET_MASK_ALL`（CHG+DSG 双管全开）；IDLE 请求 0；CAL 是 Ozone 调试态。COMP2 消抖充电器自动进入 CHARGE；CHARGE 中充电电流 >20 mA 时用电流保持充电器存在，近满（显示 SOC>90 且电流 <10 mA）切 CHG-only/DSG 体二极管；PAIR_HOLD3 切换 DISCHARGE/IDLE；FAULT 和 CAL 阻止自动 LP。没有 DISCHARGE_ARM/CUTOFF_LATCH/SWAP_ERROR/REPLACE_READY/DEAD_STORAGE。
+- **工作状态**：`state_machine` 只有 BOOT/NORM/FAULT；`charge_policy` 只有 IDLE/CHARGE/DISCHARGE/CAL/FAULT。CHARGE 和 DISCHARGE 正常请求 `BQ_FET_MASK_ALL`（CHG+DSG 双管全开）；IDLE 请求 0；CAL 是 Ozone 调试态。COMP2 消抖充电器自动进入 CHARGE；CHARGE 中充电电流 >30 mA 时用电流保持充电器存在，近满（显示 SOC>90 且 −20 mA < 电流 < 220 mA）切 CHG-only/DSG 体二极管；PAIR_HOLD3 切换 DISCHARGE/IDLE；FAULT 和 CAL 阻止自动 LP。没有 DISCHARGE_ARM/CUTOFF_LATCH/SWAP_ERROR/REPLACE_READY/DEAD_STORAGE。
 - **按键**：`button` 4 ms 采样、20 ms 消抖；`gesture` 能产生 SHORT/HOLD3/PAIR_HOLD3/HOLD5/RELEASE_AFTER_HOLD5/TRIPLE。`main_app` 目前只消费 `GESTURE_PAIR_HOLD3`；其余事件没有业务动作。
 - **SOC/SOH**：toolkit 核心已复制到 `App/detect/bms/`；`SocEst_OnSnapshot()` 在 500 ms 新快照上用三节最低电压 + CC 电流 + TS1 温度；`SOC_EST_CURRENT_SIGN=BQ_CC_DISCHARGE_SIGN`；`SOC_EST_CAL_VALID=0`，SOC 只显示/记录/归档，不参与 5%/0% 硬保护。当前参数是 NMC 1500 mAh 占位表，不是 LFP 标定表。
-- **保护**：BQ `PROTECT1=0x89`（SCD 67 mV≈44.7 A/100 µs）、`PROTECT2=0x57`（OCD 56 mV≈37.3 A/320 ms，放电方向）、`PROTECT3=0x40`（OV 1 s/UV 4 s）；OV_TRIP/UV_TRIP 当前按 NMC **4.25 V/2.80 V** 计算。软件 OCP 为充电 5000 mA、放电 30000 mA，按 2 个新发布帧确认并锁存；`PROT_TEMP_ENABLE=0`，温度禁充/禁放逻辑存在但未生效。Protection 只读 `snap.valid/fresh/sys_stat/current/protection_ok`，不直接读 `cell_mv`/`pack_mv`。
+- **保护**：BQ `PROTECT1=0x89`（SCD 67 mV≈44.7 A/100 µs）、`PROTECT2=0x57`（OCD 56 mV≈37.3 A/320 ms，放电方向）、`PROTECT3=0x40`（OV 1 s/UV 4 s）；OV_TRIP/UV_TRIP 当前按 NMC **4.25 V/2.80 V** 计算。软件 OCP 为充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认并锁存；`PROT_TEMP_ENABLE=1`，包温度 **4.0–54.0 °C** 充放电门控生效（2 °C 回差/2 s）。Protection 只读 `snap.valid/fresh/sys_stat/current/protection_ok`，不直接读 `cell_mv`/`pack_mv`。
 - **存储**：96 KB app；BMS NVM 页 48-49（132/136 B）；StateStore 页 50-51（48 B，v2）；黑匣子页 52-63（24 B×1020）。StateStore 的 `expected_swap/swap_error/cutoff_latch/dead_storage/charge_full` 只有定义，没有写入者/读取者；启动不恢复这些 flags、电压或 SOC。黑匣子有周期记录和部分保护/ADC/CAL 事件，但没有充放电/充满/换电/死存储事件；wake 记录只打包 3 bit，`POWER_WAKE_CHARGER=0x08`/`MONITOR=0x10` 会被截断。
 - **模块**：实际树包含 `protection`、`lp_cycle`、`lp_session`、`rtc_time`、`watchdog`；**没有 `shelf_monitor.c/.h`**。30 min 归档在 `main_app.c` 的 `App_ArchiveTask()` 和 `lp_cycle.c` 的 `LpCycle_DoMark()` 中分担。
 - **计划外新增（当前树）**：VC5/BAT 真实值可信时优先进入控制/SOC；异常时用 VC1/VC2 估算；记录只写真实可信值，异常写 0 + missing；`App_FakeSwitchTask()` 在新完整 BQ 批次确认 VC5/BAT 异常时，播放与当前输出同方向的提示音，并调用 `BQ_ApplyFetMaskIfUnchanged()` 同值重写 `SYS_CTRL2`（不改 FET/保护，2.5 s 重试）。
@@ -88,8 +88,8 @@
 
 | ID | 原计划 | 当前实现（摘要） |
 |---|---|---|
-| C-01 | LP 用 RTC WUT 1 s 周期唤醒 | 复位式 IWDG ~30 s tick；WUT/LPTIM1 显式关闭；`LP_BASE_CYCLE_MS=30000` |
-| C-02 | 充电插入 ≤1.5 s 唤醒；每秒 LOAD_PRESENT+PA1/COMP2 | 仅每次 ~30 s 轻量 boot 嗅探一次；LOAD_PRESENT 后才做 PA1/COMP2；无 1 s 兜底 |
+| C-01 | LP 用 RTC WUT 1 s 周期唤醒 | 复位式 IWDG ~30 s tick；WUT/LPTIM1 显式关闭；`LP_BASE_CYCLE_MS=30000`；**D-LP1 已决定接受** |
+| C-02 | 充电插入 ≤1.5 s 唤醒；每秒 LOAD_PRESENT+PA1/COMP2 | 仅每次 ~30 s 轻量 boot 嗅探一次；LOAD_PRESENT 后才做 PA1/COMP2；无 1 s 兜底；**D-LP1 已决定接受 ~30 s** |
 | C-03 | 生产 RTC 用 LSE；LSE 故障禁 LP/存档 | 默认 `LP_RTC_USE_LSE=0` 走 LSI（板载 LSE 不起振）；`=1` 才有 LSE 门控 |
 | C-04 | BQ ALERT/PA8 可唤醒 | PA8 仅 EXTI event/轮询，不能唤醒 STOP1；LP 唤醒位只保留 SCD/OCD/XREADY |
 | C-05 | LP 分 IDLE/CUTOFF/SWAP/REPLACE/DEAD 类型，DEAD 走 SHIP | 只有一种复位 LP；无 LP 类型、无 DEAD；`BQ_ShipMode()` 无调用者 |
@@ -97,9 +97,9 @@
 | C-07 | 30 min 维护完整唤醒并更新 SOC/SOH | 30 min 标记在轻量 boot 内联完成；不跑 SOC/SOH；只有监测失败才完整唤醒 |
 | C-08 | BOOT/IDLE/CHARGE/ARM/DISCHARGE/CUTOFF/SWAP/REPLACE/DEAD/FAULT | SM 仅 BOOT/NORM/FAULT；Policy 仅 IDLE/CHARGE/DISCHARGE/CAL/FAULT；其余缺失 |
 | C-09 | LFP 3S 1500 mAh；OV 3.70/UV 2.50 | NMC 1500 占位表；BQ OV 4.25/UV 2.80；`SOC_EST_CAL_VALID=0`；无 5%/0% 硬保护 |
-| C-10 | CHARGE/DISCHARGE 期间均衡常开，die 温 65 °C 停 | 均衡永久关闭；`CELLBAL1=0` 回读；`BQ_SetBalanceMask` 已删除；无 die 温 API |
-| C-11 | 软件 OCP 充电 5.5 A/1 s、放电 33 A/500 ms | 软件 OCP 5 A/30 A，按 2 个新发布帧确认；阈值等于最大允许电流，存在正常满载误锁风险 |
-| C-12 | 充电 0–45 °C、放电 −20–60 °C 温度禁充/禁放生效 | 常数/2 s 驻留/2 °C 回差存在，但 `PROT_TEMP_ENABLE=0`，运行期不生效；无效 TS1 仍可置 TEMP 故障 |
+| C-10 | CHARGE/DISCHARGE 期间均衡常开，die 温 65 °C 停 | **D-BAL1 已决：均衡永久关闭**；`CELLBAL1=0` 回读；`BQ_SetBalanceMask` 已删除；无 die 温 API |
+| C-11 | 软件 OCP 充电 5.5 A/1 s、放电 33 A/500 ms | **已恢复**：充电 5.5 A/1 s、放电 33 A/500 ms，至少 2 个新发布帧；详见 D-PROT1 |
+| C-12 | 充电 0–45 °C、放电 −20–60 °C 温度禁充/禁放生效 | **已按新决策改为包温度 4.0–54.0 °C，充放电都收紧；`PROT_TEMP_ENABLE=1`**，2 °C 回差/2 s 去抖 |
 | C-13 | 充满判据 98%/3.55 V/75 mA/30 s，鸣叫但不断电 | 无 charge-full 逻辑；`STATE_FLAG_CHARGE_FULL` 仅定义 |
 | C-14 | 放电 SOC≤5% 切断、10% 恢复、2 帧确认 | 无 SOC cutoff；`PROT_RSN_SOC_CUTOFF` 是 M3 预留；SOC 未进保护/策略 |
 | C-15 | 换电检测、expected_swap、三连击清除、5 s 换电模式 | 手势检测能产生 HOLD5/RELEASE/TRIPLE，但 App 只消费 PAIR_HOLD3；swap flags 全为死定义 |
@@ -113,7 +113,7 @@
 | C-23 | BQ 在充/放 250 ms、IDLE 500 ms 读；ADC 重启判定窗 500 ms | 固定 500 ms 读；ADC 重启 verdict 1500 ms；2 次尝试、4 好帧清 |
 | C-24 | 5 V 唤醒延迟 2 ms（风险项） | `APP_5V_STARTUP_DELAY_MS=20`，旧风险已关闭；仍建议按负载实测 |
 | C-25 | 原计划未包含 VC5/BAT 降级采样与假开关 | 当前控制值真实可信优先、异常 VC1/VC2 估算；记录 real-or-0；`App_FakeSwitchTask()` 同值重写 `SYS_CTRL2` + 同方向提示音，2.5 s 重试，不改 FET/保护 |
-| C-26 | D7：外部 I2C 上拉已具备；PB5 外部 10 kΩ 上拉 | `CLAUDE.md` 当前说明：SDA/SCL 无外部上拉、PB5 无外部上拉；这是硬件/文档待确认项，不强行裁决 |
+| C-26 | D7：外部 I2C 上拉已具备；PB5 外部 10 kΩ 上拉 | **已确认（2026-11-11）**：外部 I2C/PB5 上拉存在；D-PULL1 已决 |
 
 ---
 
@@ -121,11 +121,11 @@
 
 以下事项不能在文档中擅自“裁决”；当前实现采用左侧实际行为，但产品/硬件是否接受仍需确认：
 
-- `D-CHEM1`：目标电芯 LFP 与当前 NMC 占位参数冲突；保护阈值/OCV 表由谁、何时切换？切换前必须禁止把 SOC 当硬保护。
-- `D-PULL1`：I2C/PB5 外部上拉的真实板况；影响 LP 嗅探、按键和可靠性。
-- `D-LP1`：接受 ~30 s 充电唤醒，还是恢复 RTC WUT 1 s（需 LSE/硬件/低功耗重新设计）？
-- `D-BAL1`：均衡永久关闭是临时降级还是产品决策？恢复需要 VC5 通道和 die 温。
-- `D-PROT1`：软件 OCP 用 5 A/30 A 还是留 5.5 A/33 A 余量；温度门控何时启用。
+- `D-CHEM1`：**仍未决**。目标电芯 LFP 与当前 NMC 占位参数冲突；保护阈值/OCV 表由谁、何时切换？切换前必须禁止把 SOC 当硬保护。
+- `D-PULL1`：**已决（2026-11-11）**。外部 I2C/PB5 上拉确认存在；不再按“仅内部上拉”评估。
+- `D-LP1`：**已决（2026-11-11）**。接受当前 ~30 s 复位式 LP 充电唤醒，不恢复 RTC WUT 1 s。
+- `D-BAL1`：**已决（2026-11-11）**。均衡永久关闭，不恢复 BQ 被动均衡。
+- `D-PROT1`：**已决（2026-11-11）**。软件 OCP 恢复为充电 5.5 A/1 s、放电 33 A/500 ms；包温度门控 4.0–54.0 °C，充放电都生效，2 °C 回差/2 s 去抖。
 - `D-SWAP1`：换电/死存储/SOC cutoff 是 L1 必做还是后续里程碑。
 - `D-WAKE1`：黑匣子 wake 3-bit 截断、CHARGER/MONITOR 丢失事件是否本轮修。
 - `D-API1`：文档按实际 API 名，还是把计划 API 作为兼容别名补回。
@@ -178,12 +178,12 @@ L1 要完成的电池组行为：
 | 编号 | 决策 | 当前状态/裁决 |
 |---|---|---|
 | D1 | 充电和放电都必须 **CHG=1、DSG=1 双管全开**，不允许依赖体二极管 | 已实现于现有 CHARGE/DISCHARGE 策略 |
-| D2 | 放电最大 30 A，充电最大 5 A；BQ 硬件阈值和软件 OCP 都按此上限设计 | 部分/冲突：软件 OCP 恰好 5 A/30 A，见 C-11；BQ 阈值≈37/44.7 A |
+| D2 | 放电最大 30 A，充电最大 5 A；BQ 硬件阈值和软件 OCP 都按此上限设计 | 软件 OCP 已恢复为 5.5 A/1 s、33 A/500 ms 余量；BQ 阈值≈37/44.7 A；D-PROT1 已决 |
 | D3 | LP、1 s 充电嗅探、30 min 储存监测使用 **HSI16**；NORM 使用 HSE/PLL 80 MHz | 时钟部分已实现；1 s 嗅探未实现，LP 为 ~30 s IWDG，见 C-01/C-02 |
 | D4 | 充电检测采用 1 s RTC 轮询：BQ `LOAD_PRESENT` 初判，PA1/COMP2 复核方向 | 冲突：每次 ~30 s 轻量 boot 才检查一次，见 C-02 |
 | D5 | BQ FET 默认全关，可由状态机/调试变量显式打开；配置结束状态为“CC 开、双管关” | 运行期已实现；宏 `BQ_DEFAULT_FET_MASK=ALL` 注释有误导，见 C-22 |
 | D6 | 均衡“常开”指充电/放电期间持续启用自动均衡；按 BQ 相邻节规则单节轮换；BQ die 温 65 °C 超限停止 | 冲突：均衡永久关闭，API 删除，见 C-10 |
-| D7 | 外部 I2C 上拉已具备；REGSRC 已接 12 V；OCD/SCD 已实测 | 软件/保护有 OCD/SCD；上拉与硬件状态需现场确认，见 C-26/D-PULL1 |
+| D7 | 外部 I2C 上拉已具备；REGSRC 已接 12 V；OCD/SCD 已实测 | 外部 I2C/PB5 上拉已确认；OCD/SCD 软件配置存在；REGSRC 仍需按实物确认（D-PULL1 已决） |
 | D8 | LiFePO4 参数标定推迟到 M3 前完成；标定前 SOC 只用于显示/日志，不作为 5%/0% 的唯一依据 | 部分：`CAL_VALID=0` 已落实；但当前是 NMC 占位表，LFP 标定未完成，见 C-09 |
 | D9 | 30 A/5 A、双管全开、BQ die 温 65 °C、SCD/OCD 均需在 M6 复测 | 未验证：无 M6 记录；die 温/均衡路径不存在 |
 | D10 | CAN1 保持初始化但不实现业务；L1 的 NORM 80 MHz 时基已经满足后续 CAN 需求 | 已保持初始化，无 CAN 业务 |
@@ -192,7 +192,7 @@ L1 要完成的电池组行为：
 
 ## 1. 硬件与 L0 基线
 
-> **状态（2026-11-11）**：`[部分实现/冲突]`。3S/VC5 映射和主要外设已实现；LSE、外部上拉、PB5 外部上拉和电芯化学体系与原计划不一致或待确认，见 C-03/C-26。
+> **状态（2026-11-11）**：`[部分实现/冲突]`。3S/VC5 映射和主要外设已实现；外部 I2C/PB5 上拉已确认存在；LSE 和电芯化学体系仍与原计划不一致或待确认，见 C-03/C-09。
 
 ### 1.1 主要硬件
 
@@ -206,11 +206,11 @@ L1 要完成的电池组行为：
 | 3.3 V | HT7533，由电池侧 VBAT_12V 供电，常开 |
 | 充电方向 | COMP2：PA3 `SC_BTTN` 对 PA4 `SC_PACK`；COMP2 高 = 充电 |
 | BQ ALERT | PA8，EXTI **event rising**；不能唤醒 STOP1，只能在轻量 boot 轮询（C-04） |
-| 按键 | PB5，低有效，下降沿 EXTI；外部 10 kΩ 上拉与当前板况待确认（C-26） |
+| 按键 | PB5，低有效，下降沿 EXTI；外部上拉已确认存在（D-PULL1 已决） |
 | 12 MHz HSE | 外部 OSC1，经 Q5 三态控制，PA1=0 使能 |
 | RTC | 目标 LSE 32.768 kHz；当前板 LSE 不起振，默认 LSI；LP 由 IWDG 复位，不是 RTC WUT（C-01/C-03） |
 
-> **I2C/PB5 上拉**：当前 `CLAUDE.md` 说明 SDA/SCL 没有外部上拉、仅用 MCU 内部 ~40 kΩ，建议外加 4.7–10 kΩ；原计划 D7 写“外部上拉已具备”。两者冲突，列入 D-PULL1，实测前不把 LP 嗅探/按键可靠性当成已认证。
+> **I2C/PB5 上拉**：外部 I2C/PB5 上拉已确认存在（2026-11-11，D-PULL1 已决）；MCU 内部上拉仍使能，但不作为唯一上拉依赖。LP 嗅探/按键可靠性按外部上拉评估。
 
 ### 1.2 L0 已具备（按当前树更新）
 
@@ -442,13 +442,16 @@ App/
 | BOOT | 首批 BQ fresh/valid | 进入 NORM；策略 IDLE，双管关 | NORM/IDLE |
 | BOOT/NORM | 关键故障位 | 双管关、FAULT、阻止自动 LP | FAULT |
 | FAULT | 关键故障消失且 BQ fresh | 回 NORM 或 BOOT | NORM/BOOT |
-| IDLE | COMP2 消抖充电器 + 自检/BQ/电源就绪 | 双管开 | CHARGE |
-| CHARGE | 充电器移除连续 1 s | 双管关 | IDLE |
+| IDLE | COMP2 消抖充电器（CHARGE 中净充电电流 >30 mA 可保持）+ 自检/BQ/电源就绪 | 双管开 | CHARGE |
+| CHARGE | 充电器移除连续 5.2 s（平衡充短暂断流不误判） | 双管关 | IDLE |
 | IDLE | PAIR_HOLD3（短按后 2 s 内二次 3 s 长按） | 双管开、WAKE 音 | DISCHARGE |
 | DISCHARGE | 再次 PAIR_HOLD3 | 双管关、LP_ENTER 音 | IDLE |
 | DISCHARGE | COMP2 充电器 | 双管开、WAKE 音 | CHARGE |
+| DISCHARGE | 进入后前 10 s 净充电电流 ≥100 mA（≤90 mA 释放） | 双管开、WAKE 音 | CHARGE |
 | 任意 NORM 空闲 | 5 s 且无 LP block | 写 START token、软件复位 | LP 轻量 boot |
 | LP START/RESUME | 轻量 boot/IWDG 超时 | 继续 LP；真实唤醒写 WAKE token + 软件复位 | LP 继续/完整 boot |
+
+> **DISCHARGE 前 10 s 充电检测（2026-11-11）**：仅作为“充电器存在”的补充判据，不是新状态。窗口从 `state_enter_ms` 起算；使用与 CHARGE 相同的“充电为正”净电流（`charge_current_ma`），置位 100 mA / 释放 90 mA，无效电流帧不置位也不清除。BQ 500 ms 读取 + 250 ms CC 平均，因此最多约一个读周期后生效。窗口结束后清零闩锁，之后仍可由 COMP2 触发 DISCHARGE→CHARGE。负载大于外部充电时净电流可能达不到 100 mA（漏检）。切换后 `user_discharge_enabled=0`，拔掉充电器走正常 CHARGE→IDLE，不自动回 DISCHARGE。
 
 **原计划完整转换表（未来目标；当前未实现）**
 
@@ -495,9 +498,9 @@ App/
 
 ## 6. 按键手势
 
-> **状态（2026-11-11）**：`[部分实现]`。`button`/`gesture` 检测层已实现下表全部手势；**业务层只消费 `GESTURE_PAIR_HOLD3`**。SHORT/HOLD3/HOLD5/RELEASE_AFTER_HOLD5/TRIPLE 目前没有动作（C-19）。外部上拉仍见 C-26。
+> **状态（2026-11-11）**：`[部分实现]`。`button`/`gesture` 检测层已实现下表全部手势；**业务层只消费 `GESTURE_PAIR_HOLD3`**。SHORT/HOLD3/HOLD5/RELEASE_AFTER_HOLD5/TRIPLE 目前没有动作（C-19）。外部上拉已确认存在（D-PULL1 已决）。
 
-PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内部/板级实际配置。
+PB5 低有效、EXTI 下降沿；外部上拉已确认存在（2026-11-11）。
 
 | 手势 | 定义 |
 |---|---|
@@ -697,18 +700,18 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 ### 8.1 充电（当前实现）
 
 - 进入：COMP2 消抖检测到充电器，且自检 PASS、SM NORM、BQ RUN/fresh、电源 NORM；设置 `CHARGE_POLICY_CHARGE`，正常请求 CHG+DSG 双管全开；
-- **MOS 导通后的 COMP2 兜底**：COMP2 差模只有 `0.266×I×(Rshunt+Rds_on)`，100 mA 时约 0.3 mV；CHARGE 中充电电流 >20 mA 时保持充电器存在，<10 mA 释放，10–20 mA 回差。该判据只影响充电器存在，不改 Protection OCP。
-- **近满体二极管子模式**：显示 SOC>90 且充电电流 <10 mA（允许最多 −20 mA 的 CC 零点偏置）时请求 CHG-only（DSG 关），利用 DSG 体二极管压降 + COMP2 判充电器；电流 >20 mA 或 SOC<85% 退出。SOC 为未标定启发值，不作保护输入。
+- **MOS 导通后的 COMP2 兜底**：COMP2 差模只有 `0.266×I×(Rshunt+Rds_on)`，100 mA 时约 0.3 mV；CHARGE 中充电电流 >30 mA 时保持充电器存在，<20 mA 释放，20–30 mA 回差。该判据只影响充电器存在，不改 Protection OCP。
+- **近满体二极管子模式**：显示 SOC>90 且 −20 mA < 充电电流 < 220 mA 时请求 CHG-only（DSG 关），利用 DSG 体二极管压降 + COMP2 判充电器；电流 >320 mA 或 SOC<85% 退出。SOC 为未标定启发值，不作保护输入。
 - 充电开始音：当前使用通用 `BUZZER_PATTERN_WAKE`（5 kHz × 80 ms），不是计划中的 3 kHz × 150 ms；
 - 采样：BQ 固定 500 ms（C-23）；SOC 500 ms；没有均衡；
 - RGB：静态绿色（48），没有 SOC 渐变/快闪；
 - **没有充满判据**：无 98%/3.55 V/75 mA/30 s、无 `charge_full`、无充满提示音；上述近满子模式不是原计划的 charge-full；
-- 充电器移除：正常 CHARGE 中 COMP2 低连续 1 s 撤销存在（计划 5 s）；电流 >20 mA 时先由电流保持；体二极管模式由 COMP2 判 1 s；清 `user_discharge_enabled`，回 IDLE/双管关；
+- 充电器移除：正常 CHARGE 中 COMP2 低且无电流保持连续 **5.2 s** 才撤销存在（`CHARGE_POLICY_CHARGER_LOW_MS=5200`；原 1 s 会被平衡充的短暂输出关断误判为移除，造成 CHARGE/IDLE 反复）；电流 >30 mA 时先由电流保持；体二极管模式同样用 5.2 s；代价是真实拔充电器后最多 5.2 s 才回 IDLE，期间策略仍是 CHARGE、双管保持请求，Protection/数据/温度/故障仍即时；清 `user_discharge_enabled`，回 IDLE/双管关；
 - 充电中按键：策略拒绝 PAIR_HOLD3；没有换电模式；
-- 充电过流：当前软件 OCP **5 A**、2 个新发布帧确认后锁存；BQ 无充电方向硬件 OCP；
-- 充电温度：常数 0–45 °C/2 °C 回差/2 s 驻留代码存在，但 `PROT_TEMP_ENABLE=0`，**当前不会停充**。
+- 充电过流：软件 OCP **5.5 A/1 s**，至少 2 个新发布帧确认后锁存；BQ 无充电方向硬件 OCP；D-PROT1 已决；
+- 充电温度：包温度门控 **4.0–54.0 °C**，充放电都收紧；2 °C 回差/2 s 驻留，`PROT_TEMP_ENABLE=1`。
 
-> **原计划目标（未实现/未来）**：3.0 kHz 开始音、250 ms BQ、均衡 5 s 复评、SOC 渐变快闪、充满 4 kHz×2、充电器移除 5 s、5.5 A/1 s 充电 OCP、温度禁充生效。参见 C-11/C-12/C-13/C-20。
+> **原计划目标（未实现/未来）**：3.0 kHz 开始音、250 ms BQ、均衡 5 s 复评、SOC 渐变快闪、充满 4 kHz×2、充电器移除 5 s。参见 C-11/C-12/C-13/C-20。
 
 ### 8.2 放电（当前实现）
 
@@ -717,11 +720,12 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 - RGB：静态蓝色，不随 SOC 渐变/快闪；
 - 退出：再次 PAIR_HOLD3 → IDLE/双管关，通用 LP_ENTER 音；
 - 充电器优先：放电中插充电器立即转 CHARGE、保持双管全开；拔掉后需重新手势；
+- 前 10 s 外部充电检测：进入 DISCHARGE 后 10 s 内净充电电流 ≥100 mA（释放 90 mA）也直接转 CHARGE，用于 COMP2 差分过小、无法识别的平衡充/小电流充电器；10 s 后仍只靠 COMP2。切换后按正常 CHARGE 电流保持（30/20 mA）与近满体二极管逻辑运行；
 - **没有 5% 切断/10% 恢复**：SOC 不参与策略；`STATE_FLAG_CUTOFF_LATCH` 只有定义；`PROT_RSN_SOC_CUTOFF` 是 M3 预留；
-- 放电过流：当前软件 OCP **30 A**、2 个新发布帧确认后锁存；BQ 硬件 OCD≈37.3 A/320 ms，SCD≈44.7 A/100 µs；
+- 放电过流：软件 OCP **33 A/500 ms**，至少 2 个新发布帧确认后锁存；BQ 硬件 OCD≈37.3 A/320 ms，SCD≈44.7 A/100 µs；D-PROT1 已决；
 - 没有 DISCHARGE_ARM 状态；PAIR_HOLD3 之前没有 2 s 配对窗口的可视状态，只有 gesture 内部计时。
 
-> **原计划目标（未实现/未来）**：ARM→DISCHARGE 独立状态、L-M-H/H-M-L 音型、SOC 渐变、5% 三声长鸣/双管关/cutoff 锁存、10% 恢复、33 A/500 ms 放电 OCP。参见 C-11/C-14/C-20。
+> **原计划目标（未实现/未来）**：ARM→DISCHARGE 独立状态、L-M-H/H-M-L 音型、SOC 渐变、5% 三声长鸣/双管关/cutoff 锁存、10% 恢复。软件 OCP 已恢复 33 A/500 ms。参见 C-11/C-14/C-20。
 
 ### 8.3 均衡（当前实现）
 
@@ -738,12 +742,12 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 | 分流电阻 | 1.5 mΩ | 1.5 mΩ | 已实现 |
 | BQ OCD | 56 mV/320 ms≈37 A | `PROTECT2=0x57`，≈37.3 A/320 ms，放电方向 | 已实现 |
 | BQ SCD | 67 mV/100–200 µs≈44.7 A | `PROTECT1=0x89`，≈44.7 A/100 µs | 已实现 |
-| 软件放电 OCP | 33 A/500 ms | **30 A，2 个新发布帧确认** | 冲突（C-11） |
-| 软件充电 OCP | 5.5 A/1 s | **5 A，2 个新发布帧确认** | 冲突（C-11） |
+| 软件放电 OCP | 33 A/500 ms | **33 A/500 ms，至少 2 个新发布帧** | 已恢复（D-PROT1） |
+| 软件充电 OCP | 5.5 A/1 s | **5.5 A/1 s，至少 2 个新发布帧** | 已恢复（D-PROT1） |
 | 最大放电 | 30 A | 30 A 目标；温升未验证 | 部分 |
 | 最大充电 | 5 A | 5 A 目标；温升未验证 | 部分 |
 
-> **余量风险**：当前软件 OCP 阈值正好等于最大允许电流，正常满载可能触发锁存；原计划的 5.5 A/33 A 余量未实现。方向由 COMP2 消抖 + CC 幅值判定；`|I|>60 A` 视为不可信帧。软件 OCP 锁存需显式 `Protection_RequestLatchClear()`；充电 OCP 还要求 `comp_charging==0`。
+> **当前余量**：软件 OCP 已恢复为 5.5 A/1 s 与 33 A/500 ms，高于 5 A/30 A 最大工作电流；阈值/时间仍需台架复核。方向由 COMP2 消抖 + CC 幅值判定；`|I|>60 A` 视为不可信帧。软件 OCP 锁存需显式 `Protection_RequestLatchClear()`；充电 OCP 还要求 `comp_charging==0`。
 
 - BQ SCD 是 µs 级硬件比较器；CC 250 ms 平均不能替代短路保护；
 - SCD 触发后固件读 `SYS_STAT`，双管关，进入 FAULT/Protection 锁存，不自动重合闸；
@@ -758,8 +762,8 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 | BQ OV | 3.70 V/cell，1 s | **4.25 V/cell**，1 s（NMC 占位，C-09） |
 | BQ UV | 2.50 V/cell，4 s | **2.80 V/cell**，4 s（NMC 占位，C-09） |
 | 包合法范围 | 6.0–11.0 V；单节 2.0–3.8 V | 发布只要求 VC1/VC2 1.0–5.0 V；BAT 信任 3–15 V + 残差≤300 mV；无 6–11 V 控制窗 |
-| 充电温度 | 0–45 °C | 常数匹配；`PROT_TEMP_ENABLE=0`，当前不禁充 |
-| 放电温度 | −20–60 °C | 常数匹配；`PROT_TEMP_ENABLE=0`，当前不禁放 |
+| 充电温度 | 0–45 °C（原计划） | **包温度 4.0–54.0 °C，充放电都收紧；`PROT_TEMP_ENABLE=1`** |
+| 放电温度 | −20–60 °C（原计划） | **同上，4.0–54.0 °C；2 °C 回差/2 s** |
 | 均衡 die 温 | 65 °C，5 °C 回差 | 未实现；均衡永久关闭 |
 | 5% 放电切断 | SOC≤5% + 最低节≤2.8 V | **未实现**（C-14） |
 | 0% 死存储 | SOC=0 + 最低节≤2.5 V，10 s | **未实现**（C-05） |
@@ -774,7 +778,7 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 - CRC/超时失败重试；成功后 I2C 可能不再响应；
 - 退出：PB1 高 ≥2 ms → 低 → 等 20 ms → 完整 BQ 配置；
 - PB1 之后必须保持低，避免短接 NTC；
-- 外部上拉/REGSRC 状态需按 D-PULL1 现场确认；
+- 外部 I2C/PB5 上拉已确认（D-PULL1 已决）；REGSRC 仍需按实物确认；
 - SHIP 不会切断 MCU 3.3 V，需实测整板静态电流。
 
 ### 8.7 故障管理与安全状态
@@ -789,12 +793,12 @@ PB5 低有效、EXTI 下降沿；当前板外部上拉待确认，代码按内�
 | BQ 器件 | DEVICE_XREADY | 双管关、FAULT、等待安全恢复 |
 | BQ 保护 | OV/UV/SCD/OCD | 双管关；Protection 监督清锁存后才允许重开；boot/LP 唤醒 SCD/OCD 可在安全条件后清除 |
 | ADC/数据 | 连续无效、ADC 重启失败 | 数据不发布；锁存 `FAULT_BIT_BQ_ADC_STUCK`；2 次重启/4 好帧清 |
-| 温度 | NTC 无效/超限 | 无效可置 `FAULT_BIT_TEMP`；但 `PROT_TEMP_ENABLE=0`，**超限不禁充/禁放**（C-12） |
+| 温度 | NTC 无效/超限 | 包温度 4.0–54.0 °C 充放电都收紧；无效/超限置 `FAULT_BIT_TEMP`，`PROT_TEMP_ENABLE=1`（C-12） |
 | 电源 | PVD 跌落 | sticky `FAULT_POWER`；`Fault_PowerRecoverTask()` 1 s 无新边沿后自动清 sticky，计数保留 |
 | 时钟 | HSE/PLL 切换失败 | 降级只闪故障灯，禁止充放电；`FAULT_BIT_CLK` |
 | RTC/LSE | LSE 未起振/WUT 布防失败 | 默认 LSI 不复位；`LP_RTC_USE_LSE=1` 时 LSE 失败回退 LSI 并禁用自动 LP；没有 WUT |
 | Flash | 黑匣子/StateStore 写失败 | 置 `FAULT_BIT_FLASH_LOG/FLASH_STATE`；不继续依赖该存储 |
-| 软件 OCP | 充电 5 A/放电 30 A，2 帧确认 | 双管关、Protection 锁存；需显式清 |
+| 软件 OCP | 充电 5.5 A/1 s、放电 33 A/500 ms，至少 2 帧 | 双管关、Protection 锁存；需显式清 |
 | 硬件 SCD | 短路尖峰 | 双管关、FAULT 锁存、不自动重合闸 |
 
 **BQ ALERT / PA8（当前）**：
@@ -900,13 +904,13 @@ BMS_CAL_Init → SOH_Init → BMS_NVM_Init
 
 | 页 | 地址 | 用途 | 当前状态 |
 |---:|---|---|---|
-| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x08013C08` |
+| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x08013D50` |
 | 48–49 | `0x08018000–0x08018FFF` | BMS SOC/SOH NVM | 已实现；132/136 B，两槽 |
 | 50–51 | `0x08019000–0x08019FFF` | L1 StateStore | 已实现；48 B v2，两页 |
 | 52–63 | `0x0801A000–0x0801FFFF` | 黑匣子 | 已实现；24 B×1020 |
 
 - 链接脚本 `FLASH LENGTH=96K`；
-- `_image_end` 必须 ≤0x08018000；当前 0x08013C08 通过；
+- `_image_end` 必须 ≤0x08018000；当前 0x08013D50 通过；
 - 黑匣子必须 <0x0801A000；
 - CubeMX 重生成后恢复 96K、`-include app.mk` 和链接断言。
 
@@ -1162,7 +1166,7 @@ flags：
 
 ### M0 — 硬件/标定冻结（1–2 周）
 
-> **状态**：`[未关闭]`。没有 LFP 标定 CSV、30 A/5 A 温升、die 温/均衡记录；当前代码是 NMC 占位。外部上拉/REGSRC 仍待 D-PULL1。
+> **状态**：`[未关闭]`。没有 LFP 标定 CSV、30 A/5 A 温升、die 温/均衡记录；当前代码是 NMC 占位。外部上拉已确认；REGSRC 仍需按实物确认。
 
 目标：把硬件风险和标定输入关闭，避免在错误参数上写策略。
 
@@ -1170,7 +1174,7 @@ flags：
 
 - 确认 3S LiFePO4 1500 mAh、充电器 CV/CC、NTC BOM、FET/分流功率余量；
 - **30 A/5 A 连续温升**：1.5 mΩ 分流约 1.35 W，Q1/Q2/Q3/PCB 温升；
-- 外部上拉确认；REGSRC→VBAT_12V 飞线确认；
+- 外部上拉已确认（完成）；REGSRC→VBAT_12V 飞线仍需确认；
 - **HSI16 下 BQ I2C 实测**：SCL/SDA 波形、CRC 成功率、1 s/30 min 可用性；失败先修 HSI16 时序，不能改用 HSE 做储存监测；
 - BQ die 温度读取（`TEMP_SEL=0`、约 2 s 调度延迟、TS1 换算）和 65 °C 阈值；
 - BQ SCD 67 mV/100–200 µs（RSNS=1）与 30 A 正常电流不误触发；
@@ -1278,7 +1282,7 @@ flags：
 
 | 项 | 状态 |
 |---|---|
-| 清理构建/镜像尺寸/链接断言 | E2 通过：80736/168/6976 B，`_image_end=0x08013C08` |
+| 清理构建/镜像尺寸/链接断言 | E2 通过：81064/168/6984 B，`_image_end=0x08013D50` |
 | 按键手势检测 | E1/E2；只消费 PAIR_HOLD3 |
 | LP 周期/PB5/30 min/BQ sniff | 已有台架记录（E3，历史），但周期是 ~30 s，不是 1 s |
 | 充电唤醒 ≤1.5 s | **未满足**，实际最坏约 30 s |
@@ -1291,7 +1295,7 @@ flags：
 > **状态**：`[已通过 E2]`（2026-11-11）。
 
 - `make clean && make -j2 all` 零警告零错误；
-- `_image_end <= 0x08018000`；当前 `0x08013C08`；
+- `_image_end <= 0x08018000`；当前 `0x08013D50`；
 - 黑匣子/StateStore/NVM 地址不重叠；
 - `app.mk` 包含所有新源；`compile_commands.json` 同步；
 - CubeMX 重生成后恢复 96K、`-include app.mk`、RTC 选择补丁；
@@ -1324,7 +1328,7 @@ flags：
 
 - 30 A/5 A 持续、双管栅极/温升/体二极管：未验证；
 - SCD/OCD 配置与 30 A 不误触发：未做正式 30 A 记录；
-- 软件 OCP：当前 5 A/30 A（2 帧），不是 33 A/500 ms；阈值余量风险见 C-11；
+- 软件 OCP：已恢复 5.5 A/1 s、33 A/500 ms（至少 2 帧）；仍需台架验证；
 - 5%/0%/10%：未实现；
 - 均衡 die 温 65 °C/外部 NTC：均衡永久关闭，无 die 温路径；
 - 30 A 分流耗散/R2/R26/Q1-Q3 温升：未验证。
@@ -1366,8 +1370,8 @@ flags：
 
 1. **LFP 标定是硬阻塞**：当前只有 NMC 占位表；M3 前 SOC 不能作为 5%/0% 唯一依据。切 LFP 前必须替换 OCV/R0/R1/τ、OV/UV（D-CHEM1）。
 2. **~30 s 充电检测不是“立即”**：当前每个 IWDG 周期（~30 s）才嗅探一次；原计划 1–1.5 s 目标未满足。若产品要求 ≤1.5 s，需要恢复 RTC WUT 1 s 或改板拆分 PA1/HSE_DIS 与 CHGSC_DIS。
-3. **LOAD_PRESENT 需台架确认**：只有 `LOAD_PRESENT=1` 才做 COMP2；若充电器不置该位，当前不会唤醒（D-LP1）。
-4. **REGSRC 必须接 12 V**：否则 REGOUT、栅极驱动、SHIP 恢复不可信；当前上拉/REGSRC 状态待 D-PULL1 确认。
+3. **LOAD_PRESENT 需台架确认**：只有 `LOAD_PRESENT=1` 才做 COMP2；若充电器不置该位，当前不会唤醒。D-LP1 已决定接受 ~30 s 唤醒，不恢复 WUT 1 s。
+4. **REGSRC 必须接 12 V**：否则 REGOUT、栅极驱动、SHIP 恢复不可信；外部上拉已确认，REGSRC 仍按实物确认。
 5. **BQ SHIP 不切 3.3 V**：DEAD 是 SHIP + MCU STOP1，不是整板零功耗；需实测 LDO/分压。
 6. **30 A/5 A 热与短路**：1.5 mΩ 30 A≈45 mV、1.35 W；OCD/SCD 必须高于 30 A；分流/FET/PCB 温升需实测。
 7. **无电池 ID**：电压启发式无法识别电压几乎相同的不同电池；100% 识别需增加 ID 触点。
@@ -1378,9 +1382,9 @@ flags：
 12. **SOC<0 语义**：toolkit 输出钳位 0..100；DEAD 用 SOC=0 + 最低节≤2.5 V + 10 s 定义；当前 DEAD 未实现。
 13. **HSI16 BQ I2C**：当前每 ~30 s 轻量 boot 和 30 min 监测都依赖；M0 必须实测；失败先修时序，不把储存监测切 HSE。
 14. **双管全开/30 A**：必须 DSG=1/CHG=1；VGS/温升/体二极管不导通/老化影响需记录。
-15. **BQ die 温与外部 NTC 冲突**：`TEMP_SEL=0` 才能读 die 温；当前无 die 温 API、无均衡；充放电高温保护 `PROT_TEMP_ENABLE=0`，不生效。
+15. **BQ die 温与外部 NTC 冲突**：`TEMP_SEL=0` 才能读 die 温；当前无 die 温 API、无均衡；包温度 4.0–54.0 °C 门控已生效（`PROT_TEMP_ENABLE=1`），TS1 模型仍需现场复核。
 16. **BQ SCD 恢复**：SCD 后必须主机清 SYS_STAT、双管关、FAULT 锁存，不自动重合闸；软件 OCP 只作后备。
-17. **BQ 无充电 OCP**：充电 5 A 上限只能靠软件 OCP + 充电器自身限流；当前软件 OCP 阈值正好 5 A，余量风险见 C-11。
+17. **BQ 无充电 OCP**：充电 5 A 上限只能靠软件 OCP + 充电器自身限流；软件 OCP 现为 5.5 A/1 s，已留余量（D-PROT1）。
 18. **CAN 未实现**：L1 不实现 CAN 业务；NORM 80 MHz 已满足后续需求，但不得因此把轻量 LP/30 min 监测切到 HSE。
 19. **PACK_SC 分压/COMP2 只用于方向判定**：不能作为电压测量或主保护。
 20. **SWD 与 LP 电流**：`POWER_LP_KEEP_SWD` 默认 **0**（不是原计划的 1）；调试期设 1 会显著抬高 STOP1 电流，量产保持 0。
@@ -1388,7 +1392,7 @@ flags：
 22. **NMC/LFP 混用风险**：当前 4.25/2.80 V 与 NMC 表不能用于 LFP；误当 LFP 参数可能造成过充/过放。
 23. **StateStore 生命周期 flags 是死定义**：swap/cutoff/dead/charge_full 没有写入/读取，启动不恢复；不能声称掉电锁存可用。
 24. **黑匣子 wake 截断**：`power_wake_mask & 0x07` 丢失 CHARGER/MONITOR；事件覆盖不完整（C-17）。
-25. **软件 OCP 余量不足**：5 A/30 A 阈值等于最大允许电流，正常满载可能误锁；需 D-PROT1 决定是否恢复 5.5 A/33 A。
+25. **软件 OCP 已恢复余量**：5.5 A/1 s、33 A/500 ms（至少 2 帧）；仍需台架确认动作时间和正常满载不误锁（D-PROT1 已决）。
 26. **LP 架构差异**：复位式 IWDG LP 与计划 RTC WUT 1 s 不是同一架构；修改前不能按原计划估算唤醒延迟/电流。
 
 ---
@@ -1418,15 +1422,15 @@ L1 完成需同时满足：
 
 | # | 原完成条件 | 当前状态/剩余工作 |
 |---|---|---|
-| 1 | 空闲 5 s 自动 LP；充电器插入 1 s 级唤醒并进入 CHARGE | 5 s LP 有；唤醒约 30 s，不是 1 s；需 D-LP1 |
+| 1 | 空闲 5 s 自动 LP；充电器插入 1 s 级唤醒并进入 CHARGE | 5 s LP 有；唤醒约 30 s；D-LP1 已决定接受当前 ~30 s 方案 |
 | 2 | 放电手势激活、双管全开；退出/5% 切断/10% 恢复 | 手势切换/双管有；ARM、5%/10% 未实现 |
-| 3 | 充电充满只鸣叫不断电；充电器移除回 IDLE/LP | 充满未实现；移除 1 s 回 IDLE；LP 5 s |
+| 3 | 充电充满只鸣叫不断电；充电器移除回 IDLE/LP | 充满未实现；移除需连续 5.2 s 低电平才回 IDLE；LP 5 s |
 | 4 | SOC/SOH 标定后可用于显示/辅助；5%/0% 有电压兜底 | NMC 占位/`CAL_VALID=0`；5%/0% 未实现 |
 | 5 | 均衡单节轮换，die 温 65 °C 停止 | 均衡永久关闭；无 die 温 |
 | 6 | 30 min 监测/存档在 HSI16 下不切 HSE | 已实现；不更新 SOC/SOH；无正式 LP 电流记录 |
 | 7 | 换电/换电模式/三连击清除完整 | 未实现 |
 | 8 | 死存储 SHIP + STOP1 + 充电恢复 | 未实现；`BQ_ShipMode` 未接线 |
-| 9 | 30 A/5 A/SCD/双管全开/温升通过 | 配置有；无测试记录；软件 OCP 阈值余量风险 |
+| 9 | 30 A/5 A/SCD/双管全开/温升通过 | 配置有；软件 OCP 已恢复 5.5 A/33 A 余量；无正式测试记录 |
 | 10 | 所有故障路径回双管全关 | 现有路径部分实现；完整 L1 状态机未实现 |
 
 ---
@@ -1445,10 +1449,10 @@ L1 完成需同时满足：
 | BQ UV | 2.50 V/cell，4 s | **2.80 V/cell，4 s** | NMC 占位（C-09） |
 | BQ OCD | 56 mV/320 ms≈37 A | `0x57`≈37.3 A/320 ms | 已实现 |
 | BQ SCD | 67 mV/100–200 µs≈44.7 A | `0x89`≈44.7 A/100 µs | 已实现 |
-| 软件充电 OCP | 5.5 A/1 s | **5 A，2 个新发布帧** | 冲突（C-11） |
-| 软件放电 OCP | 33 A/500 ms | **30 A，2 个新发布帧** | 冲突（C-11） |
-| 充电温度 | 0–45 °C | 常数存在，`PROT_TEMP_ENABLE=0` | 未生效（C-12） |
-| 放电温度 | −20–60 °C | 常数存在，`PROT_TEMP_ENABLE=0` | 未生效（C-12） |
+| 软件充电 OCP | 5.5 A/1 s | **5.5 A/1 s，至少 2 个新发布帧** | 已恢复（D-PROT1） |
+| 软件放电 OCP | 33 A/500 ms | **33 A/500 ms，至少 2 个新发布帧** | 已恢复（D-PROT1） |
+| 充电温度 | 0–45 °C | **包温度 4.0–54.0 °C，充放电都收紧** | `PROT_TEMP_ENABLE=1`（D-PROT1） |
+| 放电温度 | −20–60 °C | **包温度 4.0–54.0 °C，充放电都收紧** | 2 °C 回差/2 s（D-PROT1） |
 | 均衡 | max≥3.35 V，diff≥30 mV | 永久关闭 | 冲突（C-10） |
 | 均衡 die 温 | 65 °C，5 °C 回差 | 无 die 温 API | 未实现 |
 | 放电 5% | SOC≤5% + 最低节≤2.8 V | 无 | 未实现（C-14） |
@@ -1458,7 +1462,7 @@ L1 完成需同时满足：
 | 储存监测 | 30 min HSI16 | 已实现；不更新 SOC/SOH | 部分（C-07） |
 | 空闲 LP | 5 s | 5 s | 已实现 |
 | RTC/WUT | LSE 32.768 kHz；WUT 1 s 自由运行 | LSE 死，默认 LSI；WUT 关闭 | 冲突（C-01/C-03） |
-| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x08013C08` | 已实现 |
+| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x08013D50` | 已实现 |
 | BMS NVM | 页 48–49，132/136 B | 同 | 已实现 |
 | StateStore | 页 50–51，48 B | 同（v2） | 已实现；生命周期 flags 未用 |
 | 黑匣子 | 页 52–63，24 B×1020 | 同 | 已实现；事件/wake 不完整 |
@@ -1515,7 +1519,7 @@ L1 完成需同时满足：
 | StateStore | `App/app/state_store.c/.h`；`main_app.c` `App_CommitArchiveSnapshot()` |
 | 黑匣子 | `App/app/black_box.c/.h`；`BlackBox_WriteWake()` 的 `& 0x07`；事件枚举 |
 | LED/蜂鸣器 | `App/app/led_status.c/.h`；`App/bsp/buzzer.c/.h` |
-| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x08013C08` |
+| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x08013D50` |
 | 当前文档 | `CLAUDE.md` 2026-11-11 段；`DOCS/POWER_MODE.md`/`SYSTEM_STATES.md` 顶部更新说明 |
 
 ---

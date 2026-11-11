@@ -25,7 +25,7 @@
 | 项目 | 当前配置 | 作用及动作 |
 | --- | --- | --- |
 | SCD 短路 | `PROTECT1=0x89`，RSNS=1，67 mV / 1.5 mΩ ≈ **44.7 A**；按数据手册码值延迟 **100 µs**。 | **放电**短路；BQ 锁存 SCD、关 DSG。源码上方“70 µs”注释与寄存器编码不符，应按数据手册核查实物。 |
-| OCD 过流 | `PROTECT2=0x57`，56 mV / 1.5 mΩ ≈ **37.3 A**，延迟 **320 ms**。 | **放电**过流；BQ 锁存 OCD、关 DSG。不是充电 5 A 或异常模式 2 A 阈值。 |
+| OCD 过流 | `PROTECT2=0x57`，56 mV / 1.5 mΩ ≈ **37.3 A**，延迟 **320 ms**。 | **放电**过流；BQ 锁存 OCD、关 DSG。不是软件充电 5.5 A 或放电 33 A 阈值。 |
 | OV 单节过压 | `OV_TRIP` 对应 **4.25 V/节**，`PROTECT3=0x40` 对应约 **1 s**。 | BQ 锁存 OV，关 CHG。真实阈值受增益/偏移校准及 trip 码量化影响。 |
 | UV 单节欠压 | `UV_TRIP` 对应 **2.80 V/节**，`PROTECT3=0x40` 对应约 **4 s**。 | BQ 锁存 UV，关 DSG。 |
 | XREADY、外部 ALERT override | BQ 状态位；驱动清 `CC_READY/XREADY/OVRD_ALERT` 等非保护中断原因。 | XREADY 是芯片异常；OVRD_ALERT 不是 OV/UV/SCD/OCD 保护位，但可强制双管关。不能把单纯 `ALERT` 电平当作电池过压。 |
@@ -48,12 +48,12 @@ BQ 的 OV/UV 依赖 ADC：NORM 配置、受控 ADC 重启期间以及 reset-base
 
 ### 3.2 正常准入和软件 OCP
 
-**正常准入**要求 `SelfTest_IsDone/IsPassed`、状态机 NORM、BQ RUN、`BQ_IsFresh(now_ms)` 和电源模式 NORM；充电器由消抖 COMP2 高电平指示，或 CHARGE 中充电电流 >20 mA 保持；COMP2 低且无电流支撑时还需 1 s 才撤销。近满（显示 SOC>90 且充电电流 <10 mA）时只请求 CHG（`0x01`），用 DSG 体二极管压降让 COMP2 判充电器；电流 >20 mA 或 SOC<85% 恢复双管。SOC 只作策略启发，不是保护。IDLE 请求双管关；CHARGE、DISCHARGE 在通常路径请求 `BQ_FET_MASK_ALL=0x03`，再与保护掩码相与。上电 `BQ_DEFAULT_FET_MASK` 虽为 ALL，但 CONFIG 结束实际只开启 CC、FET 位为 0，`ChargePolicy_Init()` 也立即请求 0；不能把宏当作最终上电开关状态。来源：`App/app/charge_policy.c`、`App/bsp/bq_ic.c`。
+**正常准入**要求 `SelfTest_IsDone/IsPassed`、状态机 NORM、BQ RUN、`BQ_IsFresh(now_ms)` 和电源模式 NORM；充电器由消抖 COMP2 高电平指示，或 CHARGE 中充电电流 >30 mA 保持；COMP2 低且无电流支撑时还需 **5.2 s** 才撤销（`CHARGE_POLICY_CHARGER_LOW_MS=5200`；平衡充会短暂关断输出，1 s 去抖会误判为移除并造成充放电状态抖动）。近满（显示 SOC>90 且 −20 mA < 充电电流 < 220 mA）时只请求 CHG（`0x01`），用 DSG 体二极管压降让 COMP2 判充电器；电流 >320 mA 或 SOC<85% 恢复双管。SOC 只作策略启发，不是保护。IDLE 请求双管关；CHARGE、DISCHARGE 在通常路径请求 `BQ_FET_MASK_ALL=0x03`，再与保护掩码相与。上电 `BQ_DEFAULT_FET_MASK` 虽为 ALL，但 CONFIG 结束实际只开启 CC、FET 位为 0，`ChargePolicy_Init()` 也立即请求 0；不能把宏当作最终上电开关状态。来源：`App/app/charge_policy.c`、`App/bsp/bq_ic.c`。
 
 | 软件项目 | 触发条件 | 处置/解除 |
 | --- | --- | --- |
-| 正常充电 OCP | BQ **旧发布快照判据** `valid/fresh/protection_ok` 成立、`last_update_ms` 是新时间戳时，CC 幅值 **≥5 A** 且 COMP2 为充电；连续 **2 个新发布帧**。 | 软件锁存充电过流，允许掩码归零、双 FET 请求关，记事件；需显式 `Protection_RequestLatchClear()`，且安全清除时充电器必须移走。BQ 硬件并无充电 OCP 兜底。 |
-| 正常放电 OCP | 同上，COMP2 为放电、CC 幅值 **≥30 A** 连续 **2 个新发布帧**。 | 软件锁存、双管请求关；不因电流变小自动解除。 |
+| 正常充电 OCP | BQ **旧发布快照判据** `valid/fresh/protection_ok` 成立、`last_update_ms` 是新时间戳时，CC 幅值 **≥5.5 A** 且 COMP2 为充电，持续 **1 s**，且至少 **2 个新发布帧**。 | 软件锁存充电过流，允许掩码归零、双 FET 请求关，记事件；需显式 `Protection_RequestLatchClear()`，且安全清除时充电器必须移走。BQ 硬件并无充电 OCP 兜底。 |
+| 正常放电 OCP | 同上，COMP2 为放电、CC 幅值 **≥33 A**，持续 **500 ms**，且至少 **2 个新发布帧**。 | 软件锁存、双管请求关；不因电流变小自动解除。 |
 | CC 极性诊断 | `BQ_CC_DISCHARGE_SIGN` 默认 -1，CC 与消抖 COMP2 方向不一致累计三帧。 | `PROT_RSN_CURRENT_SIGN` 诊断/日志，不单独作为跳闸条件；OCP 的方向由 COMP2、幅值由 `abs(current_ma)` 决定。 |
 
 正常 OCP 仅在旧快照判据 `Protection_DataReady()` 为真、`last_update_ms` 是新值且没有硬件保护锁存时累计；该路径**没有单独再检查** `batch.quality==FULL_REAL_OK`，也不能证明 `snap.current_ma` 与 `snap.cc_raw` 来自同一批。`|I|>60 A` 被软件评价器视为不可信并**排除**软件 OCP（SCD/OCD 硬件另行处理），不是一个“60 A 软件断开”阈值。CC 换算为 `cc_raw × 844 / 150` mA，1 LSB 为 8.44 µV、分流器 1.5 mΩ；平均窗口约 250 ms，主循环通常每 500 ms 读一次。来源：`App/app/protection.h:54-68`、`App/app/protection.c:277-285,332-445,675-781`、`App/board.h:70-81`。
@@ -66,7 +66,7 @@ BQ 的 OV/UV 依赖 ADC：NORM 配置、受控 ADC 重启期间以及 reset-base
 
 ## 4. 温度、供电和数据失效
 
-温度来自 BQ TS1 的外接 NTC 经 `SocEst` 换算。保护规则已计算：充电 **<0°C 或 >45°C**，放电 **<-20°C 或 >60°C**，约 2 s 越界确认、恢复边界有 2°C 回差。初始化时 `temp_invalid=1`；运行期由有效转为无效约 2 s 后设置禁充/禁放状态，恢复需连续有效约 2 s。**当前 `PROT_TEMP_ENABLE=0`，`Protection_TempAllowMask()` 不据此直接收紧 FET 允许掩码。**但 `temp_invalid` 仍可置 `FAULT_BIT_TEMP`，而自检将 TEMP 当作真实故障，部分电压放电门控也直接拒绝 TEMP；因此不能将“温控默认关”理解为“温度异常对任何模式都无影响”。另外 TS1 有效上拉模型未完成标定，温度值不应当作经验证的安全温度。`App/app/protection.h:69-81`、`App/app/protection.c:311-329,447-571,921-929`、`App/app/self_test.c:28-37`、`App/detect/soc_est.c:105-153`。
+温度来自 BQ TS1 的外接 NTC 经 `SocEst` 换算。当前包温度门控窗口为 **4.0–54.0 °C**，充电和放电都收紧；约 2 s 越界确认，恢复边界为 6.0–52.0 °C（2 °C 回差）。初始化时 `temp_invalid=1`；运行期由有效转为无效约 2 s 后同时禁充/禁放，恢复需连续有效约 2 s。**`PROT_TEMP_ENABLE=1`，`Protection_TempAllowMask()` 据此收紧 FET 允许掩码；`temp_invalid` 也会置 `FAULT_BIT_TEMP`，自检将 TEMP 当作真实故障。**TS1 有效上拉模型仍建议用 4 °C/54 °C 两点复核，避免读数偏差导致误禁。`App/app/protection.h`、`App/app/protection.c`、`App/app/self_test.c`、`App/detect/soc_est.c`。
 
 MCU 的 PVD 配置为 3.3 V 电源轨约 **2.8 V** 检测，IRQ 设置 `FAULT_BIT_POWER`（sticky），与电池三节 UV 是不同保护；80 MHz HSE/PLL 时钟失败进入降级路径，只留故障灯。`FAULT_BIT_BQ_STALE`（无新完整数据约 2 s）本身不在状态机 critical 掩码中，但会让正常策略/BQ 就绪条件失败并拒绝 FET；真正 critical 包括 BQ_COMM/XREADY/OV/UV/SCD/OCD/ADC_STUCK/PROTECTION/POWER/CLK。`App/app/faults.c:13-16,122-132`、`App/app/state_machine.c:14-20`、`App/app/charge_policy.c:50-77`、`App/board.h:36-40`。
 

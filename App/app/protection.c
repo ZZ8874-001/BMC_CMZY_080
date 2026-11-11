@@ -7,7 +7,7 @@
  *     FET 允许掩码和一次性事件。
  * M2a：软件充电 5 A / 放电 30 A OCP，2 个新发布帧确认后锁存；只允许
  *      `Protection_RequestLatchClear()` 在安全条件下清除，不自动重试。
- * M2b：NTC 充放电温度门控，`PROT_TEMP_ENABLE=1` 且 TS1 标定后生效。
+ * M2b：NTC 包温度门控，4–54 °C，充放电都收紧；TS1 无效时也双禁。
  *
  * FET 请求仍由 charge_policy 唯一持有；本模块只给允许掩码。
  ******************************************************************************
@@ -47,6 +47,8 @@ typedef struct
     uint8_t ocp_dsg_streak;
     uint32_t ocp_trip_count;
     uint32_t ocp_last_snap_ms;
+    uint32_t ocp_chg_since_ms;
+    uint32_t ocp_dsg_since_ms;
     int32_t ocp_last_current_ma;
     uint32_t implausible_current_count;
     uint8_t sign_mismatch_streak;
@@ -150,6 +152,8 @@ static void Protection_EvaluateOcp(const bq_snapshot_t *snap)
         s_protection.implausible_current_count++;
         s_protection.ocp_chg_streak = 0u;
         s_protection.ocp_dsg_streak = 0u;
+        s_protection.ocp_chg_since_ms = 0u;
+        s_protection.ocp_dsg_since_ms = 0u;
         return;
     }
 
@@ -195,37 +199,54 @@ static void Protection_EvaluateOcp(const bq_snapshot_t *snap)
     {
         s_protection.ocp_chg_streak = 0u;
         s_protection.ocp_dsg_streak = 0u;
+        s_protection.ocp_chg_since_ms = 0u;
+        s_protection.ocp_dsg_since_ms = 0u;
         return;
     }
 
     /* 方向用 COMP2（独立于 CC 符号），幅值用 CC 积分值。这样即使 SRP/SRN
-     * 或 CC 极性与 TI 约定相反，也不会把 5 A 放电误判成充电过流；CC 符号
-     * 只用于 SOC 和 sign_mismatch 诊断。 */
+     * 或 CC 极性与 TI 约定相反，也不会把充电/放电过流误判；CC 符号只用于
+     * SOC 和 sign_mismatch 诊断。阈值/时间：充电 5.5 A/1 s、放电 33 A/500 ms，
+     * 且至少 2 个新发布帧。 */
     if ((s_protection.comp_charging_last != 0u) &&
         (abs_ma >= (int32_t)s_protection.ocp_chg_limit_ma))
     {
+        if (s_protection.ocp_chg_streak == 0u)
+        {
+            s_protection.ocp_chg_since_ms = snap->last_update_ms;
+        }
         if (s_protection.ocp_chg_streak < 0xFFu)
         {
             s_protection.ocp_chg_streak++;
         }
         s_protection.ocp_dsg_streak = 0u;
+        s_protection.ocp_dsg_since_ms = 0u;
     }
     else if ((s_protection.comp_charging_last == 0u) &&
              (abs_ma >= (int32_t)s_protection.ocp_dsg_limit_ma))
     {
+        if (s_protection.ocp_dsg_streak == 0u)
+        {
+            s_protection.ocp_dsg_since_ms = snap->last_update_ms;
+        }
         if (s_protection.ocp_dsg_streak < 0xFFu)
         {
             s_protection.ocp_dsg_streak++;
         }
         s_protection.ocp_chg_streak = 0u;
+        s_protection.ocp_chg_since_ms = 0u;
     }
     else
     {
         s_protection.ocp_chg_streak = 0u;
         s_protection.ocp_dsg_streak = 0u;
+        s_protection.ocp_chg_since_ms = 0u;
+        s_protection.ocp_dsg_since_ms = 0u;
     }
 
     if ((s_protection.ocp_chg_streak >= PROT_OCP_CONFIRM_FRAMES) &&
+        ((snap->last_update_ms - s_protection.ocp_chg_since_ms) >=
+         PROT_OCP_CHG_MS) &&
         (s_protection.ocp_chg_latched == 0u))
     {
         s_protection.ocp_chg_latched = 1u;
@@ -235,6 +256,8 @@ static void Protection_EvaluateOcp(const bq_snapshot_t *snap)
         s_protection.event_flags |= PROT_EVENT_SW_CHG_OCP;
     }
     else if ((s_protection.ocp_dsg_streak >= PROT_OCP_CONFIRM_FRAMES) &&
+             ((snap->last_update_ms - s_protection.ocp_dsg_since_ms) >=
+              PROT_OCP_DSG_MS) &&
              (s_protection.ocp_dsg_latched == 0u))
     {
         s_protection.ocp_dsg_latched = 1u;
@@ -395,6 +418,8 @@ void Protection_Init(void)
     s_protection.ocp_dsg_streak = 0u;
     s_protection.ocp_trip_count = 0u;
     s_protection.ocp_last_snap_ms = 0u;
+    s_protection.ocp_chg_since_ms = 0u;
+    s_protection.ocp_dsg_since_ms = 0u;
     s_protection.ocp_last_current_ma = 0;
     s_protection.implausible_current_count = 0u;
     s_protection.sign_mismatch_streak = 0u;
@@ -436,6 +461,15 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
 
     bq_ready = Protection_BqReady();
     data_ready = Protection_DataReady(now_ms, snap);
+
+    /* 数据中断或 BQ 已锁存时不能把旧的 OCP 计时带入下一段连续过流。 */
+    if ((data_ready == 0u) || (latch != 0u))
+    {
+        s_protection.ocp_chg_streak = 0u;
+        s_protection.ocp_dsg_streak = 0u;
+        s_protection.ocp_chg_since_ms = 0u;
+        s_protection.ocp_dsg_since_ms = 0u;
+    }
 
     /* 首次拿到有效帧时补齐 boot 锁存：若 BQ 驱动的 pre_sys_stat 捕获或
      * 配置期间新锁存没有被 boot_prot_latch_mask 捕获，这里允许一次启动窗口
@@ -763,6 +797,8 @@ void Protection_GetSnapshot(protection_snapshot_t *out)
     out->ocp_last_current_ma = s_protection.ocp_last_current_ma;
     out->ocp_trip_count = s_protection.ocp_trip_count;
     out->ocp_last_snap_ms = s_protection.ocp_last_snap_ms;
+    out->ocp_chg_since_ms = s_protection.ocp_chg_since_ms;
+    out->ocp_dsg_since_ms = s_protection.ocp_dsg_since_ms;
     out->implausible_current_count = s_protection.implausible_current_count;
     out->sign_mismatch_streak = s_protection.sign_mismatch_streak;
     out->sign_mismatch_count = s_protection.sign_mismatch_count;

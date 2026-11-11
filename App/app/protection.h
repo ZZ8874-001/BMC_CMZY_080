@@ -6,7 +6,7 @@
  * 只做策略评估、锁存与恢复排序；FET 请求仍由 charge_policy 唯一拥有。
  * M1：BQ 硬件 OV/UV/SCD/OCD 观测、boot/LP 后 SCD/OCD 安全清除。
  * M2a：软件充电 5 A / 放电 30 A OCP，锁存 + 安全人工清除。
- * M2b：外部 NTC 充放电温度门控（PROT_TEMP_ENABLE 标定后启用）。
+ * M2b：外部 NTC 包温度门控（4–54 °C，充放电都收紧）。
  ******************************************************************************
  */
 #ifndef APP_PROTECTION_H
@@ -53,25 +53,29 @@ typedef enum
 
 /* ---------------- M2a 软件 OCP ----------------
  * 方向由 COMP2（消抖后）判定，幅值用 CC 积分值；这样 CC 极性如果与 TI
- * 约定相反，也不会把 5 A 放电误判成充电过流。CC 符号只影响 SOC/诊断。 */
-#define PROT_OCP_CHG_MA             5000    /* 充电持续过流门槛 */
-#define PROT_OCP_DSG_MA             30000   /* 放电持续过流门槛 */
-#define PROT_OCP_CONFIRM_FRAMES     2u      /* 2 个“新发布帧”≈0.5–1 s */
+ * 约定相反，也不会把充电/放电过流误判。CC 符号只影响 SOC/诊断。
+ * 阈值/时间按原计划：充电 5.5 A/1 s，放电 33 A/500 ms；至少 2 个新发布帧。 */
+#define PROT_OCP_CHG_MA             5500    /* 充电持续过流门槛 */
+#define PROT_OCP_DSG_MA             33000   /* 放电持续过流门槛 */
+#define PROT_OCP_CHG_MS             1000u   /* 充电越界持续时间 */
+#define PROT_OCP_DSG_MS             500u    /* 放电越界持续时间 */
+#define PROT_OCP_CONFIRM_FRAMES     2u      /* 至少 2 个“新发布帧” */
 #define PROT_OCP_SIGN_HINT_MA       2000    /* 与 COMP2 交叉检查的最小电流 */
 #define PROT_OCP_IMPLAUSIBLE_MA     60000   /* 高于 SCD 44.7 A，视为 CC 异常帧 */
 
-/* ---------------- M2b NTC 温度 ---------------- */
-/* TS1 上拉两点校验通过后置 1；=0 时只计算/记录，不改允许掩码。 */
-#define PROT_TEMP_ENABLE            0u
+/* ---------------- M2b 包温度门控 ----------------
+ * TS1 有效后启用；包温度 4.0–54.0 °C 为允许窗口，2 °C 回差/2 s 驻留。
+ * 低/高温同时收紧 CHG 与 DSG；传感器无效 2 s 后也同时禁止。 */
+#define PROT_TEMP_ENABLE            1u
 #define PROT_TEMP_DWELL_MS          2000u
-#define PROT_TEMP_CHG_MIN_DC        0       /* 0.0 °C，低于则禁充 */
-#define PROT_TEMP_CHG_MAX_DC        450     /* 45.0 °C，高于则禁充 */
-#define PROT_TEMP_CHG_REC_MIN_DC    20      /* +2.0 °C 回差 */
-#define PROT_TEMP_CHG_REC_MAX_DC    430     /* 43.0 °C 回差 */
-#define PROT_TEMP_DSG_MIN_DC        (-200)  /* -20.0 °C，低于则禁放 */
-#define PROT_TEMP_DSG_MAX_DC        600     /* 60.0 °C，高于则禁放 */
-#define PROT_TEMP_DSG_REC_MIN_DC    (-180)  /* -18.0 °C 回差 */
-#define PROT_TEMP_DSG_REC_MAX_DC    580     /* 58.0 °C 回差 */
+#define PROT_TEMP_CHG_MIN_DC        40      /* 4.0 °C，低于则禁充 */
+#define PROT_TEMP_CHG_MAX_DC        540     /* 54.0 °C，高于则禁充 */
+#define PROT_TEMP_CHG_REC_MIN_DC    60      /* +2.0 °C 回差 */
+#define PROT_TEMP_CHG_REC_MAX_DC    520     /* 52.0 °C 回差 */
+#define PROT_TEMP_DSG_MIN_DC        40      /* 4.0 °C，低于则禁放 */
+#define PROT_TEMP_DSG_MAX_DC        540     /* 54.0 °C，高于则禁放 */
+#define PROT_TEMP_DSG_REC_MIN_DC    60      /* +2.0 °C 回差 */
+#define PROT_TEMP_DSG_REC_MAX_DC    520     /* 52.0 °C 回差 */
 
 /* 清锁存被拒绝的原因位，供 Ozone/日志。 */
 #define PROT_CLEAR_BLOCK_READY      (1u << 0)   /* 数据未就绪/BQ busy */
@@ -98,6 +102,8 @@ typedef struct
     int32_t  ocp_last_current_ma;
     uint32_t ocp_trip_count;
     uint32_t ocp_last_snap_ms;
+    uint32_t ocp_chg_since_ms;
+    uint32_t ocp_dsg_since_ms;
     uint32_t implausible_current_count;
     uint8_t  sign_mismatch_streak;
     uint32_t sign_mismatch_count;

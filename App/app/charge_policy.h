@@ -31,7 +31,8 @@ typedef enum
 } charge_policy_cal_end_t;
 
 /* 充电器存在/近满判据的输入。charge_current_ma 已按 BQ_CC_DISCHARGE_SIGN
- * 修正为“充电为正”；soc01 为 0..10000 的显示 SOC，只作策略启发，不是保护。 */
+ * 修正为“充电为正”；soc01 为 0..10000 的显示 SOC，只作策略启发，不是保护。
+ * 同一电流在 DISCHARGE 进入后的前 10 s 还用 100/90 mA 判外部充电切换。 */
 typedef struct
 {
     int32_t  charge_current_ma;
@@ -53,6 +54,8 @@ uint8_t ChargePolicy_IsCalibration(void);
 uint8_t ChargePolicy_IsChargerPresent(void);
 uint8_t ChargePolicy_GetBodyDiodeMode(void);
 uint8_t ChargePolicy_GetChargeCurrentHold(void);
+uint8_t ChargePolicy_GetDischargeChargeDetect(void);
+uint32_t ChargePolicy_GetDischargeChargeDetectCount(void);
 charge_policy_cal_end_t ChargePolicy_GetCalEndReason(void);
 
 #endif /* APP_CHARGE_POLICY_H */

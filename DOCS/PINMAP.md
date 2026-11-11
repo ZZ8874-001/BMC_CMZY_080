@@ -21,7 +21,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
   由 250 Hz tick 采样、32 样本（约 128 ms）一致性消抖。
 - 硬件已画、固件已接的点（L0）：5 V 由 PB0 门控（`App_Init()` 拉高，LP 拉低）、
   BQ 由 PB1 boot 脉冲唤醒并走 I2C1 CRC+DMA、TIM1 CH1N 由 `buzzer.c` 以 2–5 kHz 可调频率驱动、
-  RTC 由 CubeMX 初始化，时钟源按 `LP_RTC_USE_LSE` 选择（默认 LSI，LSE 硬件修复后改 1）；LP 周期由 IWDG 超时复位驱动、RTC 只作绝对时间参考；PA8 为 EXTI **事件**模式（不能唤醒 STOP1，只在轻量 LP boot 按电平检查）、PB5 为下降沿中断（生产唤醒，由 `Button_WakeInit()` 配置 EXTI5）。仍存的硬件风险：I2C 只有 MCU 内部上拉（无外部上拉）。
+  RTC 由 CubeMX 初始化，时钟源按 `LP_RTC_USE_LSE` 选择（默认 LSI，LSE 硬件修复后改 1）；LP 周期由 IWDG 超时复位驱动、RTC 只作绝对时间参考；PA8 为 EXTI **事件**模式（不能唤醒 STOP1，只在轻量 LP boot 按电平检查）、PB5 为下降沿中断（生产唤醒，由 `Button_WakeInit()` 配置 EXTI5）。外部 I2C 上拉已确认存在（2026-11-11）。
 
 ## 1. MCU 引脚总表（UFQFPN32）
 
@@ -45,7 +45,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 16 | VSS | — | `REF_GND` | 数字地 | 与 EP(33)、BQ VSS 同网络 |
 | 17 | VDD | — | `SUP_3V3D` | 3.3 V 数字电源 | 同 pin 1 |
 | 18 | PA8 | `GPXTI8` / `BQ_ALT_EXTI8` | `BQ_ALT` | BQ76920 `ALERT`（pin 20） | 输入，CubeMX 生成为 **EXTI 事件模式、上升沿**（`GPIO_MODE_EVT_RISING`）：不产生中断、没有 EXTI 挂起位，**不能唤醒 WFI/STOP1**。每次轻量 LP boot 在 BQ prepare 清掉 CC_READY/XREADY 后按电平检查；为高则完整唤醒并归因为 BQ ALERT，最坏延迟一个 IWDG 周期。ALERT 为高有效输出（带弱下拉），是 SYS_STAT 所有位的 OR；对应状态位写 1 清除后 ALERT 才撤销 |
-| 19 | PA9 | `I2C1_SCL` / `BQ_IIC1_SCL` | `BQ_SCL` | RN4 22 Ω → BQ76920 SCL（pin 5） | AF4 开漏；固件在 `HAL_I2C_Init` **之前**写 `hi2c1.Init.Timing=0x1424A4FF`（PRESC 1 / SCLDEL 2 / SDADEL 4 / SCLH 164 / SCLL 255 → **95 kHz**，tHIGH=4.125 µs）；HAL 会清掉保留位，硬件 TIMINGR 读回 `0x1024A4FF` 属正常。IOC 生成的 ~103.6 kHz / tHIGH 3.93 µs 不满足 BQ 的 tHIGH≥4.0 µs。MSP 为 `GPIO_PULLUP`（内部上拉约 40 kΩ），**板上无外部 I2C 上拉**（见第 6 节）。I2C1_TX 用 DMA1_Ch6（生成句柄 `hdma_i2c1_tx`） |
+| 19 | PA9 | `I2C1_SCL` / `BQ_IIC1_SCL` | `BQ_SCL` | RN4 22 Ω → BQ76920 SCL（pin 5） | AF4 开漏；固件在 `HAL_I2C_Init` **之前**写 `hi2c1.Init.Timing=0x1424A4FF`（PRESC 1 / SCLDEL 2 / SDADEL 4 / SCLH 164 / SCLL 255 → **95 kHz**，tHIGH=4.125 µs）；HAL 会清掉保留位，硬件 TIMINGR 读回 `0x1024A4FF` 属正常。IOC 生成的 ~103.6 kHz / tHIGH 3.93 µs 不满足 BQ 的 tHIGH≥4.0 µs。MSP 为 `GPIO_PULLUP`（内部上拉约 40 kΩ），**外部 I2C 上拉已确认存在**（见第 6 节）。I2C1_TX 用 DMA1_Ch6（生成句柄 `hdma_i2c1_tx`） |
 | 20 | PA10 | `I2C1_SDA` / `BQ_IIC1_SDA` | `BQ_SDA` | RN4 22 Ω → BQ76920 SDA（pin 4） | AF4 开漏；同上。I2C1_RX 用生成的 **DMA1_Ch7**（`hdma_i2c1_rx`，Req3）；全部 DMA 只用 DMA1 |
 | 21 | PA11 | `CAN1_RX` | `CAN1_RX` | RN4 22 Ω → TJA1044 RXD（pin 4） | AF9；约 833 kbit/s（Prescaler 16、BS1=4TQ、BS2=1TQ，采样点 5/6） |
 | 22 | PA12 | `CAN1_TX` | `CAN1_TX` | RN4 22 Ω → TJA1044 TXD（pin 1） | AF9；TJA1044 VIO=3.3 V、VCC=5 V（需 PB0 高）、STB 接 GND（正常模式） |
@@ -54,7 +54,7 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 25 | PA15 | — | — | 未连接（原理图打 X） | — |
 | 26 | PB3 | `GPIO_Output` / `IND_ROHT` | `IND_ROHT` | R11 510 Ω → LED1 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。**高 = 点亮**（高有效）；由 `led_status.c` 驱动：NORM 常灭、故障时 5 Hz 快闪、LP 灭 |
 | 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 平时灭；复位式 LP 每次 IWDG 轻量 boot 由 `lp_cycle.c` 打 `LP_HEARTBEAT_MS`（默认 10 ms）高脉冲，作为“IWDG 周期还活着”的心跳（生产测电流可置 0） |
-| 28 | PB5 | `GPIO_Input` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 本身没有外部上拉**（原理图中的 10 kΩ 上拉不在 PB5 网络） | `.ioc` 为 `GPIO_Input` + `GPIO_PULLUP`，生成的 `MX_GPIO_Init` 只配置电平/上拉；**EXTI5 下降沿由 `bsp/button.c` 的 `Button_WakeInit()` 在轻量 LP boot 中独占配置**（SYSCFG PB、FTSR、IMR、EXTI9_5 NVIC prio0）。NORM 用 4 ms 轮询；LP 用 EXTI5 唤醒。`EXTI9_5_IRQHandler`/`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `bsp/button.c`，只置 `exti_flag`。SMBA 实测时 PB5 临时切 AF4，EXTI5 保留为回退 |
+| 28 | PB5 | `GPIO_Input` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 外部上拉已确认存在**（2026-11-11） | `.ioc` 为 `GPIO_Input` + `GPIO_PULLUP`，生成的 `MX_GPIO_Init` 只配置电平/上拉；**EXTI5 下降沿由 `bsp/button.c` 的 `Button_WakeInit()` 在轻量 LP boot 中独占配置**（SYSCFG PB、FTSR、IMR、EXTI9_5 NVIC prio0）。NORM 用 4 ms 轮询；LP 用 EXTI5 唤醒。`EXTI9_5_IRQHandler`/`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `bsp/button.c`，只置 `exti_flag`。SMBA 实测时 PB5 临时切 AF4，EXTI5 保留为回退 |
 | 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道 |
 | 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1 |
 | 31 | PH3-BOOT0 | — | `BOOT0` | R15 10 kΩ 到 REF_GND | 从 Flash 启动；无 BOOT 按键 |
@@ -125,7 +125,7 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 - 比较器看到的差模信号 = `0.266 × I × (R分流 + Rds(on)Q2/Q3)`。
   10 A 时约几十 mV；1 A 时只有几 mV，**100 mA 时约 0.3 mV**，接近/低于 COMP2 的输入失调与噪声。
   **精确电流/荷电状态请用 BQ76920 的 SRP/SRN 库仑计读数，COMP2 只做粗方向判定。**
-- 因此 `ChargePolicy` 在 CHARGE 中用充电电流兜底：`charge_current_ma >20 mA` 时即使 COMP2 为低也保持充电器存在；`<10 mA` 释放；10–20 mA 回差。接近充满（显示 SOC>90 且充电电流 <10 mA，允许最多 −20 mA 的 CC 零点偏置）时只开 CHG、关 DSG，让 DSG 体二极管提供额外压降，COMP2 重新可判充电器；电流 >20 mA 或 SOC<85% 退出该子模式。
+- 因此 `ChargePolicy` 在 CHARGE 中用充电电流兜底：`charge_current_ma >30 mA` 时即使 COMP2 为低也保持充电器存在；`<20 mA` 释放；20–30 mA 回差。接近充满（显示 SOC>90 且 −20 mA < 充电电流 < 220 mA）时只开 CHG、关 DSG，让 DSG 体二极管提供额外压降，COMP2 重新可判充电器；电流 >320 mA 或 SOC<85% 退出该子模式。
 
 ### 3.3 极性（结论）
 
@@ -185,17 +185,17 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 | OCD | 56 mV（1.5 mΩ → 37.3 A），320 ms | `PROTECT2=0x57` | **仅放电方向**；高于 30 A 正常放电，硬件后备 |
 | SCD | 67 mV（1.5 mΩ → 44.7 A），100 µs | `PROTECT1=0x89` | RSNS=1，放电硬件短路保护 |
 
-BQ76920 **没有充电过流硬件保护，也没有可编程温度/die 保护阈值**。充电 5 A 和放电 30 A 的软件 OCP 由 `protection.c` 执行：**方向用 COMP2、幅值用 CC**（CC 极性不影响 5 A/30 A 归类），2 个新发布帧（≈0.5–1 s）确认后锁存、双 FET 关；充电 OCP 清除要求充电器移除，放电 OCP 要求负载断开；`Protection_RequestLatchClear()` 只在 FET 全关、`|I| ≤ 500 mA` 连续 2 s 后执行。充电硬件后备仍依赖充电器限流和保险丝；温度必须由 MCU 读取 NTC（BQ die 温只在静止均衡时临时切换），`PROT_TEMP_ENABLE` 在 TS1 上拉模型标定后才置 1。
+BQ76920 **没有充电过流硬件保护，也没有可编程温度/die 保护阈值**。软件 OCP 由 `protection.c` 执行：**方向用 COMP2、幅值用 CC**（CC 极性不影响归类），充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认后锁存、双 FET 关；充电 OCP 清除要求充电器移除，放电 OCP 要求负载断开；`Protection_RequestLatchClear()` 只在 FET 全关、`|I| ≤ 500 mA` 连续 2 s 后执行。充电硬件后备仍依赖充电器限流和保险丝。包温度门控由 MCU 读取 NTC 执行：**4.0–54.0 °C 允许，2 °C 回差/2 s 去抖，充放电都收紧**；`PROT_TEMP_ENABLE=1`，TS1 转换有效才放行，转换模型仍建议现场复核。
 
-TS1 上拉模型：BQ 在 `TEMP_SEL=1` 时内部有 10 kΩ 到约 3.3 V；若板上另有外部 10 kΩ 到 5 V，两者并联。25 °C（NTC=10 kΩ）节点电压：仅内部≈1.65 V、仅外部≈2.50 V、两者≈2.77 V。`SOC_EST_TS1_PULL_MV/OHM` 按实测等效为 `3300/10000`、`5000/10000` 或 `4150/5000`（戴维南），再做 0 °C/45 °C 两点复核后才启用温度保护。
+TS1 上拉模型：BQ 在 `TEMP_SEL=1` 时内部有 10 kΩ 到约 3.3 V；若板上另有外部 10 kΩ 到 5 V，两者并联。25 °C（NTC=10 kΩ）节点电压：仅内部≈1.65 V、仅外部≈2.50 V、两者≈2.77 V。`SOC_EST_TS1_PULL_MV/OHM` 按实测等效为 `3300/10000`、`5000/10000` 或 `4150/5000`（戴维南）。当前 `PROT_TEMP_ENABLE=1`，4.0–54.0 °C 门控已生效；4 °C/54 °C 两点仍需按实际上拉模型复核，避免读数偏差导致误禁。
 
 `OV_TRIP/UV_TRIP` 按读回的 `ADCGAIN`（µV/LSB）和 `ADCOFFSET`（mV）反算：
 `FULL=((V_mV−offset)×1000)/(365+gain)`，取 `FULL>>4` 的低 8 位；OV 全码高 2 位固定 `10`、低 4 位 `1000`，UV 固定 `01`/`0000`。
 
 ### L1 充放电 FET 策略
 
-- `COMP2` 充电方向稳定为高，或 CHARGE 中充电电流 >20 mA：`ChargePolicy_Task()` 进入/保持 CHARGE，正常请求 `SYS_CTRL2=0x43`（CC + CHG + DSG）。
-- 近满体二极管子模式（显示 SOC>90 且充电电流 <10 mA）：请求 `SYS_CTRL2=0x41`（CC + CHG，DSG 关），利用 DSG 体二极管压降 + COMP2 判充电器；电流 >20 mA 或 SOC<85% 恢复 `0x43`。
+- `COMP2` 充电方向稳定为高，或 CHARGE 中充电电流 >30 mA：`ChargePolicy_Task()` 进入/保持 CHARGE，正常请求 `SYS_CTRL2=0x43`（CC + CHG + DSG）。
+- 近满体二极管子模式（显示 SOC>90 且 −20 mA < 充电电流 < 220 mA）：请求 `SYS_CTRL2=0x41`（CC + CHG，DSG 关），利用 DSG 体二极管压降 + COMP2 判充电器；电流 >320 mA 或 SOC<85% 恢复 `0x43`。
 - 无充电器时，`GESTURE_PAIR_HOLD3` 切换 DISCHARGE/IDLE；DISCHARGE 同样双管全开，IDLE 请求 `SYS_CTRL2=0x40`（双管关）。
 - 充电器优先：DISCHARGE 中插入充电器转 CHARGE，并清放电 latch；拔出后回 IDLE，不自动恢复放电。
 - 关键故障强制双管关；LP 进入前 `BQ_PrepareForLpMask()` 把请求影子同步为 LP mask（默认 0），避免唤醒后重放旧请求。
@@ -237,7 +237,7 @@ REGSRC 必须接 VBAT_12V（V0.80 漏接），否则 REGOUT 与 CHG/DSG 栅极�
 | 电源轨 | 来源 | 默认状态 | 负载 |
 | --- | --- | --- | --- |
 | `VBAT_12V` | 3S 电池 `BTT_3P_12V` 经 R1 100 Ω + TVS/滤波 | 接电池即有 | BQ 的 BAT/REGSRC；U21 5 V buck；U22 3.3 V LDO |
-| `SUP_3V3D` | U22 HT7533（从 VBAT_12V） | **常开**（无使能） | MCU VDD/VDDA、BQ I2C 上拉（MCU 内部，无外部）、LED、PACK_SC 分压、SWD |
+| `SUP_3V3D` | U22 HT7533（从 VBAT_12V） | **常开**（无使能） | MCU VDD/VDDA、BQ I2C 外部上拉、LED、PACK_SC 分压、SWD |
 | `SUP_5VD` | U21 LMR54410（从 VBAT_12V），EN = PB0 | **默认关**（`MX_GPIO_Init` 后 PB0 = 低） | TJA1044 VCC、U20 RGB LED、BUZZER1、U18 的 +5 V |
 | `REF_GND` | 控制地 | — | MCU VSS/EP、BQ VSS、所有去耦/按键/LED/比较器钳位 |
 
@@ -248,7 +248,7 @@ REGSRC 必须接 VBAT_12V（V0.80 漏接），否则 REGOUT 与 CHG/DSG 栅极�
 - PB1 = 低 → Q4 关，TS1 由上拉/NTC 决定，BQ 可自动从 SHIP boot。
 - PB3/PB4 = 低 → LED1/LED2 灭（高有效）。
 - COMP2 未启动；DAC1 未启动；TIM1 未启动；TIM2 已初始化但未启动；I2C/CAN/USART 外设已初始化；
-  PB5 只有 `GPIO_Input` + 内部上拉，EXTI5/NVIC 由轻量 LP boot 的 `Button_WakeInit()` 配置。
+  PB5 为 `GPIO_Input`，外部上拉已确认存在；EXTI5/NVIC 由轻量 LP boot 的 `Button_WakeInit()` 配置。
 
 `App_Init()` 之后（NORM）：
 
@@ -264,7 +264,7 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
 推荐的 bring-up 顺序（按需）：
 
 1. 上电观察：PB4 灯亮（NORM）、USART1 115200 收到 `[BOOT]` 日志；示波器测 PA0 12 MHz。
-2. 读 BQ：I2C 95 kHz、tHIGH≥4.0 µs；内部上拉已使能，若边沿/速率不足补 4.7–10 kΩ 外部上拉。
+2. 读 BQ：I2C 95 kHz、tHIGH≥4.0 µs；外部上拉已确认存在；若边沿/速率不足再检查 4.7–10 kΩ 上拉。
    若 BQ 不响应，PB1 高→低 boot 脉冲（固件已自动执行一次）后等 ≥10 ms。
 3. COMP2 已在 `App_Init()` 启动；用已知充/放电方向核对高/低与 BQ CC 符号。
 4. 蜂鸣器/WS2812 由 App 驱动，需要时按状态/自检结果验证（WS2812 注意 5 V VIH 风险）。
@@ -274,7 +274,7 @@ OSC1 的 tri-state 默认电平不再影响能否开机。上板仍应确认 PA0
 1. **COMP2 已在 `App_Init()` 启动**（`HAL_COMP_Start`）：若被人为删除或 LP 唤醒后未重建，
    PA3/PA4 的采样结果无效；自检用 `HAL_COMP_GetState()==HAL_COMP_STATE_BUSY` 检查。
 2. **I2C 上拉/时序**：PA9/PA10 经 RN4 22 Ω 到 BQ，MSP 为 `GPIO_PULLUP`（内部上拉约 40 kΩ），
-   板上没有外部上拉；建议各加 4.7–10 kΩ 到 SUP_3V3D（或 REGOUT）留余量。按 **CRC=Yes** 的格式访问
+   外部上拉已确认存在（2026-11-11）；仍按 **CRC=Yes** 的格式访问
    （地址 0x08）。固件在 `HAL_I2C_Init` **之前**写 `hi2c1.Init.Timing=0x1424A4FF`（95 kHz、tHIGH 4.125 µs）；
    HAL 会清掉保留位，硬件读回 `0x1024A4FF` 是正常的。I2C1_RX 使用生成的 DMA1_Ch7/Req3。
 3. **5 V 默认关**：不先拉高 PB0，CAN（TJA1044 VCC）、RGB 灯、蜂鸣器、UART 连接器 +5 V 都不会工作。
