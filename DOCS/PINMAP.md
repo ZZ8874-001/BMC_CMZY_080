@@ -55,8 +55,8 @@ MCU：**STM32L432KBU6**，UFQFPN32 + 裸露焊盘（EP，原理图 pin 33）。
 | 26 | PB3 | `GPIO_Output` / `IND_ROHT` | `IND_ROHT` | R11 510 Ω → LED1 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。**高 = 点亮**（高有效）；由 `led_status.c` 驱动：NORM 常灭、故障时 5 Hz 快闪、LP 灭 |
 | 27 | PB4 | `GPIO_Output` / `IND_NORM` | `IND_NORM` | R13 510 Ω → LED2 → REF_GND | 推挽输出，`MX_GPIO_Init` 后为低。高 = 点亮；`led_status.c`：NORM 常亮（调试期兼作心跳）、LP 平时灭；复位式 LP 每次 IWDG 轻量 boot 由 `lp_cycle.c` 打 `LP_HEARTBEAT_MS`（默认 10 ms）高脉冲，作为“IWDG 周期还活着”的心跳（生产测电流可置 0） |
 | 28 | PB5 | `GPIO_Input` / `WAKE_EXTI5` | `WAKE_EXTI5` | SW1 B3F-3152 到 REF_GND；**PB5 外部上拉已确认存在**（2026-11-11） | `.ioc` 为 `GPIO_Input` + `GPIO_PULLUP`，生成的 `MX_GPIO_Init` 只配置电平/上拉；**EXTI5 下降沿由 `bsp/button.c` 的 `Button_WakeInit()` 在轻量 LP boot 中独占配置**（SYSCFG PB、FTSR、IMR、EXTI9_5 NVIC prio0）。NORM 用 4 ms 轮询；LP 用 EXTI5 唤醒。`EXTI9_5_IRQHandler`/`HAL_GPIO_EXTI_Callback` 的唯一 owner 是 `bsp/button.c`，只置 `exti_flag`。SMBA 实测时 PB5 临时切 AF4，EXTI5 保留为回退 |
-| 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道 |
-| 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1 |
+| 29 | PB6 | `USART1_TX` | `UART1_TX` | U18 `WAFFER-GH1.25-4PWB`（+5 V/GND/RX/TX）；22 Ω + 100 pF EMC | AF7；`app_log.c` 覆写 BRR=694（80 MHz 下 115200 8N1），TX 走 DMA1_Ch4（`hdma_log_usart1_tx`）；调试/上位机通道，另承载 1 Hz `D,V,I,T,SOC,SOH,Q,R0` SOC 遥测（`DOCS/SOC_TELEMETRY.md`） |
+| 30 | PB7 | `USART1_RX` | `UART1_RX` | U18；22 Ω + 100 pF EMC | AF7，115200 8N1；当前遥测只发不收，RX 未使用 |
 | 31 | PH3-BOOT0 | — | `BOOT0` | R15 10 kΩ 到 REF_GND | 从 Flash 启动；无 BOOT 按键 |
 | 32 | VSS | — | `REF_GND` | 数字地 | 同 pin 16 |
 | 33 | EP | — | `REF_GND` | 裸露焊盘 | 必须焊到地平面（电气 + 散热） |
@@ -181,11 +181,13 @@ V(SC_BTTN) − V(SC_PACK) = 0.266 × [ V(BTT_N) − V(PACK_N_0V) ]
 | 项目 | 阈值 | 寄存器值 | 说明 |
 | --- | --- | --- | --- |
 | OV | 4.25 V/cell（NMC），delay 1 s | `PROTECT3=0x40`，`OV_TRIP` 动态计算 | 充电上限 4.20 V，留 50 mV 防 CV 末端误触发；数据手册范围 3.15–4.7 V |
-| UV | 2.80 V/cell（NMC），delay 4 s | `PROTECT3=0x40`，`UV_TRIP` 动态计算 | 硬件最后保护；软件 5%/0% 切断应更早；短接未用 VC 通道低于 UVMINQUAL，UV 自动忽略 |
+| UV | 2.80 V/cell（NMC），delay 4 s | `PROTECT3=0x40`，`UV_TRIP` 动态计算 | 硬件最后保护；软件在有效帧参考节 <2.8 V 时立即只关 DSG，3.0 V/2 帧恢复；正常参考节为三节最低值，VC5/BAT 异常时仅为 VC2；UV-only 时固件允许 CHG；短接未用 VC 通道低于 UVMINQUAL，UV 自动忽略 |
 | OCD | 56 mV（1.5 mΩ → 37.3 A），320 ms | `PROTECT2=0x57` | **仅放电方向**；高于 30 A 正常放电，硬件后备 |
 | SCD | 67 mV（1.5 mΩ → 44.7 A），100 µs | `PROTECT1=0x89` | RSNS=1，放电硬件短路保护 |
 
-BQ76920 **没有充电过流硬件保护，也没有可编程温度/die 保护阈值**。软件 OCP 由 `protection.c` 执行：**方向用 COMP2、幅值用 CC**（CC 极性不影响归类），充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认后锁存、双 FET 关；充电 OCP 清除要求充电器移除，放电 OCP 要求负载断开；`Protection_RequestLatchClear()` 只在 FET 全关、`|I| ≤ 500 mA` 连续 2 s 后执行。充电硬件后备仍依赖充电器限流和保险丝。包温度门控由 MCU 读取 NTC 执行：**4.0–54.0 °C 允许，2 °C 回差/2 s 去抖，充放电都收紧**；`PROT_TEMP_ENABLE=1`，TS1 转换有效才放行，转换模型仍建议现场复核。
+BQ76920 **没有充电过流硬件保护，也没有可编程温度/die 保护阈值**。软件 OCP 由 `protection.c` 执行：**方向用 COMP2、幅值用 CC**（CC 极性不影响归类），充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认后锁存、双 FET 关；充电 OCP 清除要求充电器移除，放电 OCP 要求负载断开；`Protection_RequestLatchClear()` 只在 FET 全关、`abs(I) ≤ 500 mA` 连续 2 s 后执行。充电硬件后备仍依赖充电器限流和保险丝。包温度门控由 MCU 读取 NTC 执行：**4.0–54.0 °C 允许，2 °C 回差/2 s 去抖，充放电都收紧**；`PROT_TEMP_ENABLE=1`，TS1 转换有效才放行，转换模型仍建议现场复核。
+
+软件低压分级（2026-11-12）：参考节 `<2.8 V` 立即只关 DSG、允许 CHG，`>=3.0 V` 连续 2 帧恢复；BQ UV-only 也允许 CHG 恢复。参考节<3.1 V 或 SOC<10% 连续 2 帧进入低电充电状态，默认 CHG-only 且不要求先见充电器；低电状态内 >200 mA/2 帧且≥2.8 V 才开 DSG，<120 mA 或电流无效立即关闭，2.8 V 以下绝不开放 DSG；3.1 V+SOC≥10%/2 帧退出。正常参考节为三节最低值；`log_cell3_valid==0 || log_pack_valid==0` 时保护/SOC/遥测只使用实测 VC2。MCU 复位不恢复旧 CUTOFF_LATCH；低电状态无充电器可自动 LP、按钮唤醒红灯 5 Hz。充满只是 4.15 V/98% + −20..75 mA/30 s 的白灯提示，不关 CHG；BQ OV 仍是最终硬件保护。
 
 TS1 上拉模型：BQ 在 `TEMP_SEL=1` 时内部有 10 kΩ 到约 3.3 V；若板上另有外部 10 kΩ 到 5 V，两者并联。25 °C（NTC=10 kΩ）节点电压：仅内部≈1.65 V、仅外部≈2.50 V、两者≈2.77 V。`SOC_EST_TS1_PULL_MV/OHM` 按实测等效为 `3300/10000`、`5000/10000` 或 `4150/5000`（戴维南）。当前 `PROT_TEMP_ENABLE=1`，4.0–54.0 °C 门控已生效；4 °C/54 °C 两点仍需按实际上拉模型复核，避免读数偏差导致误禁。
 

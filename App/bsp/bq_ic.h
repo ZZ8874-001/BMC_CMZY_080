@@ -57,9 +57,7 @@
 #define BQ_FET_MASK_DSG         BQ_SYS_CTRL2_DSG_ON
 #define BQ_FET_MASK_ALL         (BQ_FET_MASK_CHG | BQ_FET_MASK_DSG)
 
-/* FET 上电初值（当前用户设为全开）；ChargePolicy_Init 会请求 0，
- * 运行期实际由 ChargePolicy_Task / LP mask 接管。 */
-#define BQ_DEFAULT_FET_MASK     BQ_FET_MASK_ALL
+#define BQ_DEFAULT_FET_MASK     BQ_FET_MASK_NONE
 
 #define BQ_SYS_CTRL1_LOAD_PRESENT (1u << 7)
 
@@ -153,6 +151,7 @@ typedef struct
     uint8_t protect3;
     uint8_t log_cell3_valid;     /* 真实 VC5 通过 1..5 V 合理性检查 */
     uint8_t log_pack_valid;      /* 真实 BAT 通过范围 + 三节残差检查 */
+    uint8_t ref_cell2_only;      /* 1=VC5/BAT 不可信，保护/SOC 只看 VC2 */
     uint8_t complete;            /* 必需字段完整；optional 诊断失败不影响 */
     uint8_t quality;             /* bq_batch_class_t */
 } bq_batch_quality_t;
@@ -191,6 +190,7 @@ typedef struct
     uint8_t  reject_reason; /* bq_frame_reject_t；0=OK */
     uint8_t  log_cell3_valid; /* 真实 VC5 可信，可用于黑匣子/StateStore */
     uint8_t  log_pack_valid;  /* 真实 BAT 可信，可用于黑匣子/StateStore */
+    uint8_t  ref_cell2_only;  /* 1=VC5/BAT 不可信，保护/SOC 用 VC2 */
     uint16_t ov_trip_mv;      /* 实际写入 OV_TRIP 反算值 */
     uint16_t uv_trip_mv;      /* 实际写入 UV_TRIP 反算值 */
     uint16_t cell12_meas_mv[2]; /* 最近一次 VC1/VC2 实测，用于 OV/UV 归因 */
@@ -339,6 +339,10 @@ int BQ_WriteProtectionRaw(const uint8_t protect[3], uint8_t ov_trip,
                           uint8_t uv_trip);
 int BQ_SetTempSource(uint8_t die_temp);   /* 1=内部 die，0=外部 NTC */
 int BQ_ReadTs1RawSafe(uint16_t *raw);
+
+/* 保护/SOC 的唯一参考节：正常=三节最低值；ref_cell2_only=1 时只取 VC2。
+ * 引用无效时返回 0（调用方必须 fail-closed）。 */
+uint16_t BQ_GetRefCellMv(const bq_snapshot_t *snap);
 
 void BQ_Poll(void);
 

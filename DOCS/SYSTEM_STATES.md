@@ -1,6 +1,10 @@
 # BMC_CMZY_080 系统状态、电源/时钟/外设与状态切换
 
-> **2026-11-10 降级说明**：真实 VC5/包压不再参与控制/保护/SOC；cell3=(cell1+cell2+1)/2、pack=三节和，raw VC5/BAT 仅诊断。`bq_anomaly.c/.h`、partial/2 A OCP、9 帧/2 min/5 min 锁存、`SM_STATE_BQ_ANOMALY`、`PROTECTION_PARTIAL`、LP `-2` 均已删除；均衡永久关闭。下文涉及这些状态/路径的段落视为历史，以当前源码为准。
+> **2026-11-10 电压模式说明（已被 2026-11-12 更新，优先看下一条）**：当时真实 VC5/包压不参与控制/保护/SOC，改用合成值；2026-11-12 起，真实 VC5/BAT 可信时优先实测，异常时控制/显示用 VC1/VC2 估算，而保护/SOC/充满参考节只用实测 VC2。raw VC3/VC4 和不可信 VC5/BAT 仅作诊断；记录只写真实可信值。`bq_anomaly.c/.h`、partial/2 A OCP、9 帧/2 min/5 min 锁存、`SM_STATE_BQ_ANOMALY`、`PROTECTION_PARTIAL`、LP `-2` 均已删除；均衡永久关闭。下文涉及这些状态/路径的段落视为历史，以当前源码为准。
+>
+> **2026-11-12 低压/充满/LED**：`Protection` 增加 2.8 V 单节硬欠压（电压-only，立即只关 DSG，3.0 V/2 帧恢复）、BQ UV-only 的 CHG 例外、3.1 V/SOC10 低电状态和 RAM-only 充满提示（4.15 V 或 SOC≥98% + ≤75 mA/30 s，白灯，不关 CHG）。`SOC_EST_CAL_VALID=1`；低电状态默认 CHG-only，>200 mA/2 帧且≥2.8 V 才开 DSG，<120 mA 或电流无效立即关；3.1 V+SOC≥10%/2 帧退出。MCU 复位不恢复旧锁存。NORM RGB 增加低电红色 64/5 Hz；普通 SOC 仍红-黄-绿渐变：STANDBY 5 Hz/约 60%、DISCHARGE 常亮/95%、CHARGE 1 Hz/95%、充满白色 38/38/38 常亮。
+>
+> **VC2-only 降级**：已发布帧 `log_cell3_valid==0 || log_pack_valid==0` 时，`BQ_GetRefCellMv()` 返回实测 VC2；MCU 2.8 V/低电/SOC/SOH/D 帧和 BQ OV/UV 状态过滤均改为只比较 VC2。正常帧仍用三节最低值。VC2 无效时保留 raw OV/UV 并 fail-closed；BQ 硬件比较器仍会动作。下文旧 LED 颜色/静态绿蓝、`SM_STATE_BQ_ANOMALY`、`PROTECTION_PARTIAL` 等描述按当前源码视为历史。
 >
 > **范围**：当前工作树的复位式 LP、M2 保护监督；以实际集成后的源码与宏为准，不将旧构建或上板记录视为本次修改的验证。
 >
@@ -589,21 +593,24 @@ S5 是 `App_Init()` 完成、`POWER_STATE_NORM`、TIM2 250 Hz 已启动后的稳
 
 | 状态                  | 条件/动作                                                                             | 影响                                                                                       |
 | ----------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `SM_STATE_BOOT`       | `StateMachine_Init()`；无新真实 FULL；自检恢复期                                      | BOOT 蓝色 RGB/PB4；冷启动自检通过后仍蓝闪至少 2 s，直到真实 FULL；部分电压异常可叠加 HOT。 |
-| `SM_STATE_NORM`       | 真实 BQ 帧 fresh；无关键 fault                                                        | NORM；flow 由比较器/策略决定 CHARGING/DISCHARGING/STANDBY。                                |
-| `SM_STATE_BQ_ANOMALY` | 新批严格判为 PARTIAL_VC5_PACK，且无更高优先级 fault                                   | PB3/HOT 闪烁、RGB 不因部分电压异常切红；策略/保护只按经验证的有条件窗口决定是否放电。      |
-| `SM_STATE_FAULT`      | 真实 critical fault（BQ_COMM/XREADY/OV/UV/SCD/OCD/ADC_STUCK/PROTECTION/POWER/CLK 等） | FAULT PB3 5 Hz + RGB 红；策略 FAULT、双 FET 关；优先于 BQ_ANOMALY。                        |
+| `SM_STATE_BOOT`       | `StateMachine_Init()`；无新真实 FULL；自检恢复期                                      | BOOT 蓝 RGB 64/1 Hz + PB4；冷启动自检通过后仍至少 2 s。                                   |
+| `SM_STATE_NORM`       | 真实 BQ 帧 fresh；无关键 fault                                                        | NORM；flow 由比较器/策略决定 CHARGING/DISCHARGING/STANDBY；RGB 按 SOC 渐变。              |
+| `SM_STATE_BQ_ANOMALY` | **已删除（2026-11-10）**，不再存在此状态                                             | 旧部分电压异常路径/字段仅历史，不在当前 UI/策略中。                                       |
+| `SM_STATE_FAULT`      | critical 掩码：BQ_COMM/XREADY/SCD/OCD/ADC_STUCK/PROTECTION/POWER/CLK；不含 BQ OV/UV 本身 | FAULT PB3 5 Hz + RGB 红；策略 FAULT、双 FET 关。BQ UV-only 不进入此状态，保持 NORMAL/CHG。 |
 
 #### Protection 监督层（M2）
 
 
 | 状态/条件             | 动作                                                   | 影响                                                                                                                                                                     |
 | ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PROTECTION_INIT`     | 上电/数据未就绪                                        | `allow=0`，等首帧和配置完成。                                                                                                                                            |
-| `PROTECTION_NORMAL`   | 无 BQ 锁存、无软件 OCP、数据有效                       | `allow=0x03`；`PROT_TEMP_ENABLE=1` 时按 4–54 °C 包温度门控收紧 CHG/DSG。                                                                                                 |
-| `PROTECTION_PARTIAL`  | 严格 `BQ_BATCH_PARTIAL_VC5_PACK` 且无硬件/通信真实故障 | 默认 `allow=0`；只有本次曾通过真实 FULL/自检、最近 FULL <20 s、新 CC 与 COMP2/控制/保护证据持续可靠时，可限时放电；部分期 2 A/两次新 CC 转换 OCP。其它 M2 禁止条件优先。 |
-| `PROTECTION_RECOVERY` | boot/LP 首次配置前已锁存 SCD/OCD                       | `allow=0`；BQ RUN/idle、FET 全关、`                                                                                                                                      |
-| `PROTECTION_LATCHED`  | BQ 运行期锁存、清除失败、软件 OCP                      | `allow=0`、`FAULT_BIT_PROTECTION`；软件 OCP 只接受 `Protection_RequestLatchClear()`。                                                                                    |
+| `PROTECTION_INIT`     | 上电/数据未就绪                                        | `allow=0`，等首帧和配置完成。                                                                                                                             |
+| `PROTECTION_NORMAL`   | 无硬锁存/软件 OCP、数据有效                            | 通常 `allow=0x03`，再按 4–54 °C 温度、2.8 V/低电状态叠加；BQ UV-only 时 `allow=0x01`。                                                                   |
+| `PROTECTION_PARTIAL`  | **已删除**                                             | 旧部分电压路径不存在。                                                                                                                                     |
+| `PROTECTION_RECOVERY` | boot/LP 首次配置前已锁存 SCD/OCD                       | `allow=0`；满足 BQ RUN/idle、FET 全关、`abs(I)≤500 mA` 2 s 后自动清除。                                                                                      |
+| `PROTECTION_LATCHED`  | BQ OV/SCD/OCD 或 UV+其它硬锁存、清除失败、软件 OCP     | `allow=0`、`FAULT_BIT_PROTECTION`；软件 OCP 只接受 `Protection_RequestLatchClear()`。                                                                     |
+| MCU 2.8 V cell UV     | 有效帧参考节 <2800 mV，单帧；正常为三节最低值，VC5/BAT 异常时 VC2 | 仅 DSG off、CHG 可；≥3000 mV 两帧恢复；不置 PROTECTION fault/FAULT UI；事件 0x26/0x27。                                                                   |
+| 低电充电状态           | 参考节<3.1 V 或 SOC<10%，2 新帧；不限制 IDLE/DISCHARGE/CHARGE | `CHARGE_POLICY_LOW_BATTERY_CHARGE`，默认 CHG-only且不需先见充电器；>200 mA/2 帧且≥2.8 V 才开 DSG，<120 mA/无效立即关；3.1 V+SOC≥10%/2 帧退出；无充电器可自动 LP，按钮唤醒红灯 5 Hz；不持久化。 |
+| 充满提示              | CHARGE + 参考节≥4.15 V 或标定 SOC≥98%，且 -20..75 mA/30 s | `charge_full`、白灯、事件 0x28；不改变 allow/不关 CHG；充电器移除或 >150 mA 两帧清除。                                                                     |
 | 软件充电 OCP          | CC 充电方向 ≥5.5 A，持续 1 s，至少 2 个新发布帧        | 锁存双 FET 关；事件 0x1C；清除额外要求充电器移除。                                                                                                                       |
 | 软件放电 OCP          | CC 放电方向 ≥33 A，持续 500 ms，至少 2 个新发布帧      | 锁存双 FET 关；事件 0x1D；BQ 37.3 A OCD/44.7 A SCD 是硬件后备。                                                                                                          |
 | 温度 inhibit          | 包温度 <4 °C 或 >54 °C，2 s 去抖、2 °C 回差；无效传感器 2 s | 充电和放电都收紧（无效则双禁）；不锁存、不置 PROTECTION；`PROT_TEMP_ENABLE=1`；`FAULT_BIT_TEMP` 报传感器无效。                                                          |

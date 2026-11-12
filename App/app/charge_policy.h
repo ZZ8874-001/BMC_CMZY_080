@@ -1,10 +1,11 @@
 /**
  ******************************************************************************
  * @file    charge_policy.h
- * @brief   充放电策略层：CHARGE/DISCHARGE/CAL + FET 请求。
+ * @brief   充放电策略层：IDLE/CHARGE/DISCHARGE/CAL/FAULT + 低电充电。
  *
- * 异常部分电压放电只允许 DSG，且必须通过 Protection 独立 CC 门控；
- * CHARGE/CAL 继续使用现有完整 BQ fresh、自检和保护条件。
+ * 低电充电状态默认 CHG-only，不依赖先检测充电器；>200 mA/2 帧且参考节
+ * >=2.8 V 才在状态内请求 DSG，<120 mA 或电流无效立即回 CHG-only。
+ * 2.8 V 以下绝不开放 DSG；所有请求仍与 Protection 允许掩码相与。
  ******************************************************************************
  */
 #ifndef APP_CHARGE_POLICY_H
@@ -18,7 +19,8 @@ typedef enum
     CHARGE_POLICY_CHARGE,
     CHARGE_POLICY_DISCHARGE,
     CHARGE_POLICY_CAL,
-    CHARGE_POLICY_FAULT
+    CHARGE_POLICY_FAULT,
+    CHARGE_POLICY_LOW_BATTERY_CHARGE
 } charge_policy_state_t;
 
 typedef enum
@@ -37,8 +39,11 @@ typedef struct
 {
     int32_t  charge_current_ma;
     uint16_t soc01;
+    uint16_t ref_cell_mv;      /* 正常最低节/VC2-only 参考节 */
+    uint32_t current_ms;       /* 新 BQ/CC 样本时间戳，200 mA 去抖 */
     uint8_t  current_valid;
     uint8_t  soc_valid;
+    uint8_t  ref_valid;
 } charge_policy_input_t;
 
 void ChargePolicy_Init(void);          /* 清零并 BQ_RequestFetMask(0) */
@@ -56,6 +61,7 @@ uint8_t ChargePolicy_GetBodyDiodeMode(void);
 uint8_t ChargePolicy_GetChargeCurrentHold(void);
 uint8_t ChargePolicy_GetDischargeChargeDetect(void);
 uint32_t ChargePolicy_GetDischargeChargeDetectCount(void);
+uint8_t ChargePolicy_GetLowBattDsgOn(void);
 charge_policy_cal_end_t ChargePolicy_GetCalEndReason(void);
 
 #endif /* APP_CHARGE_POLICY_H */

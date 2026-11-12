@@ -318,5 +318,10 @@
         "command": "arm-none-eabi-gcc -c -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DUSE_HAL_DRIVER -DSTM32L432xx -DPOWER_LP_KEEP_SWD=0 -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include -IApp -IApp/bsp -IApp/comm -IApp/app -IApp/detect -IApp/detect/bms -Og -Wall -fdata-sections -ffunction-sections -g -gdwarf-2 -MMD -MP -MF\"build/app_log.d\" -Wa,-a,-ad,-alms=build/app_log.lst App/comm/app_log.c -o build/app_log.o",
         "directory": "c:/Users/Shuchen Tao/Documents/BMC_CMZY_080",
         "file": "c:\\Users\\Shuchen Tao\\Documents\\BMC_CMZY_080\\App\\comm\\app_log.c"
+    },
+    {
+        "command": "arm-none-eabi-gcc -c -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -DUSE_HAL_DRIVER -DSTM32L432xx -DPOWER_LP_KEEP_SWD=0 -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include -IApp -IApp/bsp -IApp/comm -IApp/app -IApp/detect -IApp/detect/bms -Og -Wall -fdata-sections -ffunction-sections -g -gdwarf-2 -MMD -MP -MF\"build/app_telemetry.d\" -Wa,-a,-ad,-alms=build/app_telemetry.lst App/comm/app_telemetry.c -o build/app_telemetry.o",
+        "directory": "c:/Users/Shuchen Tao/Documents/BMC_CMZY_080",
+        "file": "c:\\Users\\Shuchen Tao\\Documents\\BMC_CMZY_080\\App\\comm\\app_telemetry.c"
     }
 ]

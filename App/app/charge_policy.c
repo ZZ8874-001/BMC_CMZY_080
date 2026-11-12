@@ -38,6 +38,15 @@
 #define CHARGE_POLICY_NEAR_FULL_SOC01         9000u
 #define CHARGE_POLICY_NEAR_FULL_EXIT_SOC01    8500u
 
+/* 低电充电状态：参考节<3.1 V 或 SOC<10% 进入（由 Protection 统一判定）；
+ * 默认 CHG-only。只有 >200 mA 连续两帧且参考节>=2.8 V 才打开 DSG；
+ * <120 mA 或电流无效立即关闭。 */
+#define CHARGE_POLICY_LOW_BATT_DSG_ON_MA       200
+#define CHARGE_POLICY_LOW_BATT_DSG_OFF_MA      120
+#define CHARGE_POLICY_LOW_BATT_MIN_MV          2800u
+#define CHARGE_POLICY_LOW_BATT_ON_FRAMES       2u
+#define CHARGE_POLICY_LOW_BATT_LP_CURRENT_MA   30
+
 /* DISCHARGE 进入后的前 10 s：净充电电流 >=100 mA 视为外部设备正在充电，
  * 直接切 CHARGE；<=90 mA 释放（10 mA 回差）。输入与 CHARGE 电流判据相同。 */
 #define CHARGE_POLICY_DISCHARGE_CHARGE_WINDOW_MS 10000u
@@ -63,6 +72,11 @@ static struct
     uint8_t charge_current_hold;
     uint8_t body_diode_mode;
     uint8_t discharge_charge_detect;
+
+    /* 低电充电状态。 */
+    uint8_t  low_batt_dsg_on;
+    uint8_t  low_batt_dsg_streak;
+    uint32_t low_batt_current_ms;
 
     uint8_t cal_pending;
     uint8_t cal_active;
@@ -103,6 +117,64 @@ static uint8_t ChargePolicy_CalReady(uint32_t now_ms)
                      (BQ_GetState() == BQ_ST_RUN) &&
                      (BQ_IsFresh(now_ms) != 0u) &&
                      (PowerMode_GetState() == POWER_STATE_NORM));
+}
+
+/* 低电充电不依赖 SelfTest/正常充放准入：低电压本身可能让 BQ_DATA 自检失败，
+ * 但 CHG 仍必须可以探测/恢复。真实保护锁存仍由 Protection allow 拒绝。 */
+static uint8_t ChargePolicy_LowBattReady(uint32_t now_ms,
+                                         const charge_policy_input_t *in)
+{
+    return (uint8_t)((in != NULL) && (in->ref_valid != 0u) &&
+                     (StateMachine_GetState() != SM_STATE_FAULT) &&
+                     (BQ_GetState() == BQ_ST_RUN) &&
+                     (BQ_IsFresh(now_ms) != 0u) &&
+                     (BQ_IsRecovering() == 0u) &&
+                     (BQ_GetAdcRecoveryFailed() == 0u) &&
+                     (PowerMode_GetState() == POWER_STATE_NORM) &&
+                     (Protection_GetState() == PROTECTION_NORMAL));
+}
+
+/* 只在低电状态内维护 DSG 的 200/120 mA 窗口。 */
+static void ChargePolicy_UpdateLowBattDsg(const charge_policy_input_t *in)
+{
+    if ((in == NULL) || (in->current_valid == 0u) ||
+        (in->ref_valid == 0u) ||
+        (in->ref_cell_mv < CHARGE_POLICY_LOW_BATT_MIN_MV))
+    {
+        s_policy.low_batt_dsg_on = 0u;
+        s_policy.low_batt_dsg_streak = 0u;
+        return;
+    }
+
+    if (in->current_ms == s_policy.low_batt_current_ms)
+    {
+        if (in->charge_current_ma < CHARGE_POLICY_LOW_BATT_DSG_OFF_MA)
+        {
+            s_policy.low_batt_dsg_on = 0u;
+            s_policy.low_batt_dsg_streak = 0u;
+        }
+        return;
+    }
+    s_policy.low_batt_current_ms = in->current_ms;
+
+    if (in->charge_current_ma < CHARGE_POLICY_LOW_BATT_DSG_OFF_MA)
+    {
+        s_policy.low_batt_dsg_on = 0u;
+        s_policy.low_batt_dsg_streak = 0u;
+    }
+    else if (in->charge_current_ma > CHARGE_POLICY_LOW_BATT_DSG_ON_MA)
+    {
+        if (s_policy.low_batt_dsg_streak < 0xFFu)
+        {
+            s_policy.low_batt_dsg_streak++;
+        }
+        if (s_policy.low_batt_dsg_streak >=
+            CHARGE_POLICY_LOW_BATT_ON_FRAMES)
+        {
+            s_policy.low_batt_dsg_on = 1u;
+        }
+    }
+    /* 120–200 mA 保持上一状态。 */
 }
 
 /* DISCHARGE 前 10 s 的外部充电兜底；闩锁只在本状态窗口内有效。 */
@@ -191,8 +263,11 @@ static void ChargePolicy_SetState(charge_policy_state_t new_state,
 
     if (new_state != CHARGE_POLICY_CHARGE)
     {
-        s_policy.charge_current_hold = 0u;
         s_policy.body_diode_mode = 0u;
+        if (new_state != CHARGE_POLICY_LOW_BATTERY_CHARGE)
+        {
+            s_policy.charge_current_hold = 0u;
+        }
     }
     s_policy.discharge_charge_detect = 0u;
 
@@ -233,6 +308,9 @@ void ChargePolicy_Init(void)
     s_policy.charge_current_hold = 0u;
     s_policy.body_diode_mode = 0u;
     s_policy.discharge_charge_detect = 0u;
+    s_policy.low_batt_dsg_on = 0u;
+    s_policy.low_batt_dsg_streak = 0u;
+    s_policy.low_batt_current_ms = 0u;
     s_policy.cal_pending = 0u;
     s_policy.cal_active = 0u;
     s_policy.cal_mode = 0u;
@@ -264,9 +342,12 @@ void ChargePolicy_OnPairHold3(uint32_t now_ms)
     if ((s_policy.state == CHARGE_POLICY_FAULT) ||
         (s_policy.state == CHARGE_POLICY_CAL) ||
         (s_policy.state == CHARGE_POLICY_CHARGE) ||
+        (s_policy.state == CHARGE_POLICY_LOW_BATTERY_CHARGE) ||
         (s_policy.cal_mode != 0u) ||
         (s_policy.cal_active != 0u) ||
         (s_policy.charger_present != 0u) ||
+        (Protection_IsCellUvActive() != 0u) ||
+        (Protection_IsSocCutoffLatched() != 0u) ||
         (ChargePolicy_NormalReady(now_ms) == 0u))
     {
         s_policy.pair_reject_count++;
@@ -290,6 +371,9 @@ void ChargePolicy_OnLpWake(uint32_t now_ms)
     s_policy.charge_current_hold = 0u;
     s_policy.body_diode_mode = 0u;
     s_policy.discharge_charge_detect = 0u;
+    s_policy.low_batt_dsg_on = 0u;
+    s_policy.low_batt_dsg_streak = 0u;
+    s_policy.low_batt_current_ms = 0u;
     s_policy.cal_pending = 0u;
 
     if ((s_policy.cal_mode != 0u) || (s_policy.cal_active != 0u))
@@ -349,7 +433,8 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
 
     /* MOS 导通后 COMP2 差模只有 I×(Rshunt+Rds_on)×0.266；100 mA 时约 0.3 mV。
      * CHARGE 中充电电流 >30 mA 置位电流保持，<20 mA 释放，20–30 mA 回差。 */
-    if ((s_policy.state == CHARGE_POLICY_CHARGE) &&
+    if (((s_policy.state == CHARGE_POLICY_CHARGE) ||
+         (s_policy.state == CHARGE_POLICY_LOW_BATTERY_CHARGE)) &&
         (s_policy.current_valid != 0u))
     {
         if (s_policy.charge_current_ma > CHARGE_POLICY_CURRENT_HOLD_MA)
@@ -370,7 +455,8 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
         s_policy.charge_current_hold = 0u;
     }
 
-    current_hold = ((s_policy.state == CHARGE_POLICY_CHARGE) &&
+    current_hold = (((s_policy.state == CHARGE_POLICY_CHARGE) ||
+                     (s_policy.state == CHARGE_POLICY_LOW_BATTERY_CHARGE)) &&
                     (s_policy.charge_current_hold != 0u)) ? 1u : 0u;
 
     ChargePolicy_UpdateDischargeChargeDetect(now_ms);
@@ -491,6 +577,42 @@ void ChargePolicy_Task(uint32_t now_ms, uint8_t comp_charging,
         s_policy.cal_end_reason = CHARGE_POLICY_CAL_END_USER;
     }
     s_policy.cal_pending = 0u;
+
+    /* 亏电充电：CHG 默认常开，不等待 charger_present，打破
+     * “CHG 关 → 无电流 → 检测不到充电器”的死锁。 */
+    if ((Protection_IsLowBattery() != 0u) ||
+        (Protection_IsCellUvActive() != 0u))
+    {
+        s_policy.user_discharge_enabled = 0u;
+
+        if (ChargePolicy_LowBattReady(now_ms, in) != 0u)
+        {
+            ChargePolicy_UpdateLowBattDsg(in);
+            ChargePolicy_RequestMask((s_policy.low_batt_dsg_on != 0u) ?
+                                     BQ_FET_MASK_ALL : BQ_FET_MASK_CHG);
+            ChargePolicy_SetState(CHARGE_POLICY_LOW_BATTERY_CHARGE,
+                                  now_ms, 0u);
+            s_policy.lp_block =
+                ((s_policy.charger_present != 0u) ||
+                 (s_policy.low_batt_dsg_on != 0u) ||
+                 ((in != NULL) && (in->current_valid != 0u) &&
+                  (in->charge_current_ma >
+                   CHARGE_POLICY_LOW_BATT_LP_CURRENT_MA))) ? 1u : 0u;
+        }
+        else
+        {
+            s_policy.low_batt_dsg_on = 0u;
+            s_policy.low_batt_dsg_streak = 0u;
+            ChargePolicy_RequestMask(BQ_FET_MASK_NONE);
+            ChargePolicy_SetState(CHARGE_POLICY_LOW_BATTERY_CHARGE,
+                                  now_ms, 0u);
+            s_policy.lp_block = (s_policy.charger_present != 0u) ? 1u : 0u;
+        }
+        return;
+    }
+
+    s_policy.low_batt_dsg_on = 0u;
+    s_policy.low_batt_dsg_streak = 0u;
 
     /* 正常充放状态。 */
     if (ChargePolicy_NormalReady(now_ms) != 0u)
@@ -647,6 +769,11 @@ uint8_t ChargePolicy_GetDischargeChargeDetect(void)
 uint32_t ChargePolicy_GetDischargeChargeDetectCount(void)
 {
     return s_policy.discharge_charge_detect_count;
+}
+
+uint8_t ChargePolicy_GetLowBattDsgOn(void)
+{
+    return s_policy.low_batt_dsg_on;
 }
 
 charge_policy_cal_end_t ChargePolicy_GetCalEndReason(void)

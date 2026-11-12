@@ -4,12 +4,13 @@
  * @brief   li-ion-soc-soh-toolkit 适配层：BQ 快照 -> SOC/SOH -> NVM。
  *
  * 约定：
- *   - 输入只使用三节中的最低节电压（库是 1S 模型）和 BQ CC 电流；
+ *   - 输入使用 BQ 参考节（正常三节最低值；VC5/BAT 异常时仅 VC2）
+ *     和 BQ CC 电流；
  *   - 只在 BQ 快照时间戳变化时喂一帧（约 500 ms）；
  *   - TS1 温度按 MF52（10 kΩ，B=3950）+ 10 kΩ 上拉到 5 V 换算；
  *     实际上拉不同时修改 SOC_EST_TS1_PULL_MV/OHM 和 NTC 表；
- *   - 三元锂（NMC）标定完成前 SOC_EST_CAL_VALID=0，SocEst_IsValid() 返回 0，
- *     SOC 只能显示/记录，不能单独作为 5%/0% 硬保护依据。
+ *   - SOC_EST_CAL_VALID=1 允许 SOC/SOH 参与 3.1 V 低电判断和显示；
+ *     OCV/tau 仍有占位成分，2.8 V 电压硬保护仍是独立兜底。
  ******************************************************************************
  */
 #ifndef APP_SOC_EST_H
@@ -20,8 +21,9 @@
 #include "board.h"
 #include "bsp/bq_ic.h"
 
-/* 标定完成前保持 0；NMC 表目前是典型值占位。 */
-#define SOC_EST_CAL_VALID            0u
+/* 当前 NMC 1500 mAh 的 SOC/SOH 已允许参与低电判断；2.8 V 电压硬保护
+ * 仍是独立兜底，不能仅凭 SOC 关闭/开放放电。 */
+#define SOC_EST_CAL_VALID            1u
 
 /* TS1 NTC：MF52（10 kΩ @25°C，B=3950），10 kΩ 上拉到 5 V。
  * 若实际改成 3.3 V/VC1 或不同上拉，只改这两个值和 NTC 表。 */
@@ -42,7 +44,7 @@ typedef struct
 {
     uint8_t  frame_valid;      /* 仅完整真实 BQ 帧可用于通常的算法/保护 */
     uint8_t  temp_valid;       /* TS1 温度换算有效（无新 TS1 则为 0） */
-    uint8_t  cal_valid;        /* NMC 标定有效（当前固定 0） */
+    uint8_t  cal_valid;        /* 标定标记（当前 =SOC_EST_CAL_VALID，OCV/tau 仍有占位） */
     soc_est_quality_t quality; /* 本次 SOC 更新所用电压的来源 */
     uint8_t  soc_estimated;    /* 历史估算标志；正常真实帧静置重同步后清零 */
     int32_t  soc01;            /* 0..10000 */
@@ -50,6 +52,8 @@ typedef struct
     int16_t  temp_dc;          /* 0.1 °C */
     uint16_t cell_mv[3];
     uint16_t pack_mv;
+    uint16_t ref_cell_mv;      /* 保护/SOC 参考节：正常最低节，异常 VC2 */
+    uint8_t  ref_cell2_only;   /* 1=VC5/BAT 不可信，SOC/SOH 只用 VC2 */
     uint16_t ts1_raw;
     uint16_t ts1_mv;
     int32_t  current_ma;

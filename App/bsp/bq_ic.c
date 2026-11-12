@@ -221,6 +221,9 @@ static struct
     uint16_t log_pack_mv;       /* 真实 BAT 可信值，否则 0 */
     uint8_t log_cell3_valid;
     uint8_t log_pack_valid;
+    uint8_t ref_cell2_only;     /* 已发布：VC5/BAT 不可信，保护/SOC 只看 VC2 */
+    uint8_t run_ref_cell2_only; /* 当前 RUN 批次的过滤决策 */
+    uint8_t ref_decision_final; /* 当前批次 VC5/BAT 证据已确认 */
     uint8_t cell12_meas_valid;  /* 最近一次 VC1/VC2 换算值在 1..5 V */
     uint8_t cell12_measured_once;
     uint16_t cell12_meas_mv[2]; /* 最近一次 VC1/VC2 实测 mV（OV/UV 过滤用） */
@@ -575,6 +578,47 @@ static void Bq_SelectControlVoltages(uint16_t c1, uint16_t c2,
     *pack_mv = pack;
 }
 
+/* 计算真实 VC5/BAT 的记录值，并返回“保护/SOC 是否应只使用 VC2”。
+ * 这里只使用本批 raw/CRC 证据，绝不读取 sys_stat/quality，避免过滤环。 */
+static uint8_t Bq_EvaluateRealC3Pack(uint16_t raw_c3, uint16_t raw_pack,
+                                     uint8_t c3_field_ok, uint8_t pack_field_ok,
+                                     uint16_t c1, uint16_t c2,
+                                     uint16_t *log_cell3_mv, uint16_t *log_pack_mv,
+                                     uint8_t *log_cell3_valid, uint8_t *log_pack_valid)
+{
+    uint32_t real_c3 = Bq_RawToMv(raw_c3);
+    uint32_t real_pack = Bq_RawPackToMv(raw_pack);
+    int32_t residual;
+
+    *log_cell3_mv = 0u;
+    *log_pack_mv = 0u;
+    *log_cell3_valid = 0u;
+    *log_pack_valid = 0u;
+
+    if ((c3_field_ok != 0u) &&
+        (real_c3 >= BQ_CELL_VALID_MIN_MV) &&
+        (real_c3 <= BQ_CELL_VALID_MAX_MV))
+    {
+        *log_cell3_valid = 1u;
+        *log_cell3_mv = (uint16_t)real_c3;
+    }
+    if ((*log_cell3_valid != 0u) && (pack_field_ok != 0u) &&
+        (real_pack >= BQ_PACK_VALID_MIN_MV) &&
+        (real_pack <= BQ_PACK_VALID_MAX_MV))
+    {
+        residual = (int32_t)real_pack -
+                   ((int32_t)c1 + (int32_t)c2 + (int32_t)real_c3);
+        if ((residual <= BQ_PACK_SUM_TOL_MV) &&
+            (residual >= -BQ_PACK_SUM_TOL_MV))
+        {
+            *log_pack_valid = 1u;
+            *log_pack_mv = (uint16_t)real_pack;
+        }
+    }
+
+    return (uint8_t)((*log_cell3_valid == 0u) || (*log_pack_valid == 0u));
+}
+
 /* SCD/OCD 是硬件比较器，和 ADC 建立无关，任何 SYS_STAT 读取都要立即更新。 */
 static void Bq_UpdateFastFaults(uint8_t stat)
 {
@@ -616,13 +660,15 @@ static void Bq_UpdateVoltageFaults(uint8_t stat)
     Fault_SetLive(live);
 }
 
-/* 本板 VC5 不可信，BQ 的 OV/UV 是全局锁存、无法区分哪一节。
+/* BQ 的 OV/UV 是全局锁存，无法区分哪一节；本板 VC5/BAT 还可能异常。
  * 规则：
  *   - 首个完整 VC1/VC2 读取前：屏蔽 OV/UV（硬件 FET 保护仍生效）。
- *   - VC1/VC2 读取无效或数值超出 1..5 V：无法证明安全，按原始 OV/UV 处理。
- *   - VC1/VC2 都在 1..5 V：OV 侧 max(c1,c2) <= trip-50、UV 侧
- *     min(c1,c2) >= trip+100 时屏蔽对应位；否则保留（真实保护）。
- * 合成 cell3 位于 c1/c2 之间，因此 c1/c2 安全即证明合成 cell3 安全。 */
+ *   - VC5/BAT 不可信（run_ref_cell2_only）：只校验 VC2；VC2 在 1..5 V 时
+ *     按 VC2 判断 OV/UV，VC2 无效则保留原始锁存。
+ *   - 正常模式：VC1/VC2 都在 1..5 V 时，OV 侧 max(c1,c2) <= trip-20 mV、
+ *     UV 侧 min(c1,c2) >= trip+20 mV 才屏蔽对应位。
+ * 锁存归属只用 VC1/VC2 作为可验证证据；真实 VC5 不参与该过滤，BQ 硬件
+ * 比较器仍会在真实过压/欠压时动作并重新锁存。 */
 static uint8_t Bq_FilterHwOvUv(uint8_t raw)
 {
     uint8_t eff = raw;
@@ -655,6 +701,28 @@ static uint8_t Bq_FilterHwOvUv(uint8_t raw)
         /* 首个有效 cell1/2 批次前：不能把 VC5 假锁存当故障上报。 */
         return (uint8_t)(raw & (uint8_t)~(BQ_SYS_STAT_OV | BQ_SYS_STAT_UV));
     }
+
+    if (s_bq.run_ref_cell2_only != 0u)
+    {
+        /* cell3/pack 异常时只信任 VC2；VC2 无效必须保留原始锁存。 */
+        if ((c2 < BQ_CELL_VALID_MIN_MV) || (c2 > BQ_CELL_VALID_MAX_MV))
+        {
+            return raw;
+        }
+        if (c2 <=
+            ((s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV) ?
+             (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u))
+        {
+            eff &= (uint8_t)~BQ_SYS_STAT_OV;
+        }
+        if ((uint32_t)c2 >=
+            ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV))
+        {
+            eff &= (uint8_t)~BQ_SYS_STAT_UV;
+        }
+        return eff;
+    }
+
     if ((c1 < BQ_CELL_VALID_MIN_MV) || (c1 > BQ_CELL_VALID_MAX_MV) ||
         (c2 < BQ_CELL_VALID_MIN_MV) || (c2 > BQ_CELL_VALID_MAX_MV))
     {
@@ -678,14 +746,16 @@ static uint8_t Bq_FilterHwOvUv(uint8_t raw)
 }
 
 /* 用 raw_sys_stat 重新计算有效 sys_stat、故障位和待清锁存。
- * 只有已经取得可信 VC1/VC2 且本侧安全时才安排清 SYS_STAT 的 OV/UV。 */
+ * 只有本批 VC5/BAT 证据已最终确认、且当前参考节有效时，才安排清
+ * SYS_STAT 的假 OV/UV；读过程中的暂态决策不得清真实锁存。 */
 static void Bq_RefreshEffectiveSysStat(void)
 {
     uint8_t raw = s_bq.raw_sys_stat;
     uint8_t eff = Bq_FilterHwOvUv(raw);
 
     s_bq.sys_stat = eff;
-    if ((s_bq.cell12_measured_once != 0u) && (s_bq.cell12_meas_valid != 0u))
+    if ((s_bq.ref_decision_final != 0u) &&
+        (s_bq.cell12_measured_once != 0u) && (s_bq.cell12_meas_valid != 0u))
     {
         if (((raw & BQ_SYS_STAT_OV) != 0u) && ((eff & BQ_SYS_STAT_OV) == 0u))
         {
@@ -1079,6 +1149,9 @@ static void Bq_PublishFrame(const uint16_t cells[3], uint16_t pack)
     s_bq.log_pack_mv = s_bq.batch.log_pack_mv;
     s_bq.log_cell3_valid = s_bq.batch.log_cell3_valid;
     s_bq.log_pack_valid = s_bq.batch.log_pack_valid;
+    s_bq.ref_cell2_only = s_bq.batch.ref_cell2_only;
+    s_bq.run_ref_cell2_only = s_bq.batch.ref_cell2_only;
+    s_bq.ref_decision_final = 1u;
     s_bq.max_cell_mv = (cells[0] >= cells[1]) ? cells[0] : cells[1];
     if (cells[2] > s_bq.max_cell_mv)
     {
@@ -1154,7 +1227,6 @@ static uint8_t Bq_FinishRunBatch(void)
     uint8_t config_ok;
     uint32_t real_c3;
     uint32_t real_pack;
-    int32_t residual;
 
     b->batch_seq++;
     b->batch_ms = s_bq.now_ms;
@@ -1189,6 +1261,7 @@ static uint8_t Bq_FinishRunBatch(void)
     b->log_pack_mv = 0u;
     b->log_cell3_valid = 0u;
     b->log_pack_valid = 0u;
+    b->ref_cell2_only = 0u;
 
     if ((s_bq.run_failed != 0u) ||
         ((s_bq.run_crc_mask & BQ_FIELD_REQUIRED) != BQ_FIELD_REQUIRED) ||
@@ -1234,6 +1307,27 @@ static uint8_t Bq_FinishRunBatch(void)
     {
         b->field_ok_mask |= BQ_FIELD_TS1;
     }
+
+    /* 先用本批 raw VC5/BAT 决定参考节，再过滤本批有效 OV/UV。
+     * 这样虚假低 VC1 不会先把状态判成 INVALID，也不会形成
+     * filter -> sys_stat -> quality -> filter 的循环。 */
+    b->ref_cell2_only = Bq_EvaluateRealC3Pack(
+        b->raw_cell[2], b->raw_pack,
+        (uint8_t)(((b->field_ok_mask & BQ_FIELD_VC5) != 0u) ? 1u : 0u),
+        (uint8_t)(((b->field_ok_mask & BQ_FIELD_BAT) != 0u) ? 1u : 0u),
+        b->cell_mv[0], b->cell_mv[1],
+        &b->log_cell3_mv, &b->log_pack_mv,
+        &b->log_cell3_valid, &b->log_pack_valid);
+    if ((b->field_ok_mask & (BQ_FIELD_VC1 | BQ_FIELD_VC2)) !=
+        (BQ_FIELD_VC1 | BQ_FIELD_VC2))
+    {
+        b->ref_cell2_only = 0u;
+    }
+    s_bq.run_ref_cell2_only = b->ref_cell2_only;
+    s_bq.ref_decision_final = 1u;
+    Bq_RefreshEffectiveSysStat();
+    b->sys_stat = s_bq.sys_stat;
+
     /* STATUS: 首尾两次 CRC，任一读取有保护/XREADY/ALERT 均不能部分放行。
      * CC_READY 是 CC 转换标志，不是保护；脚本中写 1 清零。 */
     status_ok = (((b->sys_stat & BQ_BATCH_FAULT_MASK) == 0u) &&
@@ -1266,34 +1360,9 @@ static uint8_t Bq_FinishRunBatch(void)
     {
         b->field_ok_mask |= BQ_FIELD_CC;
     }
-    /* 控制值：真实 VC5/BAT 可信时优先实测，否则用 VC1/VC2 估算。
-     * 日志值：真实可信时记录实测，否则 0；估算值不进入 log_*。 */
+    /* 控制值逐字段优先真实值；日志值保持上面的 real-or-0。 */
     real_c3 = Bq_RawToMv(b->raw_cell[2]);
     real_pack = Bq_RawPackToMv(b->raw_pack);
-    if (((b->field_ok_mask & BQ_FIELD_VC5) != 0u) &&
-        (real_c3 >= BQ_CELL_VALID_MIN_MV) &&
-        (real_c3 <= BQ_CELL_VALID_MAX_MV))
-    {
-        b->log_cell3_valid = 1u;
-        b->log_cell3_mv = (uint16_t)real_c3;
-    }
-    if ((b->log_cell3_valid != 0u) &&
-        ((b->field_ok_mask & BQ_FIELD_BAT) != 0u) &&
-        (real_pack >= BQ_PACK_VALID_MIN_MV) &&
-        (real_pack <= BQ_PACK_VALID_MAX_MV))
-    {
-        residual = (int32_t)real_pack -
-                   ((int32_t)b->cell_mv[0] + (int32_t)b->cell_mv[1] +
-                    (int32_t)real_c3);
-        if ((residual <= BQ_PACK_SUM_TOL_MV) &&
-            (residual >= -BQ_PACK_SUM_TOL_MV))
-        {
-            b->log_pack_valid = 1u;
-            b->log_pack_mv = (uint16_t)real_pack;
-        }
-    }
-
-    /* 控制值逐字段优先真实值；日志值保持上面的 real-or-0。 */
     Bq_SelectControlVoltages(b->cell_mv[0], b->cell_mv[1],
                              (uint16_t)real_c3, b->log_cell3_valid,
                              (uint16_t)real_pack, b->log_pack_valid,
@@ -1385,7 +1454,7 @@ static void Bq_FrameCommit(void)
         if (s_bq.strict_window != 0u)
         {
             /* 启动/LP/ADC 重启后的首次发布：只比较 VC1/VC2 原始码 ±4 LSB。
-             * 合成 cell3/pack 由它们推导，不单独比较 raw VC5/BAT。 */
+             * cell3/pack 不作为该双帧确认条件，也不比较 raw VC5/BAT。 */
             for (i = 0u; i < 2u; i++)
             {
                 uint16_t diff = (s_bq.raw_cell[i] >= s_bq.pending_raw_cell[i]) ?
@@ -1933,6 +2002,8 @@ static void Bq_StartScript(const bq_job_t *script, uint8_t len, bq_state_t state
         s_bq.run_protect[0] = 0u;
         s_bq.run_protect[1] = 0u;
         s_bq.run_protect[2] = 0u;
+        s_bq.run_ref_cell2_only = s_bq.ref_cell2_only;
+        s_bq.ref_decision_final = 0u;
         s_bq.run_start_ms = HAL_GetTick();
     }
     Bq_StartNextJob();
@@ -1961,6 +2032,8 @@ static void Bq_StartConfig(void)
     s_bq.good_publish_streak = 0u;
     s_bq.pending_sysstat_clear = 0u;
     s_bq.sysstat_sync_active = 0u;
+    s_bq.ref_decision_final = 0u;
+    s_bq.run_ref_cell2_only = s_bq.ref_cell2_only;
     s_bq.xready_at_settle = 0u;
     s_bq.xready_streak = 0u;
 
@@ -2123,6 +2196,9 @@ void BQ_Init(void)
     s_bq.log_pack_mv = 0u;
     s_bq.log_cell3_valid = 0u;
     s_bq.log_pack_valid = 0u;
+    s_bq.ref_cell2_only = 0u;
+    s_bq.run_ref_cell2_only = 0u;
+    s_bq.ref_decision_final = 0u;
     s_bq.cell12_meas_valid = 0u;
     s_bq.cell12_measured_once = 0u;
     s_bq.cell12_meas_mv[0] = 0u;
@@ -2271,6 +2347,9 @@ void BQ_ReInitAfterLp(void)
     s_bq.log_pack_mv = 0u;
     s_bq.log_cell3_valid = 0u;
     s_bq.log_pack_valid = 0u;
+    s_bq.ref_cell2_only = 0u;
+    s_bq.run_ref_cell2_only = 0u;
+    s_bq.ref_decision_final = 0u;
     s_bq.cell12_meas_valid = 0u;
     s_bq.cell12_measured_once = 0u;
 
@@ -2579,6 +2658,7 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
     out->log_pack_mv = s_bq.log_pack_mv;
     out->log_cell3_valid = s_bq.log_cell3_valid;
     out->log_pack_valid = s_bq.log_pack_valid;
+    out->ref_cell2_only = s_bq.ref_cell2_only;
     out->ov_trip_mv = s_bq.ov_trip_mv;
     out->uv_trip_mv = s_bq.uv_trip_mv;
     out->cell12_meas_mv[0] = s_bq.cell12_meas_mv[0];
@@ -2652,6 +2732,34 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
     out->last_reject_vc4_raw = s_bq.last_reject_vc4_raw;
     out->last_reject_ms = s_bq.last_reject_ms;
     out->last_reject_sys_stat = s_bq.last_reject_sys_stat;
+}
+
+uint16_t BQ_GetRefCellMv(const bq_snapshot_t *snap)
+{
+    uint16_t ref;
+
+    if ((snap == NULL) || (snap->valid == 0u))
+    {
+        return 0u;
+    }
+    if (snap->ref_cell2_only != 0u)
+    {
+        ref = snap->cell_mv[1];
+        return ((ref >= BQ_CELL_VALID_MIN_MV) &&
+                (ref <= BQ_CELL_VALID_MAX_MV)) ? ref : 0u;
+    }
+
+    ref = snap->cell_mv[0];
+    if (snap->cell_mv[1] < ref)
+    {
+        ref = snap->cell_mv[1];
+    }
+    if (snap->cell_mv[2] < ref)
+    {
+        ref = snap->cell_mv[2];
+    }
+    return ((ref >= BQ_CELL_VALID_MIN_MV) &&
+            (ref <= BQ_CELL_VALID_MAX_MV)) ? ref : 0u;
 }
 
 void BQ_GetBatchQuality(bq_batch_quality_t *out)
@@ -2929,7 +3037,6 @@ int BQ_LpMonitorRead(bq_snapshot_t *out)
     uint16_t raw_vc4;
     uint32_t real_c3;
     uint32_t real_pack;
-    int32_t residual;
     uint8_t reason = (uint8_t)BQ_FRAME_REJECT_UNSETTLED;
     uint8_t cells12_ok;
     uint8_t state_ok;
@@ -3002,23 +3109,57 @@ int BQ_LpMonitorRead(bq_snapshot_t *out)
                   (out->cell_mv[1] >= BQ_CELL_VALID_MIN_MV) &&
                   (out->cell_mv[1] <= BQ_CELL_VALID_MAX_MV)) ? 1u : 0u;
 
+    /* 先按同批 VC5/BAT 决定参考节，再过滤 OV/UV。LP 读取已经保证各寄存器
+     * 阻塞读成功；这里不使用 CRC mask，也不依赖任何 sys_stat/quality。 */
+    out->ref_cell2_only = Bq_EvaluateRealC3Pack(
+        raw[2], raw_pack, 1u, 1u,
+        out->cell_mv[0], out->cell_mv[1],
+        &out->log_cell3_mv, &out->log_pack_mv,
+        &out->log_cell3_valid, &out->log_pack_valid);
+    if (cells12_ok == 0u)
+    {
+        out->ref_cell2_only = 0u;
+    }
+
     /* LP 中 ADC 关闭，SYS_STAT 的 OV/UV 可能来自 VC5 假锁存。
-     * cell1/2 实测安全时忽略 OV/UV；真实 cell1/2 越限时保留。 */
+     * 正常时 cell1/2 实测安全才忽略；异常时只信任 VC2。 */
     effective_stat = stat;
     if (cells12_ok != 0u)
     {
         uint16_t c1 = out->cell_mv[0];
         uint16_t c2 = out->cell_mv[1];
-        if (((c1 >= c2) ? c1 : c2) <=
-            ((BQ_OV_TRIP_MV > BQ_OV_CLEAR_GUARD_MV) ?
-             (uint16_t)(BQ_OV_TRIP_MV - BQ_OV_CLEAR_GUARD_MV) : 0u))
+
+        if (out->ref_cell2_only != 0u)
         {
-            effective_stat &= (uint8_t)~BQ_SYS_STAT_OV;
+            if ((c2 >= BQ_CELL_VALID_MIN_MV) &&
+                (c2 <= BQ_CELL_VALID_MAX_MV))
+            {
+                if (c2 <=
+                    ((BQ_OV_TRIP_MV > BQ_OV_CLEAR_GUARD_MV) ?
+                     (uint16_t)(BQ_OV_TRIP_MV - BQ_OV_CLEAR_GUARD_MV) : 0u))
+                {
+                    effective_stat &= (uint8_t)~BQ_SYS_STAT_OV;
+                }
+                if ((uint32_t)c2 >=
+                    ((uint32_t)BQ_UV_TRIP_MV + BQ_UV_CLEAR_GUARD_MV))
+                {
+                    effective_stat &= (uint8_t)~BQ_SYS_STAT_UV;
+                }
+            }
         }
-        if ((uint32_t)((c1 <= c2) ? c1 : c2) >=
-            ((uint32_t)BQ_UV_TRIP_MV + BQ_UV_CLEAR_GUARD_MV))
+        else
         {
-            effective_stat &= (uint8_t)~BQ_SYS_STAT_UV;
+            if (((c1 >= c2) ? c1 : c2) <=
+                ((BQ_OV_TRIP_MV > BQ_OV_CLEAR_GUARD_MV) ?
+                 (uint16_t)(BQ_OV_TRIP_MV - BQ_OV_CLEAR_GUARD_MV) : 0u))
+            {
+                effective_stat &= (uint8_t)~BQ_SYS_STAT_OV;
+            }
+            if ((uint32_t)((c1 <= c2) ? c1 : c2) >=
+                ((uint32_t)BQ_UV_TRIP_MV + BQ_UV_CLEAR_GUARD_MV))
+            {
+                effective_stat &= (uint8_t)~BQ_SYS_STAT_UV;
+            }
         }
     }
     out->sys_stat = effective_stat;
@@ -3033,32 +3174,9 @@ int BQ_LpMonitorRead(bq_snapshot_t *out)
                      (protect[2] == BQ_PROTECT3_VALUE)) ? 1u : 0u;
     out->protection_ok = protection_ok;
 
-    /* 控制值：真实 VC5/BAT 可信时优先实测，否则用 VC1/VC2 估算。
-     * 日志值：真实可信时记录实测，否则 0；估算值不进入 log_*。 */
+    /* 控制值逐字段优先真实值；日志值保持 real-or-0。 */
     real_c3 = Bq_RawToMv(raw[2]);
     real_pack = Bq_RawPackToMv(raw_pack);
-    if ((real_c3 >= BQ_CELL_VALID_MIN_MV) &&
-        (real_c3 <= BQ_CELL_VALID_MAX_MV))
-    {
-        out->log_cell3_valid = 1u;
-        out->log_cell3_mv = (uint16_t)real_c3;
-    }
-    if ((out->log_cell3_valid != 0u) &&
-        (real_pack >= BQ_PACK_VALID_MIN_MV) &&
-        (real_pack <= BQ_PACK_VALID_MAX_MV))
-    {
-        residual = (int32_t)real_pack -
-                   ((int32_t)out->cell_mv[0] + (int32_t)out->cell_mv[1] +
-                    (int32_t)real_c3);
-        if ((residual <= BQ_PACK_SUM_TOL_MV) &&
-            (residual >= -BQ_PACK_SUM_TOL_MV))
-        {
-            out->log_pack_valid = 1u;
-            out->log_pack_mv = (uint16_t)real_pack;
-        }
-    }
-
-    /* 控制值逐字段优先真实值；日志值保持上面的 real-or-0。 */
     Bq_SelectControlVoltages(out->cell_mv[0], out->cell_mv[1],
                              (uint16_t)real_c3, out->log_cell3_valid,
                              (uint16_t)real_pack, out->log_pack_valid,
@@ -3208,8 +3326,10 @@ static uint8_t Bq_LpFrameClose(const bq_snapshot_t *a, const bq_snapshot_t *b)
     {
         return 0u;
     }
-    /* 只比较实测 VC1/VC2；合成 cell3/pack 由它们推导，raw VC5/BAT 仅诊断。 */
-    for (i = 0u; i < 2u; i++)
+    /* 正常比较 VC1/VC2；两边都已进入 VC2-only 模式时 VC1 被有意忽略，
+     * 只比较 VC2。cell3/pack 不作为该 LP 双帧条件，raw VC5/BAT 仅诊断。 */
+    i = ((a->ref_cell2_only != 0u) && (b->ref_cell2_only != 0u)) ? 1u : 0u;
+    for (; i < 2u; i++)
     {
         int32_t d = (int32_t)a->raw_cell[i] - (int32_t)b->raw_cell[i];
         if ((d > 4) || (d < -4))

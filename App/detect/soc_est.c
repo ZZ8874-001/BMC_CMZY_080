@@ -4,14 +4,15 @@
  * @brief   BQ76920 快照 → li-ion-soc-soh-toolkit SOC/SOH 适配。
  *
  * 处理链（每帧 BQ 数据）：
- *   min(cell_mv) + current_ma + TS1 温度
+ *   参考节电压 + current_ma + TS1 温度
  *     → BMS_CAL_Update(temp)
- *     → SOC_AhUpdate(cell_mv, current_ma)
- *     → SOH_Update(cell_mv, current_ma, temp)
+ *     → SOC_AhUpdate(ref_mv, current_ma)
+ *     → SOH_Update(ref_mv, current_ma, temp)
  *
- * TS1 温度：MF52（10 kΩ @25°C，B=3950）经 10 kΩ 上拉到 5 V，
- * 按 R-T 表线性插值。NMC 标定前 SOC_EST_CAL_VALID 固定 0，结果只用于
- * 显示/记录，不能单独作为保护判据。
+ * 参考节正常为三节最低值；VC5/BAT 异常时由 BQ 层改为实测 VC2。TS1 温度：
+ * MF52（10 kΩ @25°C，B=3950）经 10 kΩ 上拉到 5 V，按 R-T 表线性插值。
+ * SOC_EST_CAL_VALID=1 允许 SOC/SOH 参与 3.1 V 低电判断和显示；2.8 V 电压
+ * 硬保护仍是独立兜底。
  ******************************************************************************
  */
 #include "detect/soc_est.h"
@@ -79,6 +80,8 @@ static struct
     int16_t  temp_dc;
     uint16_t cell_mv[3];
     uint16_t pack_mv;
+    uint16_t ref_cell_mv;
+    uint8_t  ref_cell2_only;
     uint16_t ts1_raw;
     uint16_t ts1_mv;
     int32_t  current_ma;
@@ -184,6 +187,8 @@ void SocEst_Init(void)
     s_soc_est.cell_mv[1] = 0u;
     s_soc_est.cell_mv[2] = 0u;
     s_soc_est.pack_mv = 0u;
+    s_soc_est.ref_cell_mv = 0u;
+    s_soc_est.ref_cell2_only = 0u;
     s_soc_est.ts1_raw = 0u;
     s_soc_est.ts1_mv = 0u;
     s_soc_est.current_ma = 0;
@@ -208,7 +213,7 @@ void SocEst_Init(void)
 
 void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms)
 {
-    uint16_t min_mv;
+    uint16_t ref_mv;
     int16_t temp_dc = 250;
     uint8_t frame_ok = 1u;
     uint8_t temp_ok;
@@ -226,32 +231,49 @@ void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms)
     s_soc_est.source_batch_seq = 0u;
     s_soc_est.quality = SOC_EST_QUALITY_NONE;
 
-    for (i = 0u; i < 3u; i++)
+    if (snap->ref_cell2_only != 0u)
     {
-        if ((snap->cell_mv[i] < SOC_EST_CELL_MIN_MV) ||
-            (snap->cell_mv[i] > SOC_EST_CELL_MAX_MV))
+        /* VC5/BAT 异常时 VC1/cell3/pack 都不可信，只要求 VC2。 */
+        if ((snap->cell_mv[1] < SOC_EST_CELL_MIN_MV) ||
+            (snap->cell_mv[1] > SOC_EST_CELL_MAX_MV))
         {
             frame_ok = 0u;
+        }
+    }
+    else
+    {
+        for (i = 0u; i < 3u; i++)
+        {
+            if ((snap->cell_mv[i] < SOC_EST_CELL_MIN_MV) ||
+                (snap->cell_mv[i] > SOC_EST_CELL_MAX_MV))
+            {
+                frame_ok = 0u;
+            }
+        }
+        /* 3S 接法错误/悬空通道时 BAT 不等于三节之和；这种帧不要喂 SOC，
+         * 否则会把错误的 cell3/包压积分进去。降级模式已明确不信任
+         * cell1/cell3/pack，因此跳过该检查。 */
+        {
+            int32_t sum_mv = (int32_t)snap->cell_mv[0] +
+                             (int32_t)snap->cell_mv[1] +
+                             (int32_t)snap->cell_mv[2];
+            int32_t delta_mv = (int32_t)snap->pack_mv - sum_mv;
+
+            if ((delta_mv > SOC_EST_PACK_SUM_TOL_MV) ||
+                (delta_mv < -SOC_EST_PACK_SUM_TOL_MV))
+            {
+                frame_ok = 0u;
+            }
         }
     }
     if ((snap->current_ma < -50000) || (snap->current_ma > 50000))
     {
         frame_ok = 0u;
     }
-
-    /* 3S 接法错误/悬空通道时 BAT 不等于三节之和；这种帧不要喂 SOC，
-     * 否则会把错误的 cell3/包压积分进去。 */
+    ref_mv = BQ_GetRefCellMv(snap);
+    if (ref_mv == 0u)
     {
-        int32_t sum_mv = (int32_t)snap->cell_mv[0] +
-                         (int32_t)snap->cell_mv[1] +
-                         (int32_t)snap->cell_mv[2];
-        int32_t delta_mv = (int32_t)snap->pack_mv - sum_mv;
-
-        if ((delta_mv > SOC_EST_PACK_SUM_TOL_MV) ||
-            (delta_mv < -SOC_EST_PACK_SUM_TOL_MV))
-        {
-            frame_ok = 0u;
-        }
+        frame_ok = 0u;
     }
 
     temp_ok = SocEst_Ts1ToDeciC(snap, &temp_dc);
@@ -274,6 +296,8 @@ void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms)
     s_soc_est.cell_mv[1] = snap->cell_mv[1];
     s_soc_est.cell_mv[2] = snap->cell_mv[2];
     s_soc_est.pack_mv = snap->pack_mv;
+    s_soc_est.ref_cell_mv = ref_mv;
+    s_soc_est.ref_cell2_only = (snap->ref_cell2_only != 0u) ? 1u : 0u;
     s_soc_est.ts1_raw = snap->ts1_raw;
     s_soc_est.ts1_mv = SocEst_Ts1Mv(snap);
     s_soc_est.current_ma = snap->current_ma;
@@ -283,16 +307,6 @@ void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms)
         return;             /* 坏帧不喂算法，SOC 保持上次值 */
     }
 
-    min_mv = snap->cell_mv[0];
-    if (snap->cell_mv[1] < min_mv)
-    {
-        min_mv = snap->cell_mv[1];
-    }
-    if (snap->cell_mv[2] < min_mv)
-    {
-        min_mv = snap->cell_mv[2];
-    }
-
     BMS_CAL_Update(temp_dc);
     if (s_soc_est.ekf_reset_pending != 0u)
     {
@@ -300,11 +314,11 @@ void SocEst_OnSnapshot(const bq_snapshot_t *snap, uint32_t now_ms)
         SOC_EkfReset();
         s_soc_est.ekf_reset_pending = 0u;
     }
-    SOC_AhUpdate((int32_t)min_mv,
+    SOC_AhUpdate((int32_t)ref_mv,
                  (int32_t)(SOC_EST_CURRENT_SIGN * snap->current_ma));
     if (temp_ok != 0u)
     {
-        SOH_Update((int32_t)min_mv,
+        SOH_Update((int32_t)ref_mv,
                    (int32_t)(SOC_EST_CURRENT_SIGN * snap->current_ma),
                    (int32_t)temp_dc);
     }
@@ -356,6 +370,8 @@ void SocEst_InvalidateInput(void)
     s_soc_est.cell_mv[1] = 0u;
     s_soc_est.cell_mv[2] = 0u;
     s_soc_est.pack_mv = 0u;
+    s_soc_est.ref_cell_mv = 0u;
+    s_soc_est.ref_cell2_only = 0u;
     s_soc_est.ts1_raw = 0u;
     s_soc_est.ts1_mv = 0u;
     s_soc_est.current_ma = 0;
@@ -438,6 +454,8 @@ void SocEst_GetSnapshot(soc_est_snapshot_t *out)
     out->cell_mv[1] = s_soc_est.cell_mv[1];
     out->cell_mv[2] = s_soc_est.cell_mv[2];
     out->pack_mv = s_soc_est.pack_mv;
+    out->ref_cell_mv = s_soc_est.ref_cell_mv;
+    out->ref_cell2_only = s_soc_est.ref_cell2_only;
     out->ts1_raw = s_soc_est.ts1_raw;
     out->ts1_mv = s_soc_est.ts1_mv;
     out->current_ma = s_soc_est.current_ma;

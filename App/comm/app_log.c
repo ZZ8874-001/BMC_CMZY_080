@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    app_log.c
- * @brief   USART1 非阻塞文本日志：1 KB 环形缓冲 + 64 B 暂存 + TX DMA。
+ * @brief   USART1 非阻塞文本日志：2 KB 环形缓冲 + 64 B 暂存 + TX DMA。
  *
  * DMA 通道：DMA1_Ch4（USART1_TX 在 DMA1 上唯一可选通道，CxS=0010）。
  * 完成路径：DMA TC → DMA1_Ch4 IRQ → HAL_DMA_IRQHandler → USART1 TC 中断
@@ -15,7 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define LOG_RING_SIZE       1024u
+#define LOG_RING_SIZE       2048u
 #define LOG_DMA_CHUNK       64u
 #define LOG_TMP_SIZE        128u
 #define LOG_TX_TIMEOUT_MS   100u

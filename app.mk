@@ -63,7 +63,8 @@ App/bsp/button.c \
 App/bsp/flash_store.c \
 App/bsp/ws2812_uart.c \
 App/bsp/buzzer.c \
-App/comm/app_log.c
+App/comm/app_log.c \
+App/comm/app_telemetry.c
 
 # RTC 已在 IOC 中，生成的 Makefile 通常已包含；这里保留兜底，已包含时由 filter-out 去重。
 APP_HAL_SOURCES =  \

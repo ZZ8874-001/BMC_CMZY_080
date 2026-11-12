@@ -1,7 +1,7 @@
 
 # BMC_CMZY_080 电源模式与切换说明（L0 + M1 基础）
 
-> **2026-11-11 更新说明**：控制/SOC 在真实 VC5/BAT 可信时优先采用实测，异常时回退为 VC1/VC2 估算；保护/报错动作不变，仍不直接使用 cell3/pack。记录只写真实可信值，异常时 V3/包压置 0；估算不落盘。VC3/VC4 仅作 raw 诊断。`bq_anomaly.c/.h` 与 partial/2 A OCP/9 帧/2 min/5 min 锁存已删除；均衡永久关闭。LP monitor 只校验 cell1/2，`-2` 电压异常返回码已删除；LP ALERT 唤醒只用 SCD/OCD/XREADY。下文相关旧描述视为历史。
+> **2026-11-11/12 更新说明**：控制/显示在真实 VC5/BAT 可信时优先采用实测，异常时回退为 VC1/VC2 估算；保护/SOC/充满参考节正常取三节最低值，VC5/BAT 异常时只用实测 VC2。BQ OV/UV 状态过滤正常只用 VC1/VC2 实测，异常时只比较 VC2。记录只写真实可信值，异常时 V3/包压置 0；估算不落盘。VC3/VC4 仅作 raw 诊断。`bq_anomaly.c/.h` 与 partial/2 A OCP/9 帧/2 min/5 min 锁存已删除；均衡永久关闭。LP monitor 只校验 cell1/2，`-2` 电压异常返回码已删除；LP ALERT 唤醒只用 SCD/OCD/XREADY。下文相关旧描述视为历史。
 
 依据（当前工作树：复位式 LP、M2 保护监督层；具体行为与参数以当前源码为准，旧镜像体积及构建记录不代表本次改动的验证结果）：
 
@@ -99,15 +99,16 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 
 - **时钟**：HSE bypass 12 MHz → PLL → 80 MHz，Scale1，4WS；RTC 1 Hz 时基默认来自 LSI（`LP_RTC_USE_LSE=0`），切到 LSE 后来自 32.768 kHz；HSI16 保持开启。
 - **250 Hz TIM2 中断（ISR 内只读寄存器/置标志/数数）**：COMP2 采样 + 32 样本消抖提交充/放方向；LED 相位推进（PB3/PB4 + RGB dirty 标志）；500 ms → `flag_bq_read_request`；1 s → `uptime_s++` + `flag_diag_request`；30 min → `flag_blackbox_request`。
-- **主循环（每圈固定顺序）**：`PowerMode_Loop()`（消费调试器写的 LP 请求）→ 按键/手势 → BQ 读请求 + `BQ_Poll()`（事务状态机）→ `SocEst` → 自检轮询 → 1 s 诊断（BQ 新鲜度 >2 s → `FAULT_BQ_STALE`；每 10 s 一条 `[DIAG]`/`[POL]` 日志）→ `Protection_Task(now, snap, comp, temp_valid, temp_dc)` → `StateMachine_Update` → `ChargePolicy_Task` → `Protection_Service` + 保护事件落盘 → `CalStream_Task` + 灯效 → 自动 LP 判断 → 黑匣子 30 min 记录 → `Buzzer_Poll()` → `LedStatus_Flush()` → `App_Log_Poll()` + `FlushSmall(4/32)`。
-- **保护监督层（M2）**：`Protection_Task()` 在 `StateMachine_Update()` 之前评估 BQ OV/UV/SCD/OCD、boot/LP 锁存、软件 OCP、NTC 温度、数据有效性和 FET 允许掩码；`Protection_Service()` 在 BQ RUN/idle、FET 全关、`|I| <= 500 mA`、数据有效且连续 2 s 安全时，一次性清除本次 boot/LP 唤醒首次配置前已锁存的 SCD/OCD。运行期 BQ 锁存和软件 OCP 不自动清除。软件 OCP 门槛为充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认后锁存；`Protection_RequestLatchClear()` 需人工调用，充电 OCP 还要求充电器移除。温度：包温度 **4.0–54.0 °C** 允许，充电和放电都收紧，2 °C 回差/2 s 去抖，恢复窗口 6.0–52.0 °C；`PROT_TEMP_ENABLE=1`，TS1 有效才放行。`ChargePolicy` 仍是唯一 FET 请求 owner，允许掩码变化时立即收紧（含部分掩码）。BQ 的 OCD/SCD 只覆盖放电，BQ 没有充电过流或自主温度保护；软件 OCP 的方向用 COMP2、幅值用 CC，不依赖 CC 极性；CC 符号仍由 `BQ_CC_DISCHARGE_SIGN` 单点定义供 SOC/诊断，上板必须先用已知充放电方向确认。SOC 5%/0% 切断、均衡和 die 温仍是后续阶段。
+- **主循环（每圈固定顺序）**：`PowerMode_Loop()`（消费调试器写的 LP 请求）→ 按键/手势 → BQ 读请求 + `BQ_Poll()`（事务状态机）→ `SocEst` → 自检轮询 → 1 s 分支：先 `App_Telemetry_Task()` 发 1 Hz D 帧，再进入 10 s 诊断（BQ 新鲜度 >2 s → `FAULT_BQ_STALE`；每 10 s 一条 `[DIAG]`/`[POL]` 日志）→ `Protection_Task(now, snap, comp, temp_valid, temp_dc)` → `StateMachine_Update` → `ChargePolicy_Task` → `Protection_Service` + 保护事件落盘 → `CalStream_Task` + 灯效 → 自动 LP 判断 → 黑匣子 30 min 记录 → `Buzzer_Poll()` → `LedStatus_Flush()` → `App_Log_Poll()` + `FlushSmall(4/32)`。
+- **保护监督层（M2）**：`Protection_Task()` 在 `StateMachine_Update()` 之前评估 BQ OV/UV/SCD/OCD、boot/LP 锁存、软件 OCP、NTC 温度、数据有效性和 FET 允许掩码；`Protection_Service()` 在 BQ RUN/idle、FET 全关、`|I| <= 500 mA`、数据有效且连续 2 s 安全时，一次性清除本次 boot/LP 唤醒首次配置前已锁存的 SCD/OCD。运行期 BQ 锁存和软件 OCP 不自动清除。软件 OCP 门槛为充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认后锁存；`Protection_RequestLatchClear()` 需人工调用，充电 OCP 还要求充电器移除。温度：包温度 **4.0–54.0 °C** 允许，充电和放电都收紧，2 °C 回差/2 s 去抖，恢复窗口 6.0–52.0 °C；`PROT_TEMP_ENABLE=1`，TS1 有效才放行。`ChargePolicy` 仍是唯一 FET 请求 owner，允许掩码变化时立即收紧（含部分掩码）。BQ 的 OCD/SCD 只覆盖放电，BQ 没有充电过流或自主温度保护；软件 OCP 的方向用 COMP2、幅值用 CC，不依赖 CC 极性；CC 符号仍由 `BQ_CC_DISCHARGE_SIGN` 单点定义供 SOC/诊断，上板必须先用已知充放电方向确认。原 SOC 5%/0% 截止未实现；2.8 V 硬欠压、3.1 V/SOC10 低电充电已接入（见下），均衡和 die 温仍是后续阶段。
 - **BQ**：每约 500 ms 正常全量读取（同批顺序读、逐寄存器 CRC；不是 BQ 原子 ADC 帧）。`BQ_GetBatchQuality()` 返回 `BQ_BATCH_FULL_CANDIDATE`（合理但尚未真实发布）、`BQ_BATCH_FULL_REAL_OK`（完成双帧确认并真正发布）、`BQ_BATCH_PARTIAL_VC5_PACK`（连续两批独立确认仅 VC5 和/或 BAT 不可信，VC1/VC2、VC3/VC4、CC、控制/保护状态及通信可信）或 `BQ_BATCH_INVALID`（其余，包括无法判断 BAT 与 VC5 谁错的包压残差）。部分模式中的第三节/包压估算仅供显示和带质量标志的存档；不回写 `bq_snapshot_t.valid/fresh`，不清真实 OV/UV 锁存，也不作为放行/关断依据。`BQ_GetCcSample()` 使用同一 BQ 的新 CC 转换和 CRC 证据，与电压发布解耦，**不是冗余硬件电流通道**。真 OV/UV/SCD/OCD/XREADY/PVD、通信/保护读回故障始终优先。
 - **异常分级时序**：冷/PIN/BOR 启动仅在已确认是电压异常时延长对应自检宽限；自检完成后蓝闪至少再保持 2 s，且须有真实完整好帧才能离开 BOOT 蓝灯。仅启动电压异常累计 60 s 未恢复才进入声光报警；外部 LP 真唤醒先记录部分异常，未到期不蜂鸣（PB3/HOT 仍闪）。本次完整唤醒只有曾取得真实好帧并通过自检/原保护、最后好帧未满 20 s、BQ ADC/CC 持续开且新 CC/同批证据可靠、COMP2 方向可信，才能在部分模式维持或重新请求有条件放电；两次不同的新 CC 转换达到 2 A 则锁存软件 OCP。CC/状态/保护证据过期或失效立即关，20 s 无新真实好帧到期关并报警。充电**不新增绕过原自检/fresh/保护门控的特例**；BQ 硬件无充电 OCP，也不能凭两节估算证明第三节安全。正常完整帧仍按现有 **5.5 A/1 s 充、33 A/500 ms 放**软件 OCP 门槛。输出开时 10 s 只是额外复判/限频日志间隔，500 ms 轮询继续，不能 ADC off→on；**仅输出关且严格部分异常**可通过 `BQ_RequestPartialRetry()` 按至少 10 s 冷却调用受控重启（ADC/CC/FET off 800 ms → CONFIG → ADC settle 300 ms → 双帧确认），真实保护、通信及 XREADY 故障不受此退避豁免。
 - **归档/报警**：NORM 每 30 min 标记以同一窗口连续 9 个真实新发布帧形成同源候选（与该帧的 SOC/温度一致）；到点未达标可再等最多 60 s；先达标后坏帧不丢候选。未达标的前 1–3 个连续异常标记使用带质量标志的降级周期记录（缺失电芯和包压字段写 0，SOC 仅估算/无效），不单凭这些标记响蜂鸣。连续第 4 个异常标记或窗口末 VC1/VC2 不可信进入 2 min HOT/PB3＋蜂鸣器报警；2 min 内 9 个新真实好帧可撤销，否则经策略关双管并将禁止输出/自动 LP 锁存到 StateStore（关断确认需 BQ 回读，Flash 失败不能当已持久成功）。锁存只能经人工安全确认入口解除，不随 PIN/掉电自动消失；连续实际报警满 5 min 只置未来 STOP2/SHIP 预留 trigger，**不**进入 STOP2/SHIP。黑匣子沿用 24 B 记录和累计运行 uptime，RTC epoch 仅用于跨 NORM/LP 标记 ID 去重；估算电压不得作为实测入档。
-- **状态机**：BOOT →（真实完整帧、自检等门控通过）→ NORM；严格部分电压异常可进入独立 `SM_STATE_BQ_ANOMALY`（不是硬件 FAULT；放电是否允许仍由保护/策略共同决定）；BQ_COMM/XREADY/OV/UV/SCD/OCD/PROTECTION/POWER/CLK 等关键故障 → FAULT 并优先于电压异常。流动分类由 COMP2/策略决定，失去必要证据则保持/转回保守态。
-- **灯效**：BOOT = PB4 1 Hz 慢闪 + RGB 蓝（启动电压异常须经真实好帧且自检完成后再等至少 2 s）；NORM = PB4 常亮 + RGB（充电绿 48 / 放电蓝 48 / 静置白 12）；仅部分电压异常叠加 PB3/HOT 闪烁，不把 RGB 切到故障红闪（BOOT 蓝闪可与 PB3 同时存在）；到期报警 PB3 快闪并蜂鸣，RGB 仍按 BOOT/NORM；真实关键 FAULT 才沿用 PB3 5 Hz + RGB 红的高优先级灯效。LP STOP1 中 PB3/蜂鸣/RGB 均关闭。
+- **状态机**：BOOT →（真实完整帧、自检等门控通过）→ NORM；当前只有 BOOT/NORM/FAULT。critical 掩码是 BQ_COMM/XREADY/SCD/OCD/ADC_STUCK/PROTECTION/POWER/CLK；**BQ OV/UV 不直接进 critical**——OV/SCD/OCD 及“UV+其它硬锁存”由 Protection 汇总为 `FAULT_BIT_PROTECTION`，UV-only 保持 NORMAL 且 allow=CHG。2.8 V/低电状态叠加也不进 FAULT UI。流动分类由 COMP2/策略决定，失去必要证据则保持/转回保守态。
+- **灯效（2026-11-12）**：BOOT = PB4 1 Hz 慢闪 + RGB 蓝 64（启动电压异常须经真实好帧且自检完成后再等至少 2 s）；真实关键 FAULT = PB3 5 Hz + RGB 红 128；低电状态 = `LED_FLOW_LOW_BATT` 红色 64/5 Hz（NORM，不进入 FAULT）；CAL = RGB 琥珀 (48,24)；LP STOP1 中 PB3/蜂鸣/RGB 均关闭。
+- **NORM RGB SOC 渐变**：`led_status.c` 按 SOC 0% 红 → 50% 黄 → 100% 绿，满量程仍为 48。STANDBY 5 Hz 快闪、亮度约 60%（最大 29）；DISCHARGE 常亮、95%（最大 46）；CHARGE 1 Hz 慢闪、95%（最大 46）；`charge_full` 时白色 (38,38,38) 常亮（约 80%），不再随 SOC 渐变。SOC 显示门限是 `frame_valid && quality==REAL`，不要求 `cal_valid`；SOC 无效时保持最后一次有效颜色，从未有效则回退 STANDBY 白 12 / DISCHARGE 蓝 48 / CHARGE 绿 48。常亮模式只在颜色变化时发帧，相位切换不重复发送。PB3/PB4 仍按原模式驱动。
 - **蜂鸣器**：音型表（BOOT_OK/FAULT/LP_ENTER/WAKE），主循环推进相位，TIM1 无中断。
-- **日志**：USART1 115200 非阻塞，1 KB 环形 + 64 B 暂存，TX DMA1_Ch4，100 ms DMA 看门狗。
+- **日志**：USART1 115200 非阻塞，2 KB 环形 + 64 B 暂存，TX DMA1_Ch4，100 ms DMA 看门狗；1 Hz `D,...` SOC 遥测与 `[DIAG]`/`[CAL]` 共用此通路（见 `DOCS/SOC_TELEMETRY.md`）。
 - **PVD**：3.3 V 轨 < 2.8 V → 中断 → sticky `FAULT_POWER`。
 - **黑匣子**：NORM 的 RTC 30 min 标记依上述九帧/60 s 策略归档 24 B 周期记录并同步 StateStore：FULL 使用第九个认证帧及同源 SOC/温度，PARTIAL 将不可信电芯/包压写 0 并标质量；LP 正常标记保持两批独立实测确认、只写一条黑匣子周期记录，不要求九帧或在轻量 boot 运行 SOC/StateStore 存档，但须同步清持久四连计数。页轮转时可能触发整页擦除；不得将 RTC epoch 直接写入黑匣子既有 uptime 字段。
 - **LP 请求**：空闲约 5 s 后才申请自动 LP；短暂严格部分电压异常在**无输出、无待归档/实际报警/锁存/真实故障**时允许单独放宽不 fresh/非 NORM/部分保护门控，其它 block（时基、自检、充电、策略、按键、电源等）必须仍成立为 0。START token 软件复位后的轻量 LP 会关闭 ADC/CC/FET，睡眠期不保证 10 s 复判、PB3 闪烁或维持任何输出；复位会清本次真实好帧放电资格，四连归档计数及锁存独立持久。`s_app.auto_lp_block` 仍逐位诊断；LSE 模式下时基未就绪不得进入 LP。
@@ -120,6 +121,7 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 - DISCHARGE 进入后的**前 10 s**内，若同一 signed 充电电流（净电池电流）≥100 mA，则置外部充电闩锁并立即转 CHARGE；≤90 mA 释放（10 mA 回差）。该判据不替代 COMP2：10 s 后 COMP2 仍可按原逻辑切 CHARGE。切换后清 `user_discharge_enabled`，按正常 CHARGE 电流保持/近满体二极管/移除逻辑运行。净电流会被放电负载抵消，BQ 500 ms 采样带来最多约一个读周期延迟。
 - 关键故障强制请求 0、进入策略 FAULT；CAL 自动结束，不自动恢复。
 - `CHARGE/DISCHARGE` 常规模式请求 `BQ_FET_MASK_ALL`，最终仍需与 `Protection_GetAllowedFetMask()` 和异常锁存门控相与；有条件部分放电**不代表双管无条件全开**。输出关断优先即时申请、RUN/idle 时核实实际 BQ FET 状态，不把请求影子当作已确认关断。
+- **低压分级（2026-11-12）**：有效 BQ 帧参考节 `<2.8 V` 时 Protection 立即把 allow 裁成 CHG-only；`>=3.0 V` 连续 2 帧恢复。参考节 `<3.1 V` 或 SOC `<10%` 连续 2 帧进入 `CHARGE_POLICY_LOW_BATTERY_CHARGE`，默认 CHG-only 且不依赖充电器；低电状态内 DSG 只在充电电流 >200 mA/2 帧且参考节 `>=2.8 V` 时打开，<120 mA 或电流无效立即关闭；3.1 V+SOC≥10%/2 帧退出。无充电器/电流时允许自动 LP，按键唤醒后红灯 5 Hz；旧 `STATE_FLAG_CUTOFF_LATCH` 不恢复。正常参考节为三节最低值；`log_cell3_valid==0 || log_pack_valid==0` 时保护/SOC 只使用实测 VC2。`PAIR_HOLD3` 在低电/欠压期间拒绝。
 - CAL 由调试器写 `s_policy.cal_fet_mask`（0x00..0x03）再写 `s_policy.cal_mode=1` 进入；写 `cal_mode=0` 退出。CAL 期间自动 LP 被 bit7 阻止，BQ 不 fresh/非 RUN/LP 唤醒/关键故障都会结束 CAL。
 - `[CAL]` 由 `cal_stream.c` 输出：BEGIN/HDR + 每个新 BQ 快照一行（约 2 Hz）+ END；黑匣子只写 `BB_EVENT_CAL_BEGIN/END`（0x12/0x13），不逐样本写 Flash。CAL 日志只用现有快照字段（mV、cc_raw、current_ma、ts1_raw、SocEst 的 ts1_mv/temp/SOC/SOH），不恢复 raw_cell/raw_pack。END 的 `reason`：1=user，2=fault，3=notready，4=lp。
 
@@ -138,6 +140,7 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 | 6 | `APP_LP_BLOCK_POWER` | `PowerMode_GetState()!=POWER_STATE_NORM` |
 | 7 | `APP_LP_BLOCK_POLICY` | CHARGE/DISCHARGE/CAL 或 CAL pending |
 | 8 | `APP_LP_BLOCK_PROTECTION` | `Protection_IsLpBlocked()`：真实保护/温度/锁存仍阻止 LP；严格部分电压异常且无输出、待归档/报警/锁存时才可定向例外 |
+| 9 | `APP_LP_BLOCK_FLASH_MARK` | 有待写 LP mark 或 30 min 归档 |
 
 `s_power.lp_disable_auto=1`（IWDG 故障复位或调试器写入）会让 `PowerMode_RequestLp()` 直接拒绝；调试器仍可直接写 `s_power.request_lp=1`，但入口仍受时基门控。
 

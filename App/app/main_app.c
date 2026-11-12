@@ -35,6 +35,7 @@
 #include "bsp/buzzer.h"
 #include "bsp/ws2812_uart.h"
 #include "comm/app_log.h"
+#include "comm/app_telemetry.h"
 #include "detect/gesture.h"
 #include "detect/soc_est.h"
 
@@ -221,11 +222,20 @@ static void App_OnTick250Hz(void)
     }
 }
 
-static void App_UpdateLedMode(void)
+static void App_UpdateLedMode(const soc_est_snapshot_t *soc_snap)
 {
     led_flow_t flow;
     charge_policy_state_t policy_state;
     uint32_t now_ms = HAL_GetTick();
+    uint8_t soc_display_valid = 0u;
+
+    if (soc_snap != NULL)
+    {
+        soc_display_valid =
+            ((soc_snap->frame_valid != 0u) &&
+             (soc_snap->quality == SOC_EST_QUALITY_REAL)) ? 1u : 0u;
+        LedStatus_SetSoc(soc_snap->soc01, soc_display_valid);
+    }
 
     if (StateMachine_GetState() == SM_STATE_FAULT)
     {
@@ -259,6 +269,13 @@ static void App_UpdateLedMode(void)
         return;
     }
 
+    if ((Protection_IsLowBattery() != 0u) ||
+        (ChargePolicy_GetState() == CHARGE_POLICY_LOW_BATTERY_CHARGE))
+    {
+        LedStatus_SetMode(LED_MODE_NORM, LED_FLOW_LOW_BATT);
+        return;
+    }
+
     switch (StateMachine_GetState())
     {
     case SM_STATE_FAULT:
@@ -273,7 +290,8 @@ static void App_UpdateLedMode(void)
     default:
         if (policy_state == CHARGE_POLICY_CHARGE)
         {
-            flow = LED_FLOW_CHARGING;
+            flow = (Protection_GetChargeFull() != 0u) ?
+                   LED_FLOW_CHARGE_FULL : LED_FLOW_CHARGING;
         }
         else if (policy_state == CHARGE_POLICY_DISCHARGE)
         {
@@ -326,7 +344,7 @@ static void App_BqAdcEventTask(void)
 
 static void App_ProtectionEventTask(void)
 {
-    uint8_t events;
+    uint16_t events;
     protection_snapshot_t prot;
 
     /* 保护事件落盘同样只在主循环、BQ 空闲/RUN 时进行。 */
@@ -384,9 +402,39 @@ static void App_ProtectionEventTask(void)
         (void)BlackBox_WriteEvent(BB_EVENT_PROT_TEMP_RECOVER,
                                   App_GetUptimeSeconds());
     }
+    if ((events & PROT_EVENT_EARLY_SOC_CUTOFF) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_EARLY_SOC_CUTOFF,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_EARLY_SOC_CUTOFF_CLEARED) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_EARLY_SOC_CLEARED,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_CELL_UV) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CELL_UV,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_CELL_UV_CLEARED) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CELL_UV_CLEARED,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_CHARGE_FULL) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CHARGE_FULL,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_CHARGE_FULL_CLEARED) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CHARGE_FULL_CLEARED,
+                                  App_GetUptimeSeconds());
+    }
 
     Protection_GetSnapshot(&prot);
-    App_Log_Printf("[PROT] ev=%02X state=%u reason=%04X allow=%02X boot=%02X "
+    App_Log_Printf("[PROT] ev=%04X state=%u reason=%04X allow=%02X boot=%02X "
                    "ocp=%u/%u st=%u/%u I=%ld T=%d tv=%u inh=%u/%u inv=%u clr=%u\r\n",
                    (unsigned)events,
                    (unsigned)prot.state,
@@ -682,15 +730,14 @@ static void App_FakeSwitchTask(uint32_t now_ms)
         return;
     }
 
-    /* VC1/VC2 不可信的批不能作为触发依据。 */
-    if ((batch.field_ok_mask & (BQ_FIELD_VC1 | BQ_FIELD_VC2)) !=
-        (BQ_FIELD_VC1 | BQ_FIELD_VC2))
+    /* VC2 不可信的批不能作为触发依据。 */
+    if ((batch.field_ok_mask & BQ_FIELD_VC2) != BQ_FIELD_VC2)
     {
         s_app.fake_switch_seen_batch_seq = batch.batch_seq;
         return;
     }
 
-    if ((batch.log_cell3_valid != 0u) && (batch.log_pack_valid != 0u))
+    if (batch.ref_cell2_only == 0u)
     {
         s_app.fake_switch_seen_batch_seq = batch.batch_seq;
         s_app.fake_switch_anomaly = 0u;
@@ -815,11 +862,13 @@ static void App_DiagTask(uint32_t now_ms)
         soc_est_snapshot_t soc;
         SocEst_GetSnapshot(&soc);
         App_Log_Printf("[SOC] soc=%ld soh=%ld T=%d TSR=%u TSV=%u "
-                       "fv=%u tv=%u cv=%u upd=%lu\r\n",
+                       "fv=%u tv=%u cv=%u ref=%u ref2=%u upd=%lu\r\n",
                        (long)soc.soc01, (long)soc.soh01, (int)soc.temp_dc,
                        (unsigned)soc.ts1_raw, (unsigned)soc.ts1_mv,
                        (unsigned)soc.frame_valid, (unsigned)soc.temp_valid,
-                       (unsigned)soc.cal_valid, (unsigned long)soc.update_count);
+                       (unsigned)soc.cal_valid, (unsigned)soc.ref_cell_mv,
+                       (unsigned)soc.ref_cell2_only,
+                       (unsigned long)soc.update_count);
     }
     App_Log_Printf("[FAULT] all=%04X live=%04X sticky=%04X test=%u/%u "
                    "fail=%04X sm=%u pvd=%lu\r\n",
@@ -832,7 +881,7 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)StateMachine_GetState(),
                    (unsigned long)Fault_GetPvdIrqCount());
     App_Log_Printf("[DIAG] sm=%u flow=%u V=%u/%u/%u P=%u CC=%d I=%ld TS=%u "
-                   "flt=%04X bq=%u lpblk=%04X up=%lu\r\n",
+                   "ref=%u ref2=%u flt=%04X bq=%u lpblk=%04X up=%lu\r\n",
                    (unsigned)StateMachine_GetState(),
                    (unsigned)StateMachine_GetFlow(),
                    (unsigned)snapshot.cell_mv[0],
@@ -842,6 +891,8 @@ static void App_DiagTask(uint32_t now_ms)
                    (int)snapshot.cc_raw,
                    (long)snapshot.current_ma,
                    (unsigned)snapshot.ts1_raw,
+                   (unsigned)BQ_GetRefCellMv(&snapshot),
+                   (unsigned)snapshot.ref_cell2_only,
                    (unsigned)Fault_GetAll(),
                    (unsigned)BQ_GetState(),
                    (unsigned)s_app.auto_lp_block,
@@ -903,7 +954,7 @@ static void App_DiagTask(uint32_t now_ms)
     Protection_GetSnapshot(&prot);
     App_Log_Printf("[PROT] state=%u reason=%04X allow=%02X boot=%02X "
                    "ocp=%u/%u st=%u/%u n=%lu I=%ld T=%d tv=%u inh=%u/%u "
-                   "inv=%u clr=%u\r\n",
+                   "inv=%u uvref=%u ref2=%u lb=%u boost=%u clr=%u\r\n",
                    (unsigned)prot.state,
                    (unsigned)prot.reasons,
                    (unsigned)prot.allow_mask,
@@ -919,9 +970,14 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)prot.temp_chg_inhibit,
                    (unsigned)prot.temp_dsg_inhibit,
                    (unsigned)prot.temp_invalid,
+                   (unsigned)prot.min_cell_mv,
+                   (unsigned)prot.ref_cell2_only,
+                   (unsigned)((prot.early_soc_latched != 0u) ||
+                              (prot.cell_uv_active != 0u)),
+                   (unsigned)prot.low_batt_dsg_allowed,
                    (unsigned)prot.clear_block_reason);
 
-    App_Log_Printf("[BQ] oor=%u rs=%u sw=%u ep=%u va=%u gp=%u "
+    App_Log_Printf("[BQ] oor=%u rs=%u sw=%u ep=%u va=%u gp=%u ref2=%u "
                    "vd=%lu rl=%lu\r\n",
                    (unsigned)snapshot.oor_streak,
                    (unsigned)snapshot.resample_count,
@@ -929,17 +985,20 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)snapshot.recovery_episode,
                    (unsigned)snapshot.verdict_active,
                    (unsigned)snapshot.good_publish_streak,
+                   (unsigned)snapshot.ref_cell2_only,
                    (unsigned long)snapshot.verdict_deadline_ms,
                    (unsigned long)snapshot.adc_restart_last_ms);
 
     App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u "
                    "cp=%u bd=%u ih=%u cmp=%u I=%ld soc=%u rsn=%u "
-                   "dd=%u dc=%lu\r\n",
+                   "lb=%u dsg=%u ref=%u dd=%u dc=%lu\r\n",
                    (unsigned)ChargePolicy_GetState(),
                    (unsigned)ChargePolicy_GetRequestedMask(),
                    (unsigned)BQ_GetFetMaskApplied(),
-                   (unsigned)((ChargePolicy_GetState() ==
-                               CHARGE_POLICY_CHARGE) ? 1u : 0u),
+                   (unsigned)(((ChargePolicy_GetState() ==
+                                CHARGE_POLICY_CHARGE) ||
+                               (ChargePolicy_GetState() ==
+                                CHARGE_POLICY_LOW_BATTERY_CHARGE)) ? 1u : 0u),
                    (unsigned)((ChargePolicy_GetState() ==
                                CHARGE_POLICY_DISCHARGE) ? 1u : 0u),
                    (unsigned)ChargePolicy_IsCalibration(),
@@ -950,6 +1009,9 @@ static void App_DiagTask(uint32_t now_ms)
                    (long)snapshot.current_ma,
                    (unsigned)SocEst_GetSocPercent(),
                    (unsigned)ChargePolicy_GetCalEndReason(),
+                   (unsigned)Protection_IsLowBattery(),
+                   (unsigned)ChargePolicy_GetLowBattDsgOn(),
+                   (unsigned)BQ_GetRefCellMv(&snapshot),
                    (unsigned)ChargePolicy_GetDischargeChargeDetect(),
                    (unsigned long)ChargePolicy_GetDischargeChargeDetectCount());
     App_Log_Printf("[VSW] an=%u n=%lu ok=%lu fail=%lu busy=%lu gate=%lu "
@@ -1106,6 +1168,7 @@ void App_Init(void)
     ChargePolicy_Init();
     Protection_Init();
     CalStream_Init();
+    App_Telemetry_Init();
 
     (void)HAL_COMP_Start(&hcomp2);
 
@@ -1191,12 +1254,20 @@ void App_Loop(void)
     if (s_app.flag_diag_request != 0u)
     {
         s_app.flag_diag_request = 0u;
+        /* 先发 1 Hz D 帧，再进入 10 s 诊断突发。 */
+        App_Telemetry_Task(now_ms, &bq_snap);
         App_DiagTask(now_ms);
     }
 
+    /* 同一轮只取一次 SOC 快照，供 Protection、策略、LED 共用。 */
+    SocEst_GetSnapshot(&soc_snap);
+
     /* 保护监督层必须先于状态机。 */
-    Protection_Task(now_ms, &bq_snap, s_app.comparator_charging,
-                    SocEst_IsTempValid(), SocEst_GetTempDc());
+    Protection_Task(now_ms, &bq_snap, &soc_snap,
+                    s_app.comparator_charging,
+                    ChargePolicy_IsChargerPresent(),
+                    ChargePolicy_GetState(),
+                    ChargePolicy_GetLowBattDsgOn());
     StateMachine_Update(BQ_IsFresh(now_ms), s_app.comparator_charging,
                         Fault_GetAll());
     policy_in.charge_current_ma =
@@ -1204,19 +1275,21 @@ void App_Loop(void)
     policy_in.current_valid =
         ((bq_snap.valid != 0u) && (bq_snap.fresh != 0u) &&
          (BQ_IsFresh(now_ms) != 0u)) ? 1u : 0u;
-    SocEst_GetSnapshot(&soc_snap);
     policy_in.soc01 = (uint16_t)((soc_snap.soc01 < 0) ? 0 :
                        ((soc_snap.soc01 > 10000) ? 10000 : soc_snap.soc01));
     /* 只要求真实 BQ 帧，不要求 NMC 标定；SOC 仅作近满策略启发，不是保护输入。 */
     policy_in.soc_valid =
         ((soc_snap.frame_valid != 0u) &&
          (soc_snap.quality == SOC_EST_QUALITY_REAL)) ? 1u : 0u;
+    policy_in.ref_cell_mv = BQ_GetRefCellMv(&bq_snap);
+    policy_in.ref_valid = (policy_in.ref_cell_mv != 0u) ? 1u : 0u;
+    policy_in.current_ms = bq_snap.last_update_ms;
     ChargePolicy_Task(now_ms, s_app.comparator_charging, &policy_in);
     Protection_Service(now_ms, &bq_snap);
     App_ProtectionEventTask();
 
     CalStream_Task(now_ms, App_GetUptimeSeconds(), &bq_snap);
-    App_UpdateLedMode();
+    App_UpdateLedMode(&soc_snap);
 
     /* 先处理 LP 待标记和 NORM 30 min 标记，再判断能否进 LP；否则
      * 标记到达的这一圈可能抢先复位，造成档案窗口漏处理。 */
@@ -1236,8 +1309,22 @@ void App_Loop(void)
         {
             block |= APP_LP_BLOCK_BUTTON;
         }
-        if ((SelfTest_IsDone() == 0u) || (SelfTest_IsPassed() == 0u))
+        if (((SelfTest_IsDone() == 0u) || (SelfTest_IsPassed() == 0u)) &&
+            !((ChargePolicy_GetState() ==
+               CHARGE_POLICY_LOW_BATTERY_CHARGE) &&
+              (ChargePolicy_IsLpBlocked() == 0u) &&
+              ((SelfTest_GetFailMask() &
+                (uint16_t)~SELFTEST_FAIL_BQ_DATA) == 0u) &&
+              ((Fault_GetAll() &
+                (FAULT_BIT_BQ_COMM | FAULT_BIT_BQ_XREADY |
+                 FAULT_BIT_BQ_SCD | FAULT_BIT_BQ_OCD |
+                 FAULT_BIT_BQ_ADC_STUCK | FAULT_BIT_PROTECTION |
+                 FAULT_BIT_POWER | FAULT_BIT_CLK | FAULT_BIT_TEMP |
+                 FAULT_BIT_FLASH_LOG | FAULT_BIT_FLASH_STATE |
+                 FAULT_BIT_TIMEBASE)) == 0u)))
         {
+            /* 低电且没有充电活动时，仅 BQ_DATA 自检失败不能阻止休眠；
+             * 真实通信/硬件/温度/Flash 故障仍按原逻辑阻止。 */
             block |= APP_LP_BLOCK_TEST;
         }
         if (StateMachine_GetState() != SM_STATE_NORM)
@@ -1273,7 +1360,6 @@ void App_Loop(void)
         {
             block |= APP_LP_BLOCK_FLASH_MARK;
         }
-
         if ((StateMachine_GetState() != SM_STATE_NORM) ||
             (s_app.pending_lp_mark_active != 0u) ||
             (s_app.norm_mark_active != 0u))
