@@ -33,6 +33,11 @@ extern DMA_HandleTypeDef hdma_i2c1_rx;   /* DMA1_Ch7，I2C1_RX（CubeMX 生成�
 /* ==================== App 自行定义的 DMA 句柄 ==================== */
 extern DMA_HandleTypeDef hdma_log_usart1_tx;/* DMA1_Ch4，USART1_TX */
 
+/* ==================== 发布版本 ==================== */
+/* 与 Git tag vX.Y.Z+hwA.BC 对应；启动日志会打印这两个字符串。 */
+#define APP_HW_VERSION_STR      "0.80"
+#define APP_FW_VERSION_STR      "0.0.11"
+
 /* ==================== 调度周期 ==================== */
 #define APP_TICK_HZ             250U        /* TIM2 应用中断频率 */
 #define APP_TICK_MS             4U

@@ -1,4 +1,5 @@
 /.vscode
 /build
 /.cache
+/release/
 CLAUDE.md

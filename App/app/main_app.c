@@ -1173,7 +1173,8 @@ void App_Init(void)
     HAL_Delay(APP_5V_STARTUP_DELAY_MS);
 
     App_Log_Init();
-    App_Log_Printf("[BOOT] app init, reset=0x%02X\r\n",
+    App_Log_Printf("[BOOT] app init, HW=%s SW=%s, reset=0x%02X\r\n",
+                   APP_HW_VERSION_STR, APP_FW_VERSION_STR,
                    (unsigned)ResetCause_GetLatched());
 
     BQ_Init();

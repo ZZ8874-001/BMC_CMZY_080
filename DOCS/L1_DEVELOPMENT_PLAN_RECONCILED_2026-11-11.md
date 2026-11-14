@@ -27,8 +27,8 @@
 ### G1.1 快照与证据
 
 - 基线 commit：`ce8d609`（`fix:fuck烂掉的ADC，直接用正常的VC1，VC2值`）。
-- 工作树：已修改的 App 源、`DOCS/BATTERY_PROTECTION.md`、`DOCS/POWER_MODE.md`、`DOCS/SYSTEM_STATES.md`、`BMC.jdebug.user`；另有未跟踪的原始 L1 计划与本副本。本文描述的是该工作树快照，不是干净发布。
-- 构建（2026-11-14 clean build，含 SOC/低压/充满保护、低电充电状态、RGB SOC 指示、VC2-only 降级、BQ FET 回读影子校准与 BQ OV/UV 退避/VC2 软件 OV）：text 87600 B、data 168 B、bss 8200 B、`_image_end=0x080156D8`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
+- 发布基线：`dd6fded`（`Fuck_ADC_2`，相对 `main` 5 个提交）；发布标签 `v0.0.11+hw0.80`，未合入 `main`。
+- 构建（2026-11-14 clean build，含 SOC/低压/充满保护、低电充电状态、RGB SOC 指示、VC2-only 降级、BQ FET 回读影子校准与 BQ OV/UV 退避/VC2 软件 OV，以及 HW/SW 版本启动打印）：text 87640 B、data 168 B、bss 8200 B、`_image_end=0x08015700`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
 - 文档优先级：当前代码 > `CLAUDE.md` 的 2026-11-10/11/12 当前状态段 > `DOCS/POWER_MODE.md`/`SYSTEM_STATES.md`/`BATTERY_PROTECTION.md` 顶部更新说明 > 本计划原文。`DOCS/BATTERY_PROTECTION.md` 正文仍残留已删除的 partial/`bq_anomaly` 历史段落，不能整篇当作当前状态；2026-11-12 新增行为见其 §0。
 
 ### G1.2 已落地的关键路径
@@ -909,13 +909,13 @@ BMS_CAL_Init → SOH_Init → BMS_NVM_Init
 
 | 页 | 地址 | 用途 | 当前状态 |
 |---:|---|---|---|
-| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x080156D8` |
+| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x08015700` |
 | 48–49 | `0x08018000–0x08018FFF` | BMS SOC/SOH NVM | 已实现；132/136 B，两槽 |
 | 50–51 | `0x08019000–0x08019FFF` | L1 StateStore | 已实现；48 B v2，两页 |
 | 52–63 | `0x0801A000–0x0801FFFF` | 黑匣子 | 已实现；24 B×1020 |
 
 - 链接脚本 `FLASH LENGTH=96K`；
-- `_image_end` 必须 ≤0x08018000；当前 0x080156D8 通过；
+- `_image_end` 必须 ≤0x08018000；当前 0x08015700 通过；
 - 黑匣子必须 <0x0801A000；
 - CubeMX 重生成后恢复 96K、`-include app.mk` 和链接断言。
 
@@ -1288,7 +1288,7 @@ flags：
 
 | 项 | 状态 |
 |---|---|
-| 清理构建/镜像尺寸/链接断言 | E2 通过：87600/168/8200 B，`_image_end=0x080156D8` |
+| 清理构建/镜像尺寸/链接断言 | E2 通过：87640/168/8200 B，`_image_end=0x08015700` |
 | 按键手势检测 | E1/E2；只消费 PAIR_HOLD3 |
 | LP 周期/PB5/30 min/BQ sniff | 已有台架记录（E3，历史），但周期是 ~30 s，不是 1 s |
 | 充电唤醒 ≤1.5 s | **未满足**，实际最坏约 30 s |
@@ -1301,7 +1301,7 @@ flags：
 > **状态**：`[已通过 E2]`（2026-11-11）。
 
 - `make clean && make -j2 all` 零警告零错误；
-- `_image_end <= 0x08018000`；当前 `0x080156D8`；
+- `_image_end <= 0x08018000`；当前 `0x08015700`；
 - 黑匣子/StateStore/NVM 地址不重叠；
 - `app.mk` 包含所有新源；`compile_commands.json` 同步；
 - CubeMX 重生成后恢复 96K、`-include app.mk`、RTC 选择补丁；
@@ -1468,7 +1468,7 @@ L1 完成需同时满足：
 | 储存监测 | 30 min HSI16 | 已实现；不更新 SOC/SOH | 部分（C-07） |
 | 空闲 LP | 5 s | 5 s | 已实现 |
 | RTC/WUT | LSE 32.768 kHz；WUT 1 s 自由运行 | LSE 死，默认 LSI；WUT 关闭 | 冲突（C-01/C-03） |
-| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x080156D8` | 已实现 |
+| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x08015700` | 已实现 |
 | BMS NVM | 页 48–49，132/136 B | 同 | 已实现 |
 | StateStore | 页 50–51，48 B | 同（v2） | 已实现；生命周期 flags 未用 |
 | 黑匣子 | 页 52–63，24 B×1020 | 同 | 已实现；事件/wake 不完整 |
@@ -1525,7 +1525,7 @@ L1 完成需同时满足：
 | StateStore | `App/app/state_store.c/.h`；`main_app.c` `App_CommitArchiveSnapshot()` |
 | 黑匣子 | `App/app/black_box.c/.h`；`BlackBox_WriteWake()` 的 `& 0x07`；事件枚举 |
 | LED/蜂鸣器 | `App/app/led_status.c/.h`；`App/bsp/buzzer.c/.h` |
-| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x080156D8` |
+| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x08015700` |
 | 当前文档 | `CLAUDE.md` 2026-11-11 段；`DOCS/POWER_MODE.md`/`SYSTEM_STATES.md` 顶部更新说明 |
 
 ---
