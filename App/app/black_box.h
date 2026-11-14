@@ -72,6 +72,8 @@
 #define BB_EVENT_PROT_CELL_UV_CLEARED 0x27u
 #define BB_EVENT_PROT_CHARGE_FULL 0x28u
 #define BB_EVENT_PROT_CHARGE_FULL_CLEARED 0x29u
+#define BB_EVENT_PROT_CELL_OV 0x2Au
+#define BB_EVENT_PROT_CELL_OV_CLEARED 0x2Bu
 
 /* 旧记录的唤醒原因编码（flags 第 3–5 位）。 */
 #define BB_WAKE_NONE        0u

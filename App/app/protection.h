@@ -60,6 +60,8 @@ typedef enum
 #define PROT_EVENT_CELL_UV_CLEARED          (1u << 11)
 #define PROT_EVENT_CHARGE_FULL              (1u << 12)
 #define PROT_EVENT_CHARGE_FULL_CLEARED      (1u << 13)
+#define PROT_EVENT_CELL_OV                  (1u << 14)
+#define PROT_EVENT_CELL_OV_CLEARED          (1u << 15)
 
 /* ---------------- M2a 软件 OCP ----------------
  * 方向由 COMP2（消抖后）判定，幅值用 CC 积分值；这样 CC 极性如果与 TI
@@ -100,6 +102,12 @@ typedef enum
 #define PROT_EARLY_CONFIRM_FRAMES   2u
 #define PROT_EARLY_RECOVER_SOC_01   1000u
 #define PROT_EARLY_RECOVER_FRAMES   2u
+
+/* VC5/BAT 不可信、BQ OV/UV 退避期间的 MCU VC2 软件过压。 */
+#define PROT_CELL_OV_MV             4250u
+#define PROT_CELL_OV_RECOVER_MV     4150u
+#define PROT_CELL_OV_CONFIRM_FRAMES 2u
+#define PROT_CELL_OV_RECOVER_FRAMES 2u
 
 /* ---------------- 充满提示（NMC） ----------------
  * 只置 charge_full/白灯，不关 CHG；BQ OV 4.25 V 仍是最终硬件保护。 */
@@ -154,6 +162,13 @@ typedef struct
     uint8_t  ref_cell2_only;   /* 保护当前使用 VC2-only 降级 */
     uint8_t  cell_uv_active;
     uint8_t  cell_uv_streak;
+    uint8_t  cell_ov_active;
+    uint8_t  cell_ov_streak;
+    uint8_t  cell_ov_recover_streak;
+    uint8_t  voltage_backoff;      /* BQ OV/UV 退避 active/pending */
+    uint8_t  bq_fet_hold_mask;    /* BQ 退避期间禁止重开的 FET 位 */
+    uint16_t cell_ov_ref_mv;
+    uint32_t cell_ov_count;
     uint8_t  early_soc_latched;   /* 低电状态（兼容旧命名） */
     uint8_t  early_soc_streak;
     uint8_t  early_soc_recover_streak;
@@ -191,6 +206,7 @@ uint8_t Protection_GetBootLatchMask(void);
 void Protection_GetSnapshot(protection_snapshot_t *out);
 
 uint8_t Protection_IsCellUvActive(void);
+uint8_t Protection_IsCellOvActive(void);
 uint8_t Protection_IsLowBattery(void);
 uint8_t Protection_IsSocCutoffLatched(void);   /* 兼容旧命名 */
 uint8_t Protection_GetChargeFull(void);

@@ -191,6 +191,19 @@ typedef struct
     uint8_t  log_cell3_valid; /* 真实 VC5 可信，可用于黑匣子/StateStore */
     uint8_t  log_pack_valid;  /* 真实 BAT 可信，可用于黑匣子/StateStore */
     uint8_t  ref_cell2_only;  /* 1=VC5/BAT 不可信，保护/SOC 用 VC2 */
+    uint8_t  voltage_backoff; /* 1=BQ OV/UV 已暂时退避，软件 VC2 OV/UV 接管 */
+    uint8_t  voltage_backoff_pending; /* 等待主循环暂停/恢复 BQ OV/UV */
+    uint8_t  voltage_backoff_restore_pending; /* 3 个正常批次后等待恢复 */
+    uint8_t  voltage_backoff_failed;  /* 退避或恢复写/回读失败，FET 保持关闭 */
+    uint8_t  voltage_backoff_normal_streak; /* 连续正常发布批次数 */
+    uint8_t  voltage_ov_trip_normal;  /* 退避前的正常 OV_TRIP 码 */
+    uint8_t  voltage_uv_trip_normal;  /* 退避前的正常 UV_TRIP 码 */
+    uint8_t  voltage_hold_mask;       /* 退避/重锁存期间禁止重开的 FET 位 */
+    uint8_t  voltage_relatch_mask;    /* 退避期间重新出现的 raw OV/UV */
+    uint8_t  voltage_backoff_clear_done; /* 本次退避已完成一次性 OV/UV 清除 */
+    uint8_t  voltage_backoff_clear_failed; /* 清除失败，仅诊断；active 期间仍忽略 OV/UV */
+    uint32_t voltage_backoff_probe_until_ms; /* 旧观察窗字段，保持 0 */
+    uint8_t  voltage_lp_restore_failed;
     uint16_t ov_trip_mv;      /* 实际写入 OV_TRIP 反算值 */
     uint16_t uv_trip_mv;      /* 实际写入 UV_TRIP 反算值 */
     uint16_t cell12_meas_mv[2]; /* 最近一次 VC1/VC2 实测，用于 OV/UV 归因 */
@@ -366,6 +379,15 @@ uint8_t BQ_IsCcFresh(uint32_t now_ms);
 
 /* ADC 受控重启/恢复状态，主循环和自检只读使用。 */
 uint8_t BQ_IsRecovering(void);
+
+/* VC5/BAT 不可信时，BQ OV/UV 硬件保护暂时退避，由 Protection 的 VC2
+ * 软件 OV/UV 接管；SCD/OCD、OVRD_ALERT、XREADY 仍保持有效。 */
+uint8_t BQ_IsVoltageBackoffActive(void);
+uint8_t BQ_IsVoltageBackoffPending(void);
+uint8_t BQ_IsVoltageBackoffFailed(void);
+uint8_t BQ_GetVoltageFetHoldMask(void);
+int BQ_ServiceVoltageBackoff(void);          /* 主循环、BQ RUN/idle 调用 */
+int BQ_RestoreVoltageProtectionForLp(void);  /* NORM 进 LP 前尽力恢复 */
 uint8_t BQ_GetAdcRecoveryFailed(void);
 
 /* ADC 恢复过程的一次性事件位；由主循环取走并写黑匣子，bsp 不直接写 Flash。 */

@@ -5,7 +5,7 @@
 **********************************************************************
 
 File          : 
-Created       : 02. Nov 2026 14:56
+Created       : 14. Nov 2026 19:03
 Ozone Version : V3.40i
 */
 
@@ -22,18 +22,16 @@ void OnProjectLoad (void) {
   //
   // Dialog-generated settings
   //
+  Project.AddPathSubstitute ("C:/Users/Shuchen Tao/Documents/BMC_CMZY_080", "$(ProjectDir)");
+  Project.AddPathSubstitute ("c:/users/shuchen tao/documents/bmc_cmzy_080", "$(ProjectDir)");
   Project.SetDevice ("STM32L432KB");
   Project.SetHostIF ("USB", "");
   Project.SetTargetIF ("SWD");
   Project.SetTIFSpeed ("4 MHz");
-  Project.AddPathSubstitute ("C:/Users/Shuchen Tao/Documents/BMC_CMZY_080", "$(ProjectDir)");
-  Project.AddPathSubstitute ("c:/users/shuchen tao/documents/bmc_cmzy_080", "$(ProjectDir)");
   Project.AddSvdFile ("$(InstallDir)/Config/CPU/Cortex-M4F.svd");
-  Project.SetFlashLoader ("0x08000000 = Singlebank");
   //
   // User settings
   //
-  Edit.SysVar (VAR_HSS_SPEED, FREQ_100_HZ);
   File.Open ("$(ProjectDir)/build/BMC_CMZY_080.elf");
 }
 

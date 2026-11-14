@@ -82,6 +82,14 @@
 #define BQ_OV_CLEAR_GUARD_MV    20
 #define BQ_UV_CLEAR_GUARD_MV    20
 
+/* VC5/BAT 不可信时 BQ 的全局 OV/UV 不可归因；暂时把 trip code 放到
+ * 数据手册允许的端点（OV=0xFF、UV=0x00），由 MCU 用 VC2 做软件 OV/UV。
+ * 这不是真正关闭比较器：极端电压仍会动作。active 期间 raw OV/UV 完全
+ * 忽略，只做一次清除，不反复清除，也不 hold FET。 */
+#define BQ_OV_TRIP_RELAX_CODE      0xFFu
+#define BQ_UV_TRIP_RELAX_CODE      0x00u
+#define BQ_VOLT_BACKOFF_EXIT_FRAMES 3u
+
 /* 受控 ADC 重启/恢复。 */
 #define BQ_ADC_CONVERSION_MS             250u  /* BQ ADC 帧周期，采样最小间隔 */
 #define BQ_ADC_RESAMPLE_MS               500u  /* OOR 后重采样间隔（250 + 余量） */
@@ -205,6 +213,27 @@ static struct
     uint8_t protection_ok;
     uint8_t boot_prot_latch_mask;
     uint8_t boot_prot_capture_armed;
+
+    /* VC5/BAT 异常时的 BQ OV/UV 退避/恢复状态。 */
+    uint8_t voltage_backoff_active;
+    uint8_t voltage_backoff_pending;
+    uint8_t voltage_backoff_restore_pending;
+    uint8_t voltage_backoff_failed;
+    uint8_t voltage_backoff_clear_done;
+    uint8_t voltage_backoff_clear_failed; /* 一次性清除失败，仅诊断，不阻止 active */
+    uint8_t voltage_backoff_normal_streak;
+    uint8_t voltage_backoff_abnormal_count;
+    uint8_t voltage_hold_mask;       /* FET 位，1=禁止重开；当前策略保持 0 */
+    uint8_t voltage_probe_mask;      /* 旧观察窗字段，保持 0 */
+    uint8_t voltage_relatch_mask;    /* 退避期间再次出现的 raw OV/UV，仅诊断 */
+    uint8_t voltage_trip_saved;      /* normal OV/UV code 已保存 */
+    uint8_t voltage_ov_trip_normal;
+    uint8_t voltage_uv_trip_normal;
+    uint32_t voltage_probe_until_ms;
+    uint32_t voltage_next_retry_ms;
+    uint8_t voltage_lp_restore_failed;
+    uint8_t run_log_cell3_valid;
+    uint16_t run_log_cell3_mv;
 
     uint16_t raw_cell[3];
     uint16_t raw_pack;
@@ -660,6 +689,96 @@ static void Bq_UpdateVoltageFaults(uint8_t stat)
     Fault_SetLive(live);
 }
 
+static uint8_t Bq_VoltageBackoffMasking(void)
+{
+    return ((s_bq.voltage_backoff_pending != 0u) ||
+            (s_bq.voltage_backoff_active != 0u)) ? 1u : 0u;
+}
+
+/* 完整批次一旦确认 VC5/BAT 不可信，立即登记退避；不等待第二个批次。
+ * pending 期间 FET 同步暂停；active 后 raw OV/UV 只作诊断，不再 hold FET。 */
+static void Bq_VoltageBackoffNoteBatch(const bq_batch_quality_t *b)
+{
+    uint8_t vc2_ok;
+
+    if ((b == NULL) || (b->complete == 0u) ||
+        (b->ref_cell2_only == 0u))
+    {
+        return;
+    }
+    vc2_ok = (((b->field_ok_mask & BQ_FIELD_VC2) != 0u) &&
+              (b->cell_mv[1] >= BQ_CELL_VALID_MIN_MV) &&
+              (b->cell_mv[1] <= BQ_CELL_VALID_MAX_MV)) ? 1u : 0u;
+    if (vc2_ok == 0u)
+    {
+        /* 没有可替代的 VC2 时不放松 BQ 硬件电压保护；Protection 会因
+         * 参考节无效而 fail-closed。 */
+        s_bq.voltage_backoff_normal_streak = 0u;
+        return;
+    }
+
+    s_bq.voltage_backoff_normal_streak = 0u;
+    s_bq.voltage_backoff_restore_pending = 0u;
+    if (s_bq.voltage_backoff_abnormal_count < 0xFFu)
+    {
+        s_bq.voltage_backoff_abnormal_count++;
+    }
+    if ((s_bq.voltage_backoff_active == 0u) &&
+        (s_bq.voltage_backoff_pending == 0u))
+    {
+        s_bq.voltage_backoff_pending = 1u;
+        s_bq.voltage_backoff_restore_pending = 0u;
+        s_bq.voltage_backoff_failed = 0u;
+        s_bq.voltage_backoff_clear_done = 0u;
+        s_bq.voltage_backoff_clear_failed = 0u;
+        s_bq.voltage_relatch_mask = 0u;
+        s_bq.voltage_hold_mask = 0u;
+        s_bq.voltage_probe_mask = 0u;
+    }
+
+    /* 退避 active 后 BQ OV/UV 完全不可信：raw 位只保留诊断，绝不再形成
+     * FET hold。pending 阶段 FET 同步本身已被 Bq_ScriptComplete 阻止，
+     * 等阈值放松并建立软件 VC2 保护后即可重新按策略同步。 */
+    if (s_bq.voltage_backoff_active != 0u)
+    {
+        if ((s_bq.raw_sys_stat & BQ_SYS_STAT_OV) != 0u)
+        {
+            s_bq.voltage_relatch_mask |= BQ_SYS_STAT_OV;
+        }
+        if ((s_bq.raw_sys_stat & BQ_SYS_STAT_UV) != 0u)
+        {
+            s_bq.voltage_relatch_mask |= BQ_SYS_STAT_UV;
+        }
+    }
+}
+
+/* 只统计成功发布的正常帧；连续 3 帧后请求恢复 BQ 硬件 OV/UV。 */
+static void Bq_VoltageBackoffOnPublish(const bq_batch_quality_t *b)
+{
+    if ((b == NULL) ||
+        ((s_bq.voltage_backoff_active == 0u) &&
+         (s_bq.voltage_backoff_pending == 0u)))
+    {
+        return;
+    }
+    if ((b->ref_cell2_only != 0u) ||
+        (b->log_cell3_valid == 0u) || (b->log_pack_valid == 0u))
+    {
+        s_bq.voltage_backoff_normal_streak = 0u;
+        return;
+    }
+    if (s_bq.voltage_backoff_normal_streak < 0xFFu)
+    {
+        s_bq.voltage_backoff_normal_streak++;
+    }
+    if ((s_bq.voltage_backoff_active != 0u) &&
+        (s_bq.voltage_backoff_normal_streak >=
+         BQ_VOLT_BACKOFF_EXIT_FRAMES))
+    {
+        s_bq.voltage_backoff_restore_pending = 1u;
+    }
+}
+
 /* BQ 的 OV/UV 是全局锁存，无法区分哪一节；本板 VC5/BAT 还可能异常。
  * 规则：
  *   - 首个完整 VC1/VC2 读取前：屏蔽 OV/UV（硬件 FET 保护仍生效）。
@@ -672,13 +791,20 @@ static void Bq_UpdateVoltageFaults(uint8_t stat)
 static uint8_t Bq_FilterHwOvUv(uint8_t raw)
 {
     uint8_t eff = raw;
-    uint16_t c1;
-    uint16_t c2;
+    uint16_t c1 = 0u;
+    uint16_t c2 = 0u;
     uint8_t have_cells = 0u;
 
     if ((raw & (BQ_SYS_STAT_OV | BQ_SYS_STAT_UV)) == 0u)
     {
         return raw;
+    }
+
+    /* VC5/BAT 不可信期间 BQ OV/UV 不做归因；软件 VC2 OV/UV 接管。
+     * LOCKOUT/失败时不要静默屏蔽，让原始锁存保持可见并由 Protection fail-closed。 */
+    if (Bq_VoltageBackoffMasking() != 0u)
+    {
+        return (uint8_t)(raw & (uint8_t)~(BQ_SYS_STAT_OV | BQ_SYS_STAT_UV));
     }
 
     /* 优先用当前批 VC1/VC2 实测；当前批无效/不可信时退回最近一次已发布
@@ -724,23 +850,39 @@ static uint8_t Bq_FilterHwOvUv(uint8_t raw)
     }
 
     if ((c1 < BQ_CELL_VALID_MIN_MV) || (c1 > BQ_CELL_VALID_MAX_MV) ||
-        (c2 < BQ_CELL_VALID_MIN_MV) || (c2 > BQ_CELL_VALID_MAX_MV))
+        (c2 < BQ_CELL_VALID_MIN_MV) || (c2 > BQ_CELL_VALID_MAX_MV) ||
+        (s_bq.run_log_cell3_valid == 0u) ||
+        (s_bq.run_log_cell3_mv < BQ_CELL_VALID_MIN_MV) ||
+        (s_bq.run_log_cell3_mv > BQ_CELL_VALID_MAX_MV))
     {
-        /* 已发布值理论上不会越界；这里只在当前批/回退值都不可用时走到，
-         * 无法证明安全，保留原始 OV/UV。 */
+        /* 正常模式必须能证明三节都安全；任何一节不可用都不能清锁存。 */
         return raw;
     }
 
-    if (((c1 >= c2) ? c1 : c2) <=
-        ((s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV) ?
-         (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u))
     {
-        eff &= (uint8_t)~BQ_SYS_STAT_OV;
-    }
-    if ((uint32_t)((c1 <= c2) ? c1 : c2) >=
-        ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV))
-    {
-        eff &= (uint8_t)~BQ_SYS_STAT_UV;
+        uint16_t c3 = s_bq.run_log_cell3_mv;
+        uint16_t max_v = (c1 >= c2) ? c1 : c2;
+        uint16_t min_v = (c1 <= c2) ? c1 : c2;
+
+        if (c3 > max_v)
+        {
+            max_v = c3;
+        }
+        if (c3 < min_v)
+        {
+            min_v = c3;
+        }
+        if (max_v <=
+            ((s_bq.ov_trip_mv > BQ_OV_CLEAR_GUARD_MV) ?
+             (uint16_t)(s_bq.ov_trip_mv - BQ_OV_CLEAR_GUARD_MV) : 0u))
+        {
+            eff &= (uint8_t)~BQ_SYS_STAT_OV;
+        }
+        if ((uint32_t)min_v >=
+            ((uint32_t)s_bq.uv_trip_mv + BQ_UV_CLEAR_GUARD_MV))
+        {
+            eff &= (uint8_t)~BQ_SYS_STAT_UV;
+        }
     }
     return eff;
 }
@@ -754,7 +896,21 @@ static void Bq_RefreshEffectiveSysStat(void)
     uint8_t eff = Bq_FilterHwOvUv(raw);
 
     s_bq.sys_stat = eff;
-    if ((s_bq.ref_decision_final != 0u) &&
+    if (s_bq.voltage_backoff_active != 0u)
+    {
+        /* 只记录诊断；active 期间 OV/UV 不再参与 FET 门控。 */
+        if ((raw & BQ_SYS_STAT_OV) != 0u)
+        {
+            s_bq.voltage_relatch_mask |= BQ_SYS_STAT_OV;
+        }
+        if ((raw & BQ_SYS_STAT_UV) != 0u)
+        {
+            s_bq.voltage_relatch_mask |= BQ_SYS_STAT_UV;
+        }
+    }
+    if ((Bq_VoltageBackoffMasking() == 0u) &&
+        (s_bq.voltage_backoff_failed == 0u) &&
+        (s_bq.ref_decision_final != 0u) &&
         (s_bq.cell12_measured_once != 0u) && (s_bq.cell12_meas_valid != 0u))
     {
         if (((raw & BQ_SYS_STAT_OV) != 0u) && ((eff & BQ_SYS_STAT_OV) == 0u))
@@ -1014,6 +1170,45 @@ static void Bq_UpdateTripThresholds(void)
     s_bq.uv_trip_mv = Bq_TripFullToMv(uv_full);
 }
 
+/* 只写 OV_TRIP/UV_TRIP，并逐字节回读；不碰 PROTECT1/2/3。 */
+static int Bq_SetOvUvTripVerified(uint8_t ov_trip, uint8_t uv_trip)
+{
+    uint8_t rb = 0u;
+
+    if (Bq_BlockingWrite(BQ_REG_OV_TRIP, ov_trip) != 0 ||
+        Bq_BlockingWrite(BQ_REG_UV_TRIP, uv_trip) != 0 ||
+        Bq_BlockingRead1(BQ_REG_OV_TRIP, &rb) != 0 || (rb != ov_trip) ||
+        Bq_BlockingRead1(BQ_REG_UV_TRIP, &rb) != 0 || (rb != uv_trip))
+    {
+        return -1;
+    }
+
+    s_bq.ov_trip = ov_trip;
+    s_bq.uv_trip = uv_trip;
+    Bq_UpdateTripThresholds();
+    return 0;
+}
+
+/* 退避进入/恢复时只清一次 OV/UV；写 1 清锁存后回读。 */
+static int Bq_ClearOvUvVerified(void)
+{
+    uint8_t stat = 0u;
+
+    if (Bq_BlockingWrite(BQ_REG_SYS_STAT,
+                         (uint8_t)(BQ_SYS_STAT_OV | BQ_SYS_STAT_UV)) != 0)
+    {
+        return -1;
+    }
+    HAL_Delay(2u);
+    if (Bq_BlockingRead1(BQ_REG_SYS_STAT, &stat) != 0)
+    {
+        return -1;
+    }
+    s_bq.raw_sys_stat = stat;
+    Bq_RefreshEffectiveSysStat();
+    return ((stat & (BQ_SYS_STAT_OV | BQ_SYS_STAT_UV)) == 0u) ? 0 : -1;
+}
+
 /* 控制帧只校验 VC1/VC2 实测值；cell3/pack 可能是真实值或估算值，
  * 不参与校验。VC5/BAT/VC3/VC4 的原始读数异常不阻塞发布。 */
 static uint8_t Bq_ValidateFrameValues(const uint16_t cells[3], uint8_t *reason)
@@ -1100,6 +1295,7 @@ static void Bq_RecordReject(const uint16_t cells[3], uint16_t pack,
     s_bq.frame_confirm_count = 0u;
     s_bq.fresh = 0u;
     s_bq.good_publish_streak = 0u;
+    s_bq.voltage_backoff_normal_streak = 0u;
 
     if (s_bq.reject_streak < 0xFFFFu)
     {
@@ -1152,6 +1348,7 @@ static void Bq_PublishFrame(const uint16_t cells[3], uint16_t pack)
     s_bq.ref_cell2_only = s_bq.batch.ref_cell2_only;
     s_bq.run_ref_cell2_only = s_bq.batch.ref_cell2_only;
     s_bq.ref_decision_final = 1u;
+    Bq_VoltageBackoffOnPublish(&s_bq.batch);
     s_bq.max_cell_mv = (cells[0] >= cells[1]) ? cells[0] : cells[1];
     if (cells[2] > s_bq.max_cell_mv)
     {
@@ -1324,7 +1521,13 @@ static uint8_t Bq_FinishRunBatch(void)
         b->ref_cell2_only = 0u;
     }
     s_bq.run_ref_cell2_only = b->ref_cell2_only;
+    s_bq.run_log_cell3_valid = b->log_cell3_valid;
+    s_bq.run_log_cell3_mv = b->log_cell3_mv;
     s_bq.ref_decision_final = 1u;
+
+    /* VC5/BAT 异常按“首个完整批次”立即登记退避；即使该帧尚未发布，
+     * 也先阻止 FET 同步，等待主循环放宽 BQ 阈值并建立软件 VC2 保护。 */
+    Bq_VoltageBackoffNoteBatch(b);
     Bq_RefreshEffectiveSysStat();
     b->sys_stat = s_bq.sys_stat;
 
@@ -1360,6 +1563,21 @@ static uint8_t Bq_FinishRunBatch(void)
     {
         b->field_ok_mask |= BQ_FIELD_CC;
     }
+
+    /* fet_mask_applied 只是软件影子，不能证明 BQ 物理上仍开着 CHG/DSG：
+     * OV/ALERT override/XREADY 或写入瞬态都可能把实际位清掉。若本批没有
+     * BQ 保护故障而回读与影子不一致，先把影子校准到实际值；下一轮 RUN
+     * 脚本的 request != applied 判断才会重新请求，否则会永久停在“已应用”
+     * 但实际关管的状态。有故障时保留影子，交给 Protection 处理。 */
+    if ((b->complete != 0u) &&
+        (s_bq.fet_sync_active == 0u) &&
+        ((b->sys_stat & BQ_BATCH_FAULT_MASK) == 0u) &&
+        ((b->ctrl2 & BQ_SYS_CTRL2_CC_EN) != 0u) &&
+        ((b->ctrl2 & BQ_FET_MASK_ALL) != s_bq.fet_mask_applied))
+    {
+        s_bq.fet_mask_applied = (uint8_t)(b->ctrl2 & BQ_FET_MASK_ALL);
+    }
+
     /* 控制值逐字段优先真实值；日志值保持上面的 real-or-0。 */
     real_c3 = Bq_RawToMv(b->raw_cell[2]);
     real_pack = Bq_RawPackToMv(b->raw_pack);
@@ -1557,6 +1775,23 @@ static int Bq_ApplyProtectionConfig(void)
         full = 0x1FFF;
     }
     uv_trip = (uint8_t)((full >> 4) & 0xFF);
+
+    /* 退避/待退避期间，ADC 重配置也不能把正常 OV/UV threshold 提前写回。
+     * 保存的 normal code 用于恢复；若尚未保存则在此保存一次。 */
+    if ((s_bq.voltage_backoff_pending != 0u) ||
+        (s_bq.voltage_backoff_active != 0u))
+    {
+        if (s_bq.voltage_trip_saved == 0u)
+        {
+            s_bq.voltage_ov_trip_normal = ov_trip;
+            s_bq.voltage_uv_trip_normal = uv_trip;
+            s_bq.voltage_trip_saved = 1u;
+        }
+        ov_trip = BQ_OV_TRIP_RELAX_CODE;
+        uv_trip = BQ_UV_TRIP_RELAX_CODE;
+        s_bq.voltage_backoff_clear_done = 0u;
+        s_bq.voltage_backoff_clear_failed = 0u;
+    }
 
     if (Bq_BlockingWrite(BQ_REG_PROTECT1, BQ_PROTECT1_VALUE) != 0 ||
         Bq_BlockingWrite(BQ_REG_PROTECT2, BQ_PROTECT2_VALUE) != 0 ||
@@ -1900,14 +2135,27 @@ static void Bq_ScriptComplete(void)
             return;
         }
 
-        if ((s_bq.request_fet_mask & 0x03u) != s_bq.fet_mask_applied)
+        /* 退避阈值尚未落地/失败时禁止 FET 同步，避免在软件 VC2 保护
+         * 尚未建立前重新打开 CHG/DSG。 */
+        if ((s_bq.voltage_backoff_pending != 0u) ||
+            (s_bq.voltage_backoff_failed != 0u))
         {
-            s_bq.fet_job.op = (uint8_t)BQ_OP_WRITE;
-            s_bq.fet_job.reg = BQ_REG_SYS_CTRL2;
-            s_bq.fet_job.data = (uint8_t)(BQ_SYS_CTRL2_CC_EN |
-                                          (s_bq.request_fet_mask & 0x03u));
-            s_bq.fet_sync_active = 1u;
-            Bq_StartScript(&s_bq.fet_job, 1u, BQ_ST_RUN);
+            return;
+        }
+
+        {
+            uint8_t safe_mask = (uint8_t)(s_bq.request_fet_mask &
+                                          (uint8_t)~s_bq.voltage_hold_mask);
+
+            if ((safe_mask & 0x03u) != s_bq.fet_mask_applied)
+            {
+                s_bq.fet_job.op = (uint8_t)BQ_OP_WRITE;
+                s_bq.fet_job.reg = BQ_REG_SYS_CTRL2;
+                s_bq.fet_job.data = (uint8_t)(BQ_SYS_CTRL2_CC_EN |
+                                              (safe_mask & 0x03u));
+                s_bq.fet_sync_active = 1u;
+                Bq_StartScript(&s_bq.fet_job, 1u, BQ_ST_RUN);
+            }
         }
     }
     else
@@ -2036,6 +2284,8 @@ static void Bq_StartConfig(void)
     s_bq.run_ref_cell2_only = s_bq.ref_cell2_only;
     s_bq.xready_at_settle = 0u;
     s_bq.xready_streak = 0u;
+    s_bq.voltage_backoff_normal_streak = 0u;
+    s_bq.voltage_backoff_restore_pending = 0u;
 
     if ((Bq_PreConfigSnapshot() != 0) || (Bq_ForceAdcOff() != 0))
     {
@@ -2180,6 +2430,25 @@ void BQ_Init(void)
     s_bq.protection_ok = 0u;
     s_bq.boot_prot_latch_mask = 0u;
     s_bq.boot_prot_capture_armed = 1u;
+    s_bq.voltage_backoff_active = 0u;
+    s_bq.voltage_backoff_pending = 0u;
+    s_bq.voltage_backoff_restore_pending = 0u;
+    s_bq.voltage_backoff_failed = 0u;
+    s_bq.voltage_backoff_clear_done = 0u;
+    s_bq.voltage_backoff_clear_failed = 0u;
+    s_bq.voltage_backoff_normal_streak = 0u;
+    s_bq.voltage_backoff_abnormal_count = 0u;
+    s_bq.voltage_hold_mask = 0u;
+    s_bq.voltage_probe_mask = 0u;
+    s_bq.voltage_relatch_mask = 0u;
+    s_bq.voltage_trip_saved = 0u;
+    s_bq.voltage_ov_trip_normal = 0u;
+    s_bq.voltage_uv_trip_normal = 0u;
+    s_bq.voltage_probe_until_ms = 0u;
+    s_bq.voltage_next_retry_ms = 0u;
+    s_bq.voltage_lp_restore_failed = 0u;
+    s_bq.run_log_cell3_valid = 0u;
+    s_bq.run_log_cell3_mv = 0u;
     s_bq.raw_cell[0] = 0u;
     s_bq.raw_cell[1] = 0u;
     s_bq.raw_cell[2] = 0u;
@@ -2352,6 +2621,26 @@ void BQ_ReInitAfterLp(void)
     s_bq.ref_decision_final = 0u;
     s_bq.cell12_meas_valid = 0u;
     s_bq.cell12_measured_once = 0u;
+    s_bq.run_log_cell3_valid = 0u;
+    s_bq.run_log_cell3_mv = 0u;
+
+    s_bq.voltage_backoff_active = 0u;
+    s_bq.voltage_backoff_pending = 0u;
+    s_bq.voltage_backoff_restore_pending = 0u;
+    s_bq.voltage_backoff_failed = 0u;
+    s_bq.voltage_backoff_clear_done = 0u;
+    s_bq.voltage_backoff_clear_failed = 0u;
+    s_bq.voltage_backoff_normal_streak = 0u;
+    s_bq.voltage_backoff_abnormal_count = 0u;
+    s_bq.voltage_hold_mask = 0u;
+    s_bq.voltage_probe_mask = 0u;
+    s_bq.voltage_relatch_mask = 0u;
+    s_bq.voltage_trip_saved = 0u;
+    s_bq.voltage_ov_trip_normal = 0u;
+    s_bq.voltage_uv_trip_normal = 0u;
+    s_bq.voltage_probe_until_ms = 0u;
+    s_bq.voltage_next_retry_ms = 0u;
+    s_bq.voltage_lp_restore_failed = 0u;
 
     /* 新的 NORM 回合：重新捕获 boot/LP 唤醒前的保护锁存。 */
     s_bq.boot_prot_latch_mask = 0u;
@@ -2659,6 +2948,19 @@ void BQ_GetSnapshot(bq_snapshot_t *out)
     out->log_cell3_valid = s_bq.log_cell3_valid;
     out->log_pack_valid = s_bq.log_pack_valid;
     out->ref_cell2_only = s_bq.ref_cell2_only;
+    out->voltage_backoff = s_bq.voltage_backoff_active;
+    out->voltage_backoff_pending = s_bq.voltage_backoff_pending;
+    out->voltage_backoff_restore_pending = s_bq.voltage_backoff_restore_pending;
+    out->voltage_backoff_failed = s_bq.voltage_backoff_failed;
+    out->voltage_backoff_normal_streak = s_bq.voltage_backoff_normal_streak;
+    out->voltage_ov_trip_normal = s_bq.voltage_ov_trip_normal;
+    out->voltage_uv_trip_normal = s_bq.voltage_uv_trip_normal;
+    out->voltage_hold_mask = s_bq.voltage_hold_mask;
+    out->voltage_relatch_mask = s_bq.voltage_relatch_mask;
+    out->voltage_backoff_clear_done = s_bq.voltage_backoff_clear_done;
+    out->voltage_backoff_clear_failed = s_bq.voltage_backoff_clear_failed;
+    out->voltage_backoff_probe_until_ms = s_bq.voltage_probe_until_ms;
+    out->voltage_lp_restore_failed = s_bq.voltage_lp_restore_failed;
     out->ov_trip_mv = s_bq.ov_trip_mv;
     out->uv_trip_mv = s_bq.uv_trip_mv;
     out->cell12_meas_mv[0] = s_bq.cell12_meas_mv[0];
@@ -2849,26 +3151,37 @@ uint8_t BQ_GetFetMaskApplied(void)
 
 int BQ_ApplyFetMaskNow(uint8_t mask)
 {
-    if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN))
+    if ((BQ_IsIdle() == 0u) || (s_bq.state != BQ_ST_RUN) ||
+        (s_bq.voltage_backoff_pending != 0u) ||
+        (s_bq.voltage_backoff_failed != 0u))
     {
         return -1;
     }
 
-    mask &= BQ_FET_MASK_ALL;
-    if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2,
-                         (uint8_t)(BQ_SYS_CTRL2_CC_EN | mask)) != 0)
     {
-        return -1;
+        uint8_t requested = (uint8_t)(mask & BQ_FET_MASK_ALL);
+        uint8_t applied = (uint8_t)(requested & (uint8_t)~s_bq.voltage_hold_mask);
+
+        if (Bq_BlockingWrite(BQ_REG_SYS_CTRL2,
+                             (uint8_t)(BQ_SYS_CTRL2_CC_EN | applied)) != 0)
+        {
+            return -1;
+        }
+        /* request 保持策略值；applied 记录实际写入值。退避 hold 不能
+         * 反向覆盖 ChargePolicy 的请求，否则策略会反复感知错误。 */
+        s_bq.request_fet_mask = requested;
+        s_bq.fet_mask_applied = applied;
     }
-    s_bq.request_fet_mask = mask;
-    s_bq.fet_mask_applied = mask;
     return 0;
 }
 
 uint8_t BQ_IsSameStateWriteReady(void)
 {
     if ((s_bq.state != BQ_ST_RUN) || (BQ_IsIdle() == 0u) ||
-        (s_bq.voltage_settled == 0u) || (s_bq.protection_ok == 0u))
+        (s_bq.voltage_settled == 0u) || (s_bq.protection_ok == 0u) ||
+        (s_bq.voltage_backoff_pending != 0u) ||
+        (s_bq.voltage_backoff_failed != 0u) ||
+        (s_bq.voltage_hold_mask != 0u))
     {
         return 0u;
     }
@@ -2937,6 +3250,193 @@ int BQ_ApplyFetMaskIfUnchanged(uint8_t expected_mask)
     {
         return -2;
     }
+    return 0;
+}
+
+uint8_t BQ_IsVoltageBackoffActive(void)
+{
+    return s_bq.voltage_backoff_active;
+}
+
+uint8_t BQ_IsVoltageBackoffPending(void)
+{
+    return s_bq.voltage_backoff_pending;
+}
+
+uint8_t BQ_IsVoltageBackoffFailed(void)
+{
+    return s_bq.voltage_backoff_failed;
+}
+
+uint8_t BQ_GetVoltageFetHoldMask(void)
+{
+    return (uint8_t)(s_bq.voltage_hold_mask & BQ_FET_MASK_ALL);
+}
+
+/* 主循环、BQ RUN/idle 调用。进入时先写极端 OV/UV trip，再一次清 OV/UV；
+ * 之后 raw OV/UV 只形成 hold，不再反复清除，避免 BQ 1 s OV 循环。
+ * 恢复时先写回 normal trip，再一次清锁存。 */
+int BQ_ServiceVoltageBackoff(void)
+{
+    uint32_t now_ms = HAL_GetTick();
+    uint8_t raw;
+    uint8_t need_clear = 0u;
+
+    if ((s_bq.state != BQ_ST_RUN) ||
+        (BQ_IsIdle() == 0u) ||
+        (s_bq.protection_ok == 0u) ||
+        (s_bq.fet_sync_active != 0u) ||
+        (s_bq.sysstat_sync_active != 0u) ||
+        (s_bq.retry != 0u))
+    {
+        return -1;
+    }
+    if ((s_bq.voltage_next_retry_ms != 0u) &&
+        ((int32_t)(now_ms - s_bq.voltage_next_retry_ms) < 0))
+    {
+        return -1;
+    }
+
+    raw = s_bq.raw_sys_stat;
+
+    if (s_bq.voltage_backoff_pending != 0u)
+    {
+        if (s_bq.voltage_trip_saved == 0u)
+        {
+            s_bq.voltage_ov_trip_normal = s_bq.ov_trip;
+            s_bq.voltage_uv_trip_normal = s_bq.uv_trip;
+            s_bq.voltage_trip_saved = 1u;
+        }
+        if (Bq_SetOvUvTripVerified(BQ_OV_TRIP_RELAX_CODE,
+                                   BQ_UV_TRIP_RELAX_CODE) != 0)
+        {
+            s_bq.voltage_backoff_failed = 1u;
+            s_bq.voltage_next_retry_ms = now_ms + 1000u;
+            return -1;
+        }
+
+        /* pending 阶段 FET 同步已暂停；清一次 OV/UV 只是尽力，清除失败
+         * 不阻止 active：active 期间 BQ OV/UV 被完全忽略，由 VC2 软件
+         * OV/UV 接管。 */
+        s_bq.voltage_relatch_mask = 0u;
+        s_bq.voltage_backoff_clear_failed =
+            (Bq_ClearOvUvVerified() != 0) ? 1u : 0u;
+        s_bq.voltage_backoff_clear_done = 1u;
+        s_bq.voltage_backoff_failed = 0u;
+        s_bq.voltage_backoff_pending = 0u;
+        s_bq.voltage_backoff_active = 1u;
+        s_bq.voltage_backoff_normal_streak = 0u;
+        s_bq.voltage_hold_mask = 0u;
+        s_bq.voltage_probe_mask = 0u;
+        s_bq.voltage_probe_until_ms = 0u;
+        s_bq.voltage_next_retry_ms = 0u;
+        return 1;
+    }
+
+    if (s_bq.voltage_backoff_active == 0u)
+    {
+        return 0;
+    }
+
+    /* active 期间 raw OV/UV 只记录诊断：不 hold FET、不再反复清锁存。
+     * BQ 若仍自行清 CHG/DSG 位，FET 影子回读会在下一轮请求中重写。 */
+    if ((raw & BQ_SYS_STAT_OV) != 0u)
+    {
+        s_bq.voltage_relatch_mask |= BQ_SYS_STAT_OV;
+    }
+    if ((raw & BQ_SYS_STAT_UV) != 0u)
+    {
+        s_bq.voltage_relatch_mask |= BQ_SYS_STAT_UV;
+    }
+
+    /* CONFIG/ADC 重启可能把 clear_done 清掉；只允许一次补清，且失败
+     * 只作诊断，不影响 active 下的 FET 放行。 */
+    if (s_bq.voltage_backoff_clear_done == 0u)
+    {
+        need_clear = 1u;
+    }
+    if (need_clear != 0u)
+    {
+        s_bq.voltage_backoff_clear_failed =
+            (Bq_ClearOvUvVerified() != 0u) ? 1u : 0u;
+        s_bq.voltage_backoff_clear_done = 1u;
+    }
+
+    if ((s_bq.voltage_backoff_restore_pending != 0u) &&
+        (s_bq.voltage_backoff_normal_streak >=
+         BQ_VOLT_BACKOFF_EXIT_FRAMES))
+    {
+        if ((s_bq.voltage_trip_saved == 0u) ||
+            (Bq_SetOvUvTripVerified(s_bq.voltage_ov_trip_normal,
+                                    s_bq.voltage_uv_trip_normal) != 0))
+        {
+            s_bq.voltage_backoff_failed = 1u;
+            s_bq.voltage_next_retry_ms = now_ms + 1000u;
+            return -1;
+        }
+        (void)Bq_ClearOvUvVerified();
+        s_bq.voltage_backoff_active = 0u;
+        s_bq.voltage_backoff_pending = 0u;
+        s_bq.voltage_backoff_restore_pending = 0u;
+        s_bq.voltage_backoff_clear_done = 0u;
+        s_bq.voltage_backoff_clear_failed = 0u;
+        s_bq.voltage_hold_mask = 0u;
+        s_bq.voltage_probe_mask = 0u;
+        s_bq.voltage_probe_until_ms = 0u;
+        s_bq.voltage_relatch_mask = 0u;
+        s_bq.voltage_backoff_normal_streak = 0u;
+        s_bq.voltage_trip_saved = 0u;
+        s_bq.voltage_backoff_failed = 0u;
+        s_bq.voltage_next_retry_ms = 0u;
+        return 2;
+    }
+
+    return 0;
+}
+
+/* NORM 侧进 LP 前尽力恢复 BQ normal OV/UV；失败只记录，不阻止 LP
+ *（用户选择 LP 正常运行）。全量唤醒仍由 BQ_Init 写回 normal。 */
+int BQ_RestoreVoltageProtectionForLp(void)
+{
+    if ((s_bq.voltage_backoff_active == 0u) &&
+        (s_bq.voltage_backoff_pending == 0u) &&
+        (s_bq.voltage_backoff_restore_pending == 0u))
+    {
+        return 0;
+    }
+    if ((s_bq.state != BQ_ST_RUN) || (BQ_IsIdle() == 0u))
+    {
+        s_bq.voltage_lp_restore_failed = 1u;
+        return -1;
+    }
+    if ((s_bq.voltage_backoff_active != 0u) &&
+        (s_bq.voltage_trip_saved == 0u))
+    {
+        s_bq.voltage_lp_restore_failed = 1u;
+        return -1;
+    }
+    if ((s_bq.voltage_trip_saved != 0u) &&
+        (Bq_SetOvUvTripVerified(s_bq.voltage_ov_trip_normal,
+                                s_bq.voltage_uv_trip_normal) != 0))
+    {
+        s_bq.voltage_lp_restore_failed = 1u;
+        return -1;
+    }
+    (void)Bq_ClearOvUvVerified();
+    s_bq.voltage_backoff_active = 0u;
+    s_bq.voltage_backoff_pending = 0u;
+    s_bq.voltage_backoff_restore_pending = 0u;
+    s_bq.voltage_backoff_failed = 0u;
+    s_bq.voltage_backoff_clear_done = 0u;
+    s_bq.voltage_backoff_clear_failed = 0u;
+    s_bq.voltage_backoff_normal_streak = 0u;
+    s_bq.voltage_hold_mask = 0u;
+    s_bq.voltage_probe_mask = 0u;
+    s_bq.voltage_probe_until_ms = 0u;
+    s_bq.voltage_relatch_mask = 0u;
+    s_bq.voltage_trip_saved = 0u;
+    s_bq.voltage_next_retry_ms = 0u;
+    s_bq.voltage_lp_restore_failed = 0u;
     return 0;
 }
 
@@ -3147,20 +3647,35 @@ int BQ_LpMonitorRead(bq_snapshot_t *out)
                 }
             }
         }
-        else
+        else if ((out->log_cell3_valid != 0u) &&
+                 (out->log_cell3_mv >= BQ_CELL_VALID_MIN_MV) &&
+                 (out->log_cell3_mv <= BQ_CELL_VALID_MAX_MV))
         {
-            if (((c1 >= c2) ? c1 : c2) <=
+            uint16_t c3 = out->log_cell3_mv;
+            uint16_t max_v = (c1 >= c2) ? c1 : c2;
+            uint16_t min_v = (c1 <= c2) ? c1 : c2;
+
+            if (c3 > max_v)
+            {
+                max_v = c3;
+            }
+            if (c3 < min_v)
+            {
+                min_v = c3;
+            }
+            if (max_v <=
                 ((BQ_OV_TRIP_MV > BQ_OV_CLEAR_GUARD_MV) ?
                  (uint16_t)(BQ_OV_TRIP_MV - BQ_OV_CLEAR_GUARD_MV) : 0u))
             {
                 effective_stat &= (uint8_t)~BQ_SYS_STAT_OV;
             }
-            if ((uint32_t)((c1 <= c2) ? c1 : c2) >=
+            if ((uint32_t)min_v >=
                 ((uint32_t)BQ_UV_TRIP_MV + BQ_UV_CLEAR_GUARD_MV))
             {
                 effective_stat &= (uint8_t)~BQ_SYS_STAT_UV;
             }
         }
+        /* 三节中任一不可用时不归因/不清除，保持 raw OV/UV。 */
     }
     out->sys_stat = effective_stat;
 

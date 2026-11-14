@@ -21,7 +21,7 @@
 
 /* 平衡充会故意暂时关断输出（电流先降到 0），若按 1 s 去抖会被误判为
  * 充电器移除，造成 CHARGE→IDLE→CHARGE 反复。5.2 s 覆盖该短暂断流。 */
-#define CHARGE_POLICY_CHARGER_LOW_MS 5200u
+#define CHARGE_POLICY_CHARGER_LOW_MS 10400u
 
 /* COMP2 在 MOS 导通后只看到 I×(Rshunt+Rds_on)×0.266；100 mA 时仅约 0.3 mV。
  * 充电电流 >30 mA 时用电流保持“充电器存在”；<20 mA 时释放；20–30 mA 回差。
@@ -49,9 +49,9 @@
 
 /* DISCHARGE 进入后的前 10 s：净充电电流 >=100 mA 视为外部设备正在充电，
  * 直接切 CHARGE；<=90 mA 释放（10 mA 回差）。输入与 CHARGE 电流判据相同。 */
-#define CHARGE_POLICY_DISCHARGE_CHARGE_WINDOW_MS 10000u
-#define CHARGE_POLICY_DISCHARGE_CHARGE_SET_MA    100
-#define CHARGE_POLICY_DISCHARGE_CHARGE_CLEAR_MA  90
+#define CHARGE_POLICY_DISCHARGE_CHARGE_WINDOW_MS 50000u
+#define CHARGE_POLICY_DISCHARGE_CHARGE_SET_MA    200
+#define CHARGE_POLICY_DISCHARGE_CHARGE_CLEAR_MA  160
 
 static struct
 {

@@ -70,11 +70,18 @@ typedef struct
     /* 低压分级 */
     uint8_t  cell_uv_active;
     uint8_t  cell_uv_recover_streak;
+    uint8_t  cell_ov_active;
+    uint8_t  cell_ov_streak;
+    uint8_t  cell_ov_recover_streak;
     uint8_t  ref_cell2_only;
+    uint8_t  voltage_backoff;
+    uint8_t  bq_fet_hold_mask;
     uint8_t  low_batt_dsg_allowed;
     uint16_t cell_uv_min_mv;
+    uint16_t cell_ov_ref_mv;
     uint32_t cell_last_update_ms;
     uint32_t cell_uv_count;
+    uint32_t cell_ov_count;
 
     uint8_t  soc_early_latched;
     uint8_t  soc_early_streak;
@@ -418,9 +425,29 @@ static void Protection_UpdateTemperature(uint32_t now_ms, uint8_t temp_valid,
     }
 }
 
+static uint8_t Protection_BqVoltageBackoff(void)
+{
+    return ((BQ_IsVoltageBackoffActive() != 0u) ||
+            (BQ_IsVoltageBackoffPending() != 0u) ||
+            (BQ_IsVoltageBackoffFailed() != 0u)) ? 1u : 0u;
+}
+
 static uint16_t Protection_RefCellMv(const bq_snapshot_t *snap)
 {
-    /* 正常=三节最低值；cell3/pack 不可信时=VC2；参考节无效返回 0。 */
+    uint16_t ref;
+
+    if ((snap == NULL) || (snap->valid == 0u))
+    {
+        return 0u;
+    }
+    if ((Protection_BqVoltageBackoff() != 0u) ||
+        (snap->ref_cell2_only != 0u))
+    {
+        /* VC5/BAT 不可信或 BQ 电压保护退避期间，软件 OV/UV 只使用 VC2；
+         * 即使发布快照的 ref_cell2_only 尚未更新，也不能回到三节最低值。 */
+        ref = snap->cell_mv[1];
+        return ((ref >= 1000u) && (ref <= 5000u)) ? ref : 0u;
+    }
     return BQ_GetRefCellMv(snap);
 }
 
@@ -450,6 +477,23 @@ static uint8_t Protection_ApplyLowVoltageAllow(uint8_t allow,
         {
             allow &= BQ_FET_MASK_CHG;
         }
+    }
+    if (s_protection.cell_ov_active != 0u)
+    {
+        /* 软件 OV 与 BQ OV 语义一致：只关充电，允许放电。 */
+        allow &= BQ_FET_MASK_DSG;
+    }
+    return allow;
+}
+
+/* BQ 退避/失败形成的 FET hold 是最后一道软件门；任何 allow 计算之后
+ * 都必须再次相与，避免 Protection_Service 的清锁存路径绕过它。 */
+static uint8_t Protection_ApplyVoltageHold(uint8_t allow)
+{
+    allow &= (uint8_t)~s_protection.bq_fet_hold_mask;
+    if (BQ_IsVoltageBackoffFailed() != 0u)
+    {
+        return BQ_FET_MASK_NONE;
     }
     return allow;
 }
@@ -517,6 +561,61 @@ static void Protection_UpdateLowVoltage(uint32_t now_ms,
     else
     {
         s_protection.cell_uv_recover_streak = 0u;
+    }
+
+    /* BQ 电压保护退避期间，VC2 是唯一可信电压；OV 与 BQ OV 一样只关 CHG。
+     * 正常模式仍由 BQ 硬件 4.25 V 负责，不在 Protection 里重复锁存。 */
+    s_protection.cell_ov_ref_mv = ref_mv;
+    if (Protection_BqVoltageBackoff() != 0u)
+    {
+        if (s_protection.cell_ov_active == 0u)
+        {
+            if (ref_mv >= PROT_CELL_OV_MV)
+            {
+                if (s_protection.cell_ov_streak < 0xFFu)
+                {
+                    s_protection.cell_ov_streak++;
+                }
+                if (s_protection.cell_ov_streak >=
+                    PROT_CELL_OV_CONFIRM_FRAMES)
+                {
+                    s_protection.cell_ov_active = 1u;
+                    s_protection.cell_ov_streak = 0u;
+                    s_protection.cell_ov_recover_streak = 0u;
+                    s_protection.cell_ov_count++;
+                    s_protection.event_flags |= PROT_EVENT_CELL_OV;
+                }
+            }
+            else
+            {
+                s_protection.cell_ov_streak = 0u;
+            }
+        }
+        else if (ref_mv <= PROT_CELL_OV_RECOVER_MV)
+        {
+            if (s_protection.cell_ov_recover_streak < 0xFFu)
+            {
+                s_protection.cell_ov_recover_streak++;
+            }
+            if (s_protection.cell_ov_recover_streak >=
+                PROT_CELL_OV_RECOVER_FRAMES)
+            {
+                s_protection.cell_ov_active = 0u;
+                s_protection.cell_ov_streak = 0u;
+                s_protection.cell_ov_recover_streak = 0u;
+                s_protection.event_flags |= PROT_EVENT_CELL_OV_CLEARED;
+            }
+        }
+        else
+        {
+            s_protection.cell_ov_recover_streak = 0u;
+        }
+    }
+    else
+    {
+        s_protection.cell_ov_active = 0u;
+        s_protection.cell_ov_streak = 0u;
+        s_protection.cell_ov_recover_streak = 0u;
     }
 
     /* 低电状态：电压条件独立于 SOC；SOC 只在标定/温度/真实帧有效时参与。 */
@@ -720,6 +819,13 @@ void Protection_Init(void)
     s_protection.ref_cell2_only = 0u;
     s_protection.low_batt_dsg_allowed = 0u;
     s_protection.cell_uv_min_mv = 0u;
+    s_protection.cell_ov_active = 0u;
+    s_protection.cell_ov_streak = 0u;
+    s_protection.cell_ov_recover_streak = 0u;
+    s_protection.cell_ov_ref_mv = 0u;
+    s_protection.cell_ov_count = 0u;
+    s_protection.voltage_backoff = 0u;
+    s_protection.bq_fet_hold_mask = 0u;
     s_protection.cell_last_update_ms = 0u;
     s_protection.cell_uv_count = 0u;
 
@@ -752,11 +858,11 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
     uint8_t bq_ready;
     uint8_t data_ready;
     uint8_t low_batt_boost = 0u;
+    uint8_t bq_voltage_masking;
+    uint8_t bq_voltage_backoff;
     uint8_t sys_stat = (snap != NULL) ? snap->sys_stat : 0u;
-    uint8_t latch = (uint8_t)(sys_stat & BQ_SYS_STAT_PROT_MASK);
-    uint8_t hard_latch = (uint8_t)(latch &
-                                   (BQ_SYS_STAT_OV | BQ_SYS_STAT_SCD |
-                                    BQ_SYS_STAT_OCD));
+    uint8_t latch;
+    uint8_t hard_latch;
     uint8_t uv_only;
     uint8_t boot_mask = (uint8_t)(BQ_GetBootProtectionLatchMask() &
                                   PROT_CLEAR_ALLOWED_MASK);
@@ -768,12 +874,41 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
     s_protection.comp_charging_last = (comp_charging != 0u) ? 1u : 0u;
     s_protection.ref_cell2_only =
         ((snap != NULL) && (snap->ref_cell2_only != 0u)) ? 1u : 0u;
+    bq_voltage_masking =
+        ((BQ_IsVoltageBackoffActive() != 0u) ||
+         (BQ_IsVoltageBackoffPending() != 0u)) ? 1u : 0u;
+    bq_voltage_backoff =
+        ((bq_voltage_masking != 0u) ||
+         (BQ_IsVoltageBackoffFailed() != 0u)) ? 1u : 0u;
+    s_protection.voltage_backoff = bq_voltage_backoff;
+    s_protection.bq_fet_hold_mask = BQ_GetVoltageFetHoldMask();
+    if (bq_voltage_masking != 0u)
+    {
+        /* BQ OV/UV 在 VC5/BAT 不可信期间没有归因意义；不覆盖 SCD/OCD。 */
+        sys_stat &= (uint8_t)~(BQ_SYS_STAT_OV | BQ_SYS_STAT_UV);
+    }
+    latch = (uint8_t)(sys_stat & BQ_SYS_STAT_PROT_MASK);
+    hard_latch = (uint8_t)(latch &
+                           (BQ_SYS_STAT_OV | BQ_SYS_STAT_SCD |
+                            BQ_SYS_STAT_OCD));
+
     Protection_UpdateTemperature(now_ms,
                                  (soc != NULL) ? soc->temp_valid : 0u,
                                  (soc != NULL) ? soc->temp_dc : 0);
 
     bq_ready = Protection_BqReady();
     data_ready = Protection_DataReady(now_ms, snap);
+    if ((bq_voltage_backoff != 0u) &&
+        ((snap == NULL) || (Protection_RefCellMv(snap) == 0u)))
+    {
+        data_ready = 0u;
+    }
+    if ((snap != NULL) && (snap->ref_cell2_only != 0u) &&
+        (Protection_RefCellMv(snap) == 0u))
+    {
+        /* VC5/BAT 不可信但没有有效 VC2：不能使用三节参考值放行。 */
+        data_ready = 0u;
+    }
     uv_only = (uint8_t)(((latch & BQ_SYS_STAT_UV) != 0u) &&
                         (hard_latch == 0u) &&
                         ((sys_stat & BQ_SYS_STAT_XREADY) == 0u) &&
@@ -931,6 +1066,7 @@ void Protection_Task(uint32_t now_ms, const bq_snapshot_t *snap,
     }
 
     allow = Protection_ApplyLowVoltageAllow(allow, low_batt_boost);
+    allow = Protection_ApplyVoltageHold(allow);
 
     if ((next_state != s_protection.state) &&
         ((next_state == PROTECTION_RECOVERY) ||
@@ -1089,9 +1225,12 @@ void Protection_Service(uint32_t now_ms, const bq_snapshot_t *snap)
     if ((stat & BQ_SYS_STAT_PROT_MASK) == 0u)
     {
         s_protection.state = PROTECTION_NORMAL;
+        s_protection.bq_fet_hold_mask = BQ_GetVoltageFetHoldMask();
         s_protection.allow_mask =
-            Protection_ApplyLowVoltageAllow(Protection_TempAllowMask(),
-                                            s_protection.low_batt_dsg_allowed);
+            Protection_ApplyVoltageHold(
+                Protection_ApplyLowVoltageAllow(
+                    Protection_TempAllowMask(),
+                    s_protection.low_batt_dsg_allowed));
         s_protection.reasons &= (uint16_t)~(PROT_RSN_BQ_OV |
                                             PROT_RSN_BQ_UV |
                                             PROT_RSN_BQ_SCD |
@@ -1166,6 +1305,13 @@ void Protection_GetSnapshot(protection_snapshot_t *out)
     out->soc_valid = s_protection.soc_valid_last;
     out->ref_cell2_only = s_protection.ref_cell2_only;
     out->cell_uv_active = s_protection.cell_uv_active;
+    out->cell_ov_active = s_protection.cell_ov_active;
+    out->cell_ov_streak = s_protection.cell_ov_streak;
+    out->cell_ov_recover_streak = s_protection.cell_ov_recover_streak;
+    out->cell_ov_ref_mv = s_protection.cell_ov_ref_mv;
+    out->cell_ov_count = s_protection.cell_ov_count;
+    out->voltage_backoff = s_protection.voltage_backoff;
+    out->bq_fet_hold_mask = s_protection.bq_fet_hold_mask;
     out->low_batt_dsg_allowed = s_protection.low_batt_dsg_allowed;
     out->cell_uv_streak = s_protection.cell_uv_recover_streak;
     out->early_soc_latched = s_protection.soc_early_latched;
@@ -1181,6 +1327,11 @@ void Protection_GetSnapshot(protection_snapshot_t *out)
 uint8_t Protection_IsCellUvActive(void)
 {
     return s_protection.cell_uv_active;
+}
+
+uint8_t Protection_IsCellOvActive(void)
+{
+    return s_protection.cell_ov_active;
 }
 
 uint8_t Protection_IsLowBattery(void)

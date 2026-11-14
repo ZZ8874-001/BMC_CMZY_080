@@ -6,6 +6,8 @@
 >
 > **VC2-only 降级**：已发布帧 `log_cell3_valid==0 || log_pack_valid==0` 时，`BQ_GetRefCellMv()` 返回实测 VC2；MCU 2.8 V/低电/SOC/SOH/D 帧和 BQ OV/UV 状态过滤均改为只比较 VC2。正常帧仍用三节最低值。VC2 无效时保留 raw OV/UV 并 fail-closed；BQ 硬件比较器仍会动作。下文旧 LED 颜色/静态绿蓝、`SM_STATE_BQ_ANOMALY`、`PROTECTION_PARTIAL` 等描述按当前源码视为历史。
 >
+> **BQ OV/UV 退避（2026-11-14）**：首个 `ref_cell2_only=1` 且 VC2 有效的完整批次立即进入退避；BQ OV/UV TRIP 临时写到端点，软件只用 VC2 做 4.25/4.15 V OV 和 2.8/3.0 V UV；BQ OV/UV raw 不再作为硬故障。清除只做一次；pending 阶段暂停 FET 同步，active 后 raw OV/UV 完全忽略（只记录诊断），不再重复清除，BQ 自行清位由 FET 影子回读重写；3 个正常发布批次后恢复 BQ TRIP。SCD/OCD、XREADY/OVRD_ALERT、温度、软件 OCP 不变；自动 LP 仍允许，NORM LP 入口尽力恢复 TRIP，假开关在退避期间仍启用：异常批一到就立即尝试同值重写，但同值重写不能覆盖 BQ 硬件 OV/UV 锁存。
+>
 > **范围**：当前工作树的复位式 LP、M2 保护监督；以实际集成后的源码与宏为准，不将旧构建或上板记录视为本次修改的验证。
 >
 > **事实来源优先级**：

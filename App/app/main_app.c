@@ -51,7 +51,7 @@
 #define APP_DIAG_LOG_PERIOD_MS      10000u
 #define APP_DEGRADED_BLINK_MS       250u
 #define APP_5V_STARTUP_DELAY_MS     20u
-#define APP_IDLE_LP_MS              5000u   /* 无操作/无充电 5 s 自动进 LP */
+#define APP_IDLE_LP_MS              10000u   /* 无操作/无充电 10 s 自动进 LP */
 #define APP_BOOT_VOLTAGE_HOLD_MS    2000u
 
 /* VC5/BAT 异常恢复：同值重写 SYS_CTRL2（假开关）。 */
@@ -432,6 +432,16 @@ static void App_ProtectionEventTask(void)
         (void)BlackBox_WriteEvent(BB_EVENT_PROT_CHARGE_FULL_CLEARED,
                                   App_GetUptimeSeconds());
     }
+    if ((events & PROT_EVENT_CELL_OV) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CELL_OV,
+                                  App_GetUptimeSeconds());
+    }
+    if ((events & PROT_EVENT_CELL_OV_CLEARED) != 0u)
+    {
+        (void)BlackBox_WriteEvent(BB_EVENT_PROT_CELL_OV_CLEARED,
+                                  App_GetUptimeSeconds());
+    }
 
     Protection_GetSnapshot(&prot);
     App_Log_Printf("[PROT] ev=%04X state=%u reason=%04X allow=%02X boot=%02X "
@@ -712,6 +722,9 @@ static uint8_t App_FakeSwitchGatesReady(uint32_t now_ms)
     {
         return 0u;
     }
+    /* 故障期间也必须保留假开关动作：不再因 BQ 退避、request/applied
+     * 不一致或 BQ 已清掉 CHG/DSG 位而跳过；异常批一到就尝试同值重写。
+     * 同值重写本身不会强制打开被 BQ 硬件保护关掉的 FET。 */
     return 1u;
 }
 
@@ -954,7 +967,8 @@ static void App_DiagTask(uint32_t now_ms)
     Protection_GetSnapshot(&prot);
     App_Log_Printf("[PROT] state=%u reason=%04X allow=%02X boot=%02X "
                    "ocp=%u/%u st=%u/%u n=%lu I=%ld T=%d tv=%u inh=%u/%u "
-                   "inv=%u uvref=%u ref2=%u lb=%u boost=%u clr=%u\r\n",
+                   "inv=%u uvref=%u ref2=%u lb=%u boost=%u clr=%u "
+                   "vb=%u hold=%02X swov=%u ovref=%u\r\n",
                    (unsigned)prot.state,
                    (unsigned)prot.reasons,
                    (unsigned)prot.allow_mask,
@@ -975,10 +989,14 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)((prot.early_soc_latched != 0u) ||
                               (prot.cell_uv_active != 0u)),
                    (unsigned)prot.low_batt_dsg_allowed,
-                   (unsigned)prot.clear_block_reason);
+                   (unsigned)prot.clear_block_reason,
+                   (unsigned)prot.voltage_backoff,
+                   (unsigned)prot.bq_fet_hold_mask,
+                   (unsigned)prot.cell_ov_active,
+                   (unsigned)prot.cell_ov_ref_mv);
 
     App_Log_Printf("[BQ] oor=%u rs=%u sw=%u ep=%u va=%u gp=%u ref2=%u "
-                   "vd=%lu rl=%lu\r\n",
+                   "vd=%lu rl=%lu vb=%u vbp=%u vbf=%u vbc=%u vbn=%u ovt=%u uvt=%u\r\n",
                    (unsigned)snapshot.oor_streak,
                    (unsigned)snapshot.resample_count,
                    (unsigned)snapshot.strict_window,
@@ -987,7 +1005,14 @@ static void App_DiagTask(uint32_t now_ms)
                    (unsigned)snapshot.good_publish_streak,
                    (unsigned)snapshot.ref_cell2_only,
                    (unsigned long)snapshot.verdict_deadline_ms,
-                   (unsigned long)snapshot.adc_restart_last_ms);
+                   (unsigned long)snapshot.adc_restart_last_ms,
+                   (unsigned)snapshot.voltage_backoff,
+                   (unsigned)snapshot.voltage_backoff_pending,
+                   (unsigned)snapshot.voltage_backoff_failed,
+                   (unsigned)snapshot.voltage_backoff_clear_failed,
+                   (unsigned)snapshot.voltage_backoff_normal_streak,
+                   (unsigned)snapshot.ov_trip_mv,
+                   (unsigned)snapshot.uv_trip_mv);
 
     App_Log_Printf("[POL] st=%u req=%u app=%u chg=%u dis=%u cal=%u "
                    "cp=%u bd=%u ih=%u cmp=%u I=%ld soc=%u rsn=%u "
@@ -1268,6 +1293,9 @@ void App_Loop(void)
                     ChargePolicy_IsChargerPresent(),
                     ChargePolicy_GetState(),
                     ChargePolicy_GetLowBattDsgOn());
+    /* BQ OV/UV 退避：Protection 已按 VC2 更新 allow，再执行阈值切换；
+     * 失败时 BQ 驱动会保持 FET hold，下一轮 Protection fail-closed。 */
+    (void)BQ_ServiceVoltageBackoff();
     StateMachine_Update(BQ_IsFresh(now_ms), s_app.comparator_charging,
                         Fault_GetAll());
     policy_in.charge_current_ma =
@@ -1282,6 +1310,20 @@ void App_Loop(void)
         ((soc_snap.frame_valid != 0u) &&
          (soc_snap.quality == SOC_EST_QUALITY_REAL)) ? 1u : 0u;
     policy_in.ref_cell_mv = BQ_GetRefCellMv(&bq_snap);
+    if ((BQ_IsVoltageBackoffActive() != 0u) ||
+        (BQ_IsVoltageBackoffPending() != 0u) ||
+        (BQ_IsVoltageBackoffFailed() != 0u))
+    {
+        /* VC5/BAT 不可信时低电/DSG 策略也必须只使用 VC2。 */
+        if ((bq_snap.cell_mv[1] >= 1000u) && (bq_snap.cell_mv[1] <= 5000u))
+        {
+            policy_in.ref_cell_mv = bq_snap.cell_mv[1];
+        }
+        else
+        {
+            policy_in.ref_cell_mv = 0u;
+        }
+    }
     policy_in.ref_valid = (policy_in.ref_cell_mv != 0u) ? 1u : 0u;
     policy_in.current_ms = bq_snap.last_update_ms;
     ChargePolicy_Task(now_ms, s_app.comparator_charging, &policy_in);

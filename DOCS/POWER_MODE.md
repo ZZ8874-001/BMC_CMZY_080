@@ -122,6 +122,7 @@ PA1=0（OSC1/PACK_SC 使能）→ `HAL_Delay(30)` 起振余量 → HSE **bypass*
 - 关键故障强制请求 0、进入策略 FAULT；CAL 自动结束，不自动恢复。
 - `CHARGE/DISCHARGE` 常规模式请求 `BQ_FET_MASK_ALL`，最终仍需与 `Protection_GetAllowedFetMask()` 和异常锁存门控相与；有条件部分放电**不代表双管无条件全开**。输出关断优先即时申请、RUN/idle 时核实实际 BQ FET 状态，不把请求影子当作已确认关断。
 - **低压分级（2026-11-12）**：有效 BQ 帧参考节 `<2.8 V` 时 Protection 立即把 allow 裁成 CHG-only；`>=3.0 V` 连续 2 帧恢复。参考节 `<3.1 V` 或 SOC `<10%` 连续 2 帧进入 `CHARGE_POLICY_LOW_BATTERY_CHARGE`，默认 CHG-only 且不依赖充电器；低电状态内 DSG 只在充电电流 >200 mA/2 帧且参考节 `>=2.8 V` 时打开，<120 mA 或电流无效立即关闭；3.1 V+SOC≥10%/2 帧退出。无充电器/电流时允许自动 LP，按键唤醒后红灯 5 Hz；旧 `STATE_FLAG_CUTOFF_LATCH` 不恢复。正常参考节为三节最低值；`log_cell3_valid==0 || log_pack_valid==0` 时保护/SOC 只使用实测 VC2。`PAIR_HOLD3` 在低电/欠压期间拒绝。
+- **BQ OV/UV 退避（2026-11-14）**：首个 VC2-only 完整批次进入退避，BQ OV/UV TRIP 临时放宽，MCU 用 VC2 软件 OV/UV；pending 阶段暂停 FET 同步，active 后 raw BQ OV/UV 完全忽略（只记录诊断），不再重复清除，BQ 自行清位由 FET 影子回读在下一批重写。3 个正常发布批次后恢复 BQ TRIP。自动 LP 仍按用户要求正常运行，不新增自动 LP block；NORM LP 入口 best-effort 恢复 normal TRIP，失败记录但在全量唤醒 CONFIG 恢复。SCD/OCD、XREADY/OVRD_ALERT、温度和软件 OCP 不变；假开关在退避期间仍启用：异常批一到就立即尝试同值重写，但同值重写不能覆盖 BQ 硬件 OV/UV 锁存。
 - CAL 由调试器写 `s_policy.cal_fet_mask`（0x00..0x03）再写 `s_policy.cal_mode=1` 进入；写 `cal_mode=0` 退出。CAL 期间自动 LP 被 bit7 阻止，BQ 不 fresh/非 RUN/LP 唤醒/关键故障都会结束 CAL。
 - `[CAL]` 由 `cal_stream.c` 输出：BEGIN/HDR + 每个新 BQ 快照一行（约 2 Hz）+ END；黑匣子只写 `BB_EVENT_CAL_BEGIN/END`（0x12/0x13），不逐样本写 Flash。CAL 日志只用现有快照字段（mV、cc_raw、current_ma、ts1_raw、SocEst 的 ts1_mv/temp/SOC/SOH），不恢复 raw_cell/raw_pack。END 的 `reason`：1=user，2=fault，3=notready，4=lp。
 

@@ -968,6 +968,11 @@ uint8_t LpCycle_RequestStart(void)
         return 0u;
     }
 
+    /* 自动 LP 仍按用户要求正常运行。若当前 BQ OV/UV 因 VC5/BAT 异常
+     * 处于退避，尽力恢复 normal trip 后再睡眠；失败只记录，不阻止 LP，
+     * 全量唤醒的 BQ CONFIG 会恢复 normal 阈值。 */
+    (void)BQ_RestoreVoltageProtectionForLp();
+
     if (RtcTime_Read(&now) == 0u)
     {
         return 0u;

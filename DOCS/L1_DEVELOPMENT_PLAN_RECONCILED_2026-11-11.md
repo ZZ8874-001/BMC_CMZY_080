@@ -28,7 +28,7 @@
 
 - 基线 commit：`ce8d609`（`fix:fuck烂掉的ADC，直接用正常的VC1，VC2值`）。
 - 工作树：已修改的 App 源、`DOCS/BATTERY_PROTECTION.md`、`DOCS/POWER_MODE.md`、`DOCS/SYSTEM_STATES.md`、`BMC.jdebug.user`；另有未跟踪的原始 L1 计划与本副本。本文描述的是该工作树快照，不是干净发布。
-- 构建（2026-11-12 clean build，含 SOC/低压/充满保护、低电充电状态、RGB SOC 指示与 VC2-only 降级）：text 84952 B、data 168 B、bss 8144 B、`_image_end=0x08014C80`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
+- 构建（2026-11-14 clean build，含 SOC/低压/充满保护、低电充电状态、RGB SOC 指示、VC2-only 降级、BQ FET 回读影子校准与 BQ OV/UV 退避/VC2 软件 OV）：text 87600 B、data 168 B、bss 8200 B、`_image_end=0x080156D8`；链接脚本 96 KB，`_image_end<=0x08018000` 断言通过。
 - 文档优先级：当前代码 > `CLAUDE.md` 的 2026-11-10/11/12 当前状态段 > `DOCS/POWER_MODE.md`/`SYSTEM_STATES.md`/`BATTERY_PROTECTION.md` 顶部更新说明 > 本计划原文。`DOCS/BATTERY_PROTECTION.md` 正文仍残留已删除的 partial/`bq_anomaly` 历史段落，不能整篇当作当前状态；2026-11-12 新增行为见其 §0。
 
 ### G1.2 已落地的关键路径
@@ -39,10 +39,10 @@
 - **工作状态**：`state_machine` 只有 BOOT/NORM/FAULT；`charge_policy` 只有 IDLE/CHARGE/DISCHARGE/CAL/FAULT。CHARGE 和 DISCHARGE 正常请求 `BQ_FET_MASK_ALL`（CHG+DSG 双管全开）；IDLE 请求 0；CAL 是 Ozone 调试态。COMP2 消抖充电器自动进入 CHARGE；CHARGE 中充电电流 >30 mA 时用电流保持充电器存在，近满（显示 SOC>90 且 −20 mA < 电流 < 220 mA）切 CHG-only/DSG 体二极管；PAIR_HOLD3 切换 DISCHARGE/IDLE；FAULT 和 CAL 阻止自动 LP。没有 DISCHARGE_ARM/CUTOFF_LATCH/SWAP_ERROR/REPLACE_READY/DEAD_STORAGE。
 - **按键**：`button` 4 ms 采样、20 ms 消抖；`gesture` 能产生 SHORT/HOLD3/PAIR_HOLD3/HOLD5/RELEASE_AFTER_HOLD5/TRIPLE。`main_app` 目前只消费 `GESTURE_PAIR_HOLD3`；其余事件没有业务动作。
 - **SOC/SOH**：toolkit 核心已复制到 `App/detect/bms/`；`SocEst_OnSnapshot()` 在 500 ms 新快照上用参考节（正常三节最低，VC2-only 降级时 VC2）+ CC 电流 + TS1 温度；`SOC_EST_CURRENT_SIGN=BQ_CC_DISCHARGE_SIGN`；`SOC_EST_CAL_VALID=1`，SOC/SOH 参与低电判断和显示，但 2.8 V 电压仍是独立硬保护。当前没有原计划的 5%/0% SOC 截止；参考节<3.1 V 或 SOC<10% 进入低电充电，充满只是提示。NMC 1500 mAh：R0/R1 已按 25 °C 放电实测接入，OCV/tau 仍有占位成分；不是 LFP 标定表。
-- **保护**：BQ `PROTECT1=0x89`（SCD 67 mV≈44.7 A/100 µs）、`PROTECT2=0x57`（OCD 56 mV≈37.3 A/320 ms，放电方向）、`PROTECT3=0x40`（OV 1 s/UV 4 s）；OV_TRIP/UV_TRIP 当前按 NMC **4.25 V/2.80 V** 计算。软件 OCP 为充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认并锁存；`PROT_TEMP_ENABLE=1`，包温度 **4.0–54.0 °C** 充放电门控生效（2 °C 回差/2 s）。Protection 现在同时读有效 BQ 帧的参考节和 `soc_est_snapshot_t`：正常参考节为三节最低值；已发布帧 `log_cell3_valid==0 || log_pack_valid==0` 时只使用实测 VC2（`BQ_GetRefCellMv`），并据此判断 2.8 V、低电充电、充满、SOC/SOH 和 D 帧。BQ OV/UV 状态过滤在 VC2-only 模式只比较 VC2，并在本批最终判定后清假锁存；VC2 无效时保持 raw OV/UV。BQ UV-only 允许 CHG；这些低压叠加都不置 `FAULT_BIT_PROTECTION`（BQ OV/SCD/OCD 等硬锁存仍置）。
+- **保护**：BQ `PROTECT1=0x89`（SCD 67 mV≈44.7 A/100 µs）、`PROTECT2=0x57`（OCD 56 mV≈37.3 A/320 ms，放电方向）、`PROTECT3=0x40`（OV 1 s/UV 4 s）；OV_TRIP/UV_TRIP 当前按 NMC **4.25 V/2.80 V** 计算。**2026-11-14 起**，首个 `ref_cell2_only=1` 完整批次立即进入 BQ OV/UV 退避：临时写端点 TRIP，MCU 用 VC2 软件 OV（4.25/4.15 V）和现有 2.8 V UV；清除只做一次；pending 阶段暂停 FET 同步，active 后 raw OV/UV 完全忽略（只记录诊断），不再重复清除，BQ 自行清位由 FET 影子回读重写；3 个正常发布批次后恢复 BQ TRIP。SCD/OCD、XREADY/OVRD_ALERT、温度和软件 OCP 不变；自动 LP 仍正常运行，假开关在退避期间仍启用：异常批一到就立即尝试同值重写，但同值重写不能覆盖 BQ 硬件 OV/UV 锁存。软件 OCP 为充电 **5.5 A/1 s**、放电 **33 A/500 ms**，至少 2 个新发布帧确认并锁存；`PROT_TEMP_ENABLE=1`，包温度 **4.0–54.0 °C** 充放电门控生效（2 °C 回差/2 s）。Protection 现在同时读有效 BQ 帧的参考节和 `soc_est_snapshot_t`：正常参考节为三节最低值；已发布帧 `log_cell3_valid==0 || log_pack_valid==0` 时只使用实测 VC2（`BQ_GetRefCellMv`），并据此判断 2.8 V、低电充电、充满、SOC/SOH 和 D 帧。BQ OV/UV 状态过滤在 VC2-only 模式只比较 VC2，并在本批最终判定后清假锁存；VC2 无效时保持 raw OV/UV。BQ UV-only 允许 CHG；这些低压叠加都不置 `FAULT_BIT_PROTECTION`（BQ OV/SCD/OCD 等硬锁存仍置）。
 - **存储**：96 KB app；BMS NVM 页 48-49（132/136 B）；StateStore 页 50-51（48 B，v2）；黑匣子页 52-63（24 B×1020）。低电状态是 RAM-only；MCU 复位不恢复旧 `STATE_FLAG_CUTOFF_LATCH`，按实时参考节/SOC 重建。`expected_swap/swap_error/dead_storage/charge_full` 仍无写入者/读取者；`charge_full` 不持久化。黑匣子已增加低压/充满事件 0x24–0x29，但仍无充放电/换电/死存储事件；wake 记录只打包 3 bit，`POWER_WAKE_CHARGER=0x08`/`MONITOR=0x10` 会被截断。
 - **模块**：实际树包含 `protection`、`lp_cycle`、`lp_session`、`rtc_time`、`watchdog`；**没有 `shelf_monitor.c/.h`**。30 min 归档在 `main_app.c` 的 `App_ArchiveTask()` 和 `lp_cycle.c` 的 `LpCycle_DoMark()` 中分担。
-- **计划外新增（当前树）**：VC5/BAT 真实值可信时优先进入控制/显示；异常时控制/显示用 VC1/VC2 估算，保护/SOC/充满只用实测 VC2；记录只写真实可信值，异常写 0 + missing；`App_FakeSwitchTask()` 在新完整 BQ 批次确认 VC5/BAT 异常时，播放与当前输出同方向的提示音，并调用 `BQ_ApplyFetMaskIfUnchanged()` 同值重写 `SYS_CTRL2`（不改 FET/保护，2.5 s 重试）。
+- **计划外新增（当前树）**：VC5/BAT 真实值可信时优先进入控制/显示；异常时控制/显示用 VC1/VC2 估算，保护/SOC/充满只用实测 VC2；记录只写真实可信值，异常写 0 + missing。VC5/BAT 异常首个完整批次立即进入 BQ OV/UV 退避：临时写端点 TRIP，由 VC2 软件 OV（4.25/4.15 V）+ 现有 2.8 V UV 接管，pending 阶段暂停 FET 同步，active 后 raw OV/UV 完全忽略，不再重复清除；3 个正常发布批次后恢复 BQ TRIP。`App_FakeSwitchTask()` 在退避期间仍启用，异常新批次一到就立即尝试同值重写；同值重写不能覆盖 BQ 硬件 OV/UV 锁存。SCD/OCD、温度、软件 OCP 保留。
 
 ### G1.3 未落地/不可宣称
 
@@ -643,8 +643,9 @@ PB5 低有效、EXTI 下降沿；外部上拉已确认存在（2026-11-11）。
 
 - 触发：每个新的完整 BQ 批次且 VC1/VC2 有效、`log_cell3_valid==0 || log_pack_valid==0`。
 - 动作：播放与当前输出方向相同的提示音（输出非零用 WAKE，全关用 LP_ENTER），并调用 `BQ_ApplyFetMaskIfUnchanged(current applied mask)` 同值重写 `SYS_CTRL2`。
-- 安全条件：BQ RUN/idle、无 FET/SYS_STAT 同步、无 ADC 重启/恢复/verdict/resample、`request_fet_mask==fet_mask_applied`、实际 `SYS_CTRL2` 与期望一致且 `CC_ONESHOT=0`；绝不改变 FET 状态或保护。
-- 重试：动作后 2.5 s 内不重复；门控跳过用 50 ms 短重试；蜂鸣器忙/保护非 NORMAL/CAL/FAULT/按钮/30 min 标记/LP 临近 <3 s 时跳过。
+- 外层触发不再因 `voltage_backoff_active/pending/failed`、`request != applied` 或 `batch.ctrl2` 与影子不一致而跳过；异常新批次一到就立即尝试。
+- 安全条件：BQ RUN/idle、无 FET/SYS_STAT 同步、无 ADC 重启/恢复/verdict/resample、`request_fet_mask==fet_mask_applied`、实际 `SYS_CTRL2` 与期望一致且 `CC_ONESHOT=0`；绝不改变 FET 状态或保护。同值重写不能覆盖 BQ 硬件 OV/UV 锁存。
+- 重试：动作后 2.5 s 内不重复；门控跳过用 50 ms 短重试；蜂鸣器忙/自检未完成/保护非 NORMAL/CAL/FAULT/按钮/30 min 标记/LP 临近 <3 s 时跳过。
 - 诊断：`s_app.fake_switch_*`、`[VSW]`。这是板级临时缝补，不是 VC5 模拟通道修复。
 
 #### 电压有效范围（当前）
@@ -908,13 +909,13 @@ BMS_CAL_Init → SOH_Init → BMS_NVM_Init
 
 | 页 | 地址 | 用途 | 当前状态 |
 |---:|---|---|---|
-| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x08014C80` |
+| 0–47 | `0x08000000–0x08017FFF` | 应用代码，96 KB | 已实现；当前 `_image_end=0x080156D8` |
 | 48–49 | `0x08018000–0x08018FFF` | BMS SOC/SOH NVM | 已实现；132/136 B，两槽 |
 | 50–51 | `0x08019000–0x08019FFF` | L1 StateStore | 已实现；48 B v2，两页 |
 | 52–63 | `0x0801A000–0x0801FFFF` | 黑匣子 | 已实现；24 B×1020 |
 
 - 链接脚本 `FLASH LENGTH=96K`；
-- `_image_end` 必须 ≤0x08018000；当前 0x08014C80 通过；
+- `_image_end` 必须 ≤0x08018000；当前 0x080156D8 通过；
 - 黑匣子必须 <0x0801A000；
 - CubeMX 重生成后恢复 96K、`-include app.mk` 和链接断言。
 
@@ -1287,7 +1288,7 @@ flags：
 
 | 项 | 状态 |
 |---|---|
-| 清理构建/镜像尺寸/链接断言 | E2 通过：84952/168/8144 B，`_image_end=0x08014C80` |
+| 清理构建/镜像尺寸/链接断言 | E2 通过：87600/168/8200 B，`_image_end=0x080156D8` |
 | 按键手势检测 | E1/E2；只消费 PAIR_HOLD3 |
 | LP 周期/PB5/30 min/BQ sniff | 已有台架记录（E3，历史），但周期是 ~30 s，不是 1 s |
 | 充电唤醒 ≤1.5 s | **未满足**，实际最坏约 30 s |
@@ -1300,7 +1301,7 @@ flags：
 > **状态**：`[已通过 E2]`（2026-11-11）。
 
 - `make clean && make -j2 all` 零警告零错误；
-- `_image_end <= 0x08018000`；当前 `0x08014C80`；
+- `_image_end <= 0x08018000`；当前 `0x080156D8`；
 - 黑匣子/StateStore/NVM 地址不重叠；
 - `app.mk` 包含所有新源；`compile_commands.json` 同步；
 - CubeMX 重生成后恢复 96K、`-include app.mk`、RTC 选择补丁；
@@ -1467,7 +1468,7 @@ L1 完成需同时满足：
 | 储存监测 | 30 min HSI16 | 已实现；不更新 SOC/SOH | 部分（C-07） |
 | 空闲 LP | 5 s | 5 s | 已实现 |
 | RTC/WUT | LSE 32.768 kHz；WUT 1 s 自由运行 | LSE 死，默认 LSI；WUT 关闭 | 冲突（C-01/C-03） |
-| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x08014C80` | 已实现 |
+| 代码 Flash | 96 KB，`_image_end<0x08018000` | 96 KB，`0x080156D8` | 已实现 |
 | BMS NVM | 页 48–49，132/136 B | 同 | 已实现 |
 | StateStore | 页 50–51，48 B | 同（v2） | 已实现；生命周期 flags 未用 |
 | 黑匣子 | 页 52–63，24 B×1020 | 同 | 已实现；事件/wake 不完整 |
@@ -1524,7 +1525,7 @@ L1 完成需同时满足：
 | StateStore | `App/app/state_store.c/.h`；`main_app.c` `App_CommitArchiveSnapshot()` |
 | 黑匣子 | `App/app/black_box.c/.h`；`BlackBox_WriteWake()` 的 `& 0x07`；事件枚举 |
 | LED/蜂鸣器 | `App/app/led_status.c/.h`；`App/bsp/buzzer.c/.h` |
-| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x08014C80` |
+| 构建/分区 | `app.mk`；`STM32L432xx_FLASH.ld`；`board.h` `APP_FLASH_END`；当前 `build/BMC_CMZY_080.map` `_image_end=0x080156D8` |
 | 当前文档 | `CLAUDE.md` 2026-11-11 段；`DOCS/POWER_MODE.md`/`SYSTEM_STATES.md` 顶部更新说明 |
 
 ---
